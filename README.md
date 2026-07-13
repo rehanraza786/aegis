@@ -339,9 +339,9 @@ CI runs the whole thing on **ubuntu and windows, against both runtimes**, on eve
 
 ## The names
 
-Ariadne gave Theseus the thread through the labyrinth, so she's the graph. Argus had a hundred eyes and never slept, so he reviews. Daedalus built the thing in the first place. Asclepius was the physician, he diagnoses. Hephaestus was the smith: he reforges without changing what a thing *is*. Metis was good counsel. Themis held the scales. Hermes carried messages. Pythia spoke the oracle's knowledge at Delphi, which is where the knowledge base lives. Mnemosyne was memory itself.
+Ariadne gave Theseus the thread through the labyrinth, so she's the graph. Argus had a hundred eyes and never slept, so he reviews. Daedalus built the thing in the first place. Asclepius was the physician, so he diagnoses. Hephaestus was the smith: he reforges a thing without changing what it *is*. Metis was good counsel. Themis held the scales. Hermes carried messages. Pythia spoke the oracle's knowledge at Delphi, which is where the knowledge base lives. Mnemosyne was memory itself.
 
-The motto is a ThunderCats reference, and it stays a motto and nothing more, for trademark reasons a lawyer would appreciate more than a developer.
+The motto is "Sight beyond sight", which is where the eye on the shield comes from. It is a ThunderCats reference, and it stays a motto and nothing more, for trademark reasons a lawyer would appreciate more than a developer.
 
 ---
 
