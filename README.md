@@ -1,6 +1,6 @@
-<img src="assets/aegis-logo-256.png" alt="AEGIS" width="110" align="right">
-
 # AEGIS
+
+<img src="assets/aegis-logo-256.png" alt="AEGIS" width="110" align="right">
 
 Agentic Engineering Guardrails & Intelligence System. A local codebase graph, a set of MCP tools, and a handful of skills and agents that make GitHub Copilot behave like it actually knows your repositories.
 
