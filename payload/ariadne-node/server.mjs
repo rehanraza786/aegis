@@ -52,7 +52,7 @@ const SUMMARY_THRESHOLD = cfg.summaryThreshold ?? 40;
 const hasWarning = (r) => r && typeof r === "object" &&
   (r.warning || r.warnings || r.unresolved_expressions || r.unmatched_calls);
 
-/** Cap rows and bytes. Entries carrying warnings are kept FIRST and never dropped —
+/** Cap rows and bytes. Entries carrying warnings are kept FIRST and never dropped.
  *  a truncated dump that silently discards the drift warning is worse than useless. */
 function budget(result) {
   if (Array.isArray(result) && result.length > MAX_ROWS) {
@@ -70,7 +70,7 @@ function budget(result) {
   let out = typeof result === "string" ? result : JSON.stringify(result, null, 1);
   if (out.length > MAX_BYTES) {
     out = out.slice(0, MAX_BYTES) +
-      `\n\n… [truncated at ${MAX_BYTES} chars to protect context. Narrow the query — pass a filter argument, or query one item at a time.]`;
+      `\n\n… [truncated at ${MAX_BYTES} chars to protect context. Narrow the query, pass a filter argument, or query one item at a time.]`;
   }
   return out;
 }
@@ -107,7 +107,7 @@ tool(server, "search_code",
     const rows = d.prepare(
       `SELECT path, start_line, snippet(chunks, 2, '>>>', '<<<', ' … ', 24) AS snippet
        FROM chunks WHERE chunks MATCH ? ORDER BY rank LIMIT ?`
-    ).all(safe, clamp(limit ?? 8, 1, 25));
+).all(safe, clamp(limit ?? 8, 1, 25));
     // Attribute each hit to its enclosing symbol: "UserService.findById" beats a bare line
     // number, and saves the agent an open-the-file round trip to find out what it hit.
     const encl = d.prepare(`SELECT s.name, s.parent FROM symbols s JOIN files f ON f.id=s.file_id
@@ -120,7 +120,7 @@ tool(server, "search_code",
   }));
 
 tool(server, "context_pack",
-  "ONE call that assembles everything relevant to working on a target (a file path, class, or method): its outline, callers, blast radius, the Kafka topics / DB tables / HTTP endpoints it touches, the architectural decisions governing those, and any cached insight. Use this INSTEAD of six separate lookups when starting work on something — it is the cheapest way to load focused context, and it is budgeted so it cannot flood the window.",
+  "ONE call that assembles everything relevant to working on a target (a file path, class, or method): its outline, callers, blast radius, the Kafka topics / DB tables / HTTP endpoints it touches, the architectural decisions governing those, and any cached insight. Use this INSTEAD of six separate lookups when starting work on something, it is the cheapest way to load focused context, and it is budgeted so it cannot flood the window.",
   { target: z.string().min(1).max(300) },
   ({ target }) => withDb((d) => {
     // resolve target -> a file (accept a path, or a symbol name)
@@ -186,13 +186,13 @@ tool(server, "context_pack",
         calls: httpCalls.map((c) => `${c.method} ${c.path}`),
       },
       governing_decisions: govern.length ? govern.map((g) => `${g.id}: ${g.title}`) : "none recorded",
-      cached_insight: insight ?? "none — run enrichment, or synthesize and save_insight",
+      cached_insight: insight ?? "none, run enrichment, or synthesize and save_insight",
       next: "This is the focused context for this target. Go deeper only where needed: find_references (certainty), blast_radius (full list), message_flow/db_map/http_map (the other side of a seam).",
     };
   }));
 
 tool(server, "find_symbol",
-  "Look up functions/classes/types by name (substring by default). Returns kind, signature, file, line — enough to reference without reading the file.",
+  "Look up functions/classes/types by name (substring by default). Returns kind, signature, file, line, enough to reference without reading the file.",
   { name: z.string().min(1).max(120), exact: z.boolean().optional() },
   ({ name, exact }) => withDb((d) => {
     const rows = exact
@@ -232,7 +232,7 @@ tool(server, "blast_radius",
       const marks = [...frontier].map(() => "?").join(",");
       const rows = d.prepare(
         `SELECT DISTINCT e.src, f2.path FROM edges e JOIN files f2 ON f2.id=e.src WHERE e.dst IN (${marks})`
-      ).all(...frontier);
+).all(...frontier);
       frontier = new Set(rows.map((r) => r.src).filter((id) => !seen.has(id)));
       frontier.forEach((id) => seen.add(id));
       if (rows.length) levels.push([...new Set(rows.map((r) => r.path))].sort());
@@ -246,7 +246,7 @@ tool(server, "dependencies",
   ({ path: p }) => withDb((d) => {
     const rows = d.prepare(
       `SELECT f2.path p FROM files f JOIN edges e ON e.src=f.id JOIN files f2 ON f2.id=e.dst WHERE f.path=?`
-    ).all(p).map((r) => r.p);
+).all(p).map((r) => r.p);
     return rows.length ? rows : "No in-repo dependencies found.";
   }));
 
@@ -271,7 +271,7 @@ tool(server, "module_map",
   }));
 
 tool(server, "hotspots",
-  "Most-depended-on files (highest in-degree) — highest-risk to change, best places to start understanding the architecture.",
+  "Most-depended-on files (highest in-degree), highest-risk to change, best places to start understanding the architecture.",
   { limit: z.number().int().optional() },
   ({ limit }) => withDb((d) =>
     d.prepare(`SELECT f.path, COUNT(e.src) dependents FROM files f JOIN edges e ON e.dst=f.id
@@ -285,8 +285,8 @@ tool(server, "find_callers",
       `SELECT s.name AS caller, s.parent, f.path, c.line FROM calls c
        JOIN symbols s ON s.id=c.src_symbol JOIN files f ON f.id=s.file_id
        WHERE c.callee = ? ORDER BY f.path, c.line LIMIT ?`
-    ).all(name, clamp(limit ?? 40, 1, 100));
-    return rows.length ? rows : "No callers recorded (AST index may not cover this file's language, or name mismatch — try find_references for SCIP-grade lookup).";
+).all(name, clamp(limit ?? 40, 1, 100));
+    return rows.length ? rows : "No callers recorded (AST index may not cover this file's language, or name mismatch, try find_references for SCIP-grade lookup).";
   }));
 
 tool(server, "find_callees",
@@ -296,12 +296,12 @@ tool(server, "find_callees",
     const rows = d.prepare(
       `SELECT DISTINCT c.callee, c.line FROM calls c JOIN symbols s ON s.id=c.src_symbol
        WHERE s.name = ? ORDER BY c.line LIMIT 60`
-    ).all(name);
+).all(name);
     return rows.length ? rows : "No callees recorded for that symbol.";
   }));
 
 tool(server, "find_references",
-  "COMPILER-GRADE (requires SCIP ingest): every place a symbol is actually used, resolved by the compiler — not text matching. Returns definition site + reference sites.",
+  "COMPILER-GRADE (requires SCIP ingest): every place a symbol is actually used, resolved by the compiler, not text matching. Returns definition site + reference sites.",
   { name: z.string().min(1).max(200), limit: z.number().int().optional() },
   ({ name, limit }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='scip_refs'").get()) {
@@ -326,29 +326,29 @@ tool(server, "goto_definition",
     }
     const rows = d.prepare(
       "SELECT symbol, path, line, docs FROM scip_defs WHERE symbol LIKE ? ORDER BY length(symbol) LIMIT 10"
-    ).all(`%${name}%`);
+).all(`%${name}%`);
     return rows.length ? rows : "Not found in SCIP index; try find_symbol.";
   }));
 
 tool(server, "explain",
-  "Cached LLM insight for a module or file: intent, responsibilities, system connections, gotchas. Generated by the enrichment layer (hash-cached — regenerated only when content changes). Falls back with guidance if no insight exists or it's stale.",
+  "Cached LLM insight for a module or file: intent, responsibilities, system connections, gotchas. Generated by the enrichment layer (hash-cached, regenerated only when content changes). Falls back with guidance if no insight exists or it's stale.",
   { target: z.string().min(1).max(300) },
   ({ target }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='insights'").get()) {
-      return "No insights yet. Run enrichment: node .ariadne/enrich.mjs (see PRIVACY.md — opt-in, supports fully-local models via OPENAI_BASE_URL).";
+      return "No insights yet. Run enrichment: node .ariadne/enrich.mjs (see PRIVACY.md, opt-in, supports fully-local models via OPENAI_BASE_URL).";
     }
     const row = d.prepare("SELECT * FROM insights WHERE target=? OR target LIKE ? LIMIT 1").get(target, "%" + target + "%");
     if (!row) return `No cached insight for '${target}'. Ask Hermes to derive one from the graph, or run enrich.`;
     let stale = "";
     if (row.kind === "file") {
       const f = d.prepare("SELECT hash FROM files WHERE path=?").get(row.target);
-      if (f && f.hash !== row.hash) stale = " [STALE: file changed since this was generated — re-run enrich]";
+      if (f && f.hash !== row.hash) stale = " [STALE: file changed since this was generated, re-run enrich]";
     }
     return `${row.kind} ${row.target} (model: ${row.model})${stale}\n\n${row.summary}`;
   }));
 
 tool(server, "decisions",
-  "Decision memory (Mnemosyne): query architectural decisions with temporal validity. Filter by free text, a governed target (topic/table/module), status, or as_of (YYYY-MM-DD) for time-travel ('what was valid last March'). Decisions are parsed from ADR markdown in the repos — the source of truth stays in git.",
+  "Decision memory (Mnemosyne): query architectural decisions with temporal validity. Filter by free text, a governed target (topic/table/module), status, or as_of (YYYY-MM-DD) for time-travel ('what was valid last March'). Decisions are parsed from ADR markdown in the repos, the source of truth stays in git.",
   { query: z.string().max(200).optional(), target: z.string().max(200).optional(),
     status: z.string().max(30).optional(), as_of: z.string().max(10).optional() },
   ({ query, target, status, as_of }) => withDb((d) => {
@@ -372,7 +372,7 @@ tool(server, "decisions",
   }));
 
 tool(server, "decision_trace",
-  "Full lineage of one decision: supersession chain (what replaced what, when), governed artifacts with existence check (flags decisions referencing topics/tables that no longer exist in the graph — decision drift).",
+  "Full lineage of one decision: supersession chain (what replaced what, when), governed artifacts with existence check (flags decisions referencing topics/tables that no longer exist in the graph, decision drift).",
   { id: z.string().min(1).max(60) },
   ({ id }) => withDb((d) => {
     const rec = d.prepare("SELECT * FROM decisions WHERE id=?").get(id.toUpperCase());
@@ -435,7 +435,7 @@ tool(server, "save_decision",
   });
 
 tool(server, "save_insight",
-  "Persist a derived insight for a module or file into the graph (served by `explain`, hash-keyed so it auto-stales when content changes). Use after synthesizing understanding from the graph tools — this is how assistants (Copilot, Claude, etc.) enrich the shared knowledge layer.",
+  "Persist a derived insight for a module or file into the graph (served by `explain`, hash-keyed so it auto-stales when content changes). Use after synthesizing understanding from the graph tools, this is how assistants (Copilot, Claude, etc.) enrich the shared knowledge layer.",
   { target: z.string().min(1).max(300), kind: z.enum(["module", "file"]), summary: z.string().min(40).max(4000) },
   ({ target, kind, summary }) => {
     // dedicated writable connection: the shared handle is read-only by design
@@ -457,7 +457,7 @@ tool(server, "save_insight",
   });
 
 tool(server, "graph_gaps",
-  "Where static analysis is BLIND — the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, drift tables, and unmatched calls, each with file:line. Use this to find what needs a human or an assistant to work out, then record the answer with assert_edge. This is how the graph gets better instead of staying wrong.",
+  "Where static analysis is BLIND, the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, drift tables, and unmatched calls, each with file:line. Use this to find what needs a human or an assistant to work out, then record the answer with assert_edge. This is how the graph gets better instead of staying wrong.",
   { limit: z.number().int().optional() },
   ({ limit }) => withDb((d) => {
     const n = clamp(limit ?? 20, 1, 60);
@@ -467,37 +467,37 @@ tool(server, "graph_gaps",
     gaps.unresolved_topic_expressions = q(
       `SELECT m.topic AS expression, f.path, m.line FROM msg_edges m JOIN files f ON f.id=m.file_id
        WHERE m.resolved=0 LIMIT ?`, n)
-      .map((r) => ({ ...r, why: "topic name is assembled at runtime — static analysis cannot evaluate it" }));
+      .map((r) => ({ ...r, why: "topic name is assembled at runtime, static analysis cannot evaluate it" }));
 
     const per = q(`SELECT topic, SUM(direction='produce') p, SUM(direction='consume') c FROM msg_edges GROUP BY topic`);
     gaps.topics_produced_but_never_consumed = per.filter((t) => t.p && !t.c).slice(0, n)
-      .map((t) => ({ topic: t.topic, why: "no consumer found — dead topic, a consumer outside the workspace, or a dynamic listener the parser missed" }));
+      .map((t) => ({ topic: t.topic, why: "no consumer found, dead topic, a consumer outside the workspace, or a dynamic listener the parser missed" }));
     gaps.topics_consumed_but_never_produced = per.filter((t) => t.c && !t.p).slice(0, n)
-      .map((t) => ({ topic: t.topic, why: "no producer found — an upstream repo not indexed, or a dynamic producer the parser missed" }));
+      .map((t) => ({ topic: t.topic, why: "no producer found, an upstream repo not indexed, or a dynamic producer the parser missed" }));
 
     gaps.tables_accessed_but_undefined = q(
       `SELECT DISTINCT a.tbl AS table_name, f.path, a.line FROM db_access a JOIN files f ON f.id=a.file_id
        WHERE a.tbl NOT IN (SELECT tbl FROM db_defs) LIMIT ?`, n)
-      .map((r) => ({ ...r, why: "DRIFT — code touches it but no Liquibase changeset defines it here (other repo? dynamic DDL? a real bug?)" }));
+      .map((r) => ({ ...r, why: "DRIFT, code touches it but no Liquibase changeset defines it here (other repo? dynamic DDL? a real bug?)" }));
 
     const eps = q(`SELECT e.method, e.path, e.norm FROM http_endpoints e`);
     const calls = q(`SELECT c.method, c.norm FROM http_calls c`);
     gaps.endpoints_with_no_caller = eps
       .filter((e) => !calls.some((c) => c.method === e.method && pathsMatch(c.norm, e.norm)))
       .slice(0, n)
-      .map((e) => ({ endpoint: `${e.method} ${e.path}`, why: "nobody in the workspace calls it — dead route, an external consumer, or a gateway rewrite the parser cannot see" }));
+      .map((e) => ({ endpoint: `${e.method} ${e.path}`, why: "nobody in the workspace calls it, dead route, an external consumer, or a gateway rewrite the parser cannot see" }));
 
     const total = Object.values(gaps).reduce((a, b) => a + b.length, 0);
     return {
       summary: total
         ? `${total} things static analysis could not resolve. Investigate the code at each location; when you work out the answer, record it with assert_edge so the whole team's graph improves.`
-        : "No gaps found — static analysis resolved everything it looked at.",
+        : "No gaps found, static analysis resolved everything it looked at.",
       ...gaps,
     };
   }));
 
 tool(server, "assert_edge",
-  "Record a fact you DERIVED by reading code that static analysis could not resolve — a runtime-assembled Kafka topic, a dynamically built SQL table, a gateway-rewritten route. Writes to docs/graph-assertions.json (git-committed and reviewable, exactly like an ADR) and into the graph, tagged with your name so it is never mistaken for a parsed fact. Requires evidence: quote the code that convinced you. Only assert what you can defend.",
+  "Record a fact you DERIVED by reading code that static analysis could not resolve, a runtime-assembled Kafka topic, a dynamically built SQL table, a gateway-rewritten route. Writes to docs/graph-assertions.json (git-committed and reviewable, exactly like an ADR) and into the graph, tagged with your name so it is never mistaken for a parsed fact. Requires evidence: quote the code that convinced you. Only assert what you can defend.",
   {
     kind: z.enum(["kafka", "db", "http_endpoint", "http_call"]),
     file: z.string().min(1).max(400),
@@ -519,7 +519,7 @@ tool(server, "assert_edge",
     const d = new Database(DB_PATH, { readonly: true });
     let hash = null;
     try { hash = d.prepare("SELECT hash FROM files WHERE path=?").get(a.file)?.hash ?? null; } finally { d.close(); }
-    if (!hash) return `File '${a.file}' is not in the index — check the path (it is repo-prefixed in a multi-repo workspace).`;
+    if (!hash) return `File '${a.file}' is not in the index, check the path (it is repo-prefixed in a multi-repo workspace).`;
 
     const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
     let list = [];
@@ -531,11 +531,11 @@ tool(server, "assert_edge",
     list.push(rec);
     fs.mkdirSync(path.dirname(af), { recursive: true });
     fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
-    return `Asserted and recorded in docs/graph-assertions.json (${list.length} total). It enters the graph on the next index — tagged 'asserted', never mixed with parsed facts, and marked STALE automatically if ${a.file} changes. Commit the file to share it with the team.`;
+    return `Asserted and recorded in docs/graph-assertions.json (${list.length} total). It enters the graph on the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically if ${a.file} changes. Commit the file to share it with the team.`;
   });
 
 tool(server, "message_flow",
-  "Kafka topology: correlate inbound/outbound message handling across modules. No args = full topic map (each topic's producers and consumers with file:line, plus orphans — topics produced but never consumed or vice versa). Pass topic for one topic's flow. Topics resolved from literals, constants, and application.yaml placeholders.",
+  "Kafka topology: correlate inbound/outbound message handling across modules. No args = full topic map (each topic's producers and consumers with file:line, plus orphans, topics produced but never consumed or vice versa). Pass topic for one topic's flow. Topics resolved from literals, constants, and application.yaml placeholders.",
   { topic: z.string().max(200).optional() },
   ({ topic }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='msg_edges'").get()) {
@@ -563,14 +563,14 @@ tool(server, "message_flow",
     const rows = d.prepare(
       `SELECT m.topic, m.direction, f.path, m.line, m.resolved, m.via${hasSrc ? ", m.source" : ""} FROM msg_edges m
        JOIN files f ON f.id=m.file_id ${where} ORDER BY m.topic, m.direction`
-    ).all(...(topic ? [topic] : []));
+).all(...(topic ? [topic] : []));
     if (!rows.length) return topic ? `No handlers found for topic '${topic}'.` : "No Kafka producers/consumers detected.";
     const topics = {};
     for (const r of rows) {
       const t = (topics[r.topic] ??= { producers: [], consumers: [], unresolved: [] });
       const asserted = r.source && r.source !== "static";
       const site = `${r.path}:${r.line}` + (r.via && !asserted ? ` (via ${r.via})` : "")
-        + (asserted ? `  [ASSERTED by ${r.source.split(":")[1]} — derived, not parsed]` : "");
+        + (asserted ? `  [ASSERTED by ${r.source.split(":")[1]}, derived, not parsed]` : "");
       if (!r.resolved) t.unresolved.push(site);
       else (r.direction === "produce" ? t.producers : t.consumers).push(site);
     }
@@ -630,7 +630,7 @@ tool(server, "db_map",
   }));
 
 tool(server, "http_map",
-  "Full-stack HTTP seam: correlate REST endpoints (Spring controllers) with every caller — TS/React fetch/axios, Java RestTemplate/WebClient/Feign — matched on method + normalized path ({id}, :id, ${expr} all correlate). No args = full map with orphans (endpoints nobody calls; calls hitting no known endpoint). Pass path to filter.",
+  "Full-stack HTTP seam: correlate REST endpoints (Spring controllers) with every caller (TS/React fetch/axios, Java RestTemplate/WebClient/Feign) matched on method + normalized path ({id}, :id, ${expr} all correlate). No args = full map with orphans (endpoints nobody calls; calls hitting no known endpoint). Pass path to filter.",
   { path: z.string().max(300).optional() },
   ({ path: pf }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='http_endpoints'").get()) {
@@ -679,7 +679,7 @@ tool(server, "http_map",
     }
     const unmatched = calls.filter((c, i) => !matchedCalls.has(i) && (!pf || c.norm.includes(pf)));
     if (unmatched.length) {
-      out.push({ unmatched_calls: unmatched.map((c) => `${c.method} ${c.path} — ${c.fp}:${c.line} (${c.client}) — no matching endpoint in workspace (external API, or path built dynamically)`) });
+      out.push({ unmatched_calls: unmatched.map((c) => `${c.method} ${c.path}, ${c.fp}:${c.line} (${c.client}), no matching endpoint in workspace (external API, or path built dynamically)`) });
     }
     return out;
   }));

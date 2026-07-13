@@ -73,7 +73,7 @@ function resolveExpr(raw, configMap, constants) {
   const results = [];
 
   // Runtime concatenation: PREFIX + "." + env. Resolve every part we can and mark
-  // the whole thing UNRESOLVED with a partial like "orders.created.{?}" — that tells
+  // the whole thing UNRESOLVED with a partial like "orders.created.{?}", that tells
   // an assistant exactly what is missing, instead of silently picking one literal
   // out of the expression and calling it the topic name (which is a lie).
   if (/\+/.test(expr)) {

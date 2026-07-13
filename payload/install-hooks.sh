@@ -15,7 +15,7 @@ if [ -f "$GR/indexer.mjs" ]; then
   command -v node >/dev/null || { echo "Error: Node >=18 required (https://nodejs.org)"; exit 1; }
   INDEX_CMD='node "$(git rev-parse --show-toplevel)/.ariadne/indexer.mjs"'
   echo "Runtime: Node ($(node --version))"
-  ( cd "$GR" && npm install --silent --no-audit --no-fund )
+  (cd "$GR" && npm install --silent --no-audit --no-fund)
 elif [ -f "$GR/indexer.py" ]; then
   RUNTIME=python
   PY="$(command -v python3 || command -v python || true)"
@@ -37,7 +37,7 @@ install_hook () {
   [ -f "$hook" ] || echo "#!/usr/bin/env bash" > "$hook"
   cat >> "$hook" <<HOOK
 
-$marker — keep the codebase graph fresh (background; never blocks git; lockfile prevents overlap)
+$marker, keep the codebase graph fresh (background; never blocks git; lockfile prevents overlap)
 (nohup bash -c "$INDEX_CMD --incremental && if [ -f \"$(git rev-parse --show-toplevel)/.ariadne/docgen.mjs\" ]; then node \"$(git rev-parse --show-toplevel)/.ariadne/docgen.mjs\"; elif [ -f \"$(git rev-parse --show-toplevel)/.ariadne/docgen.py\" ]; then python3 \"$(git rev-parse --show-toplevel)/.ariadne/docgen.py\"; fi" >> "\$(git rev-parse --show-toplevel)/.ariadne/index.log" 2>&1 &) || true
 HOOK
   chmod +x "$hook"

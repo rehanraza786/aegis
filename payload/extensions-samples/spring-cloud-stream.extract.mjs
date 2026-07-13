@@ -1,7 +1,7 @@
 /** Sample seam extractor: Spring Cloud Stream functional bindings.
  * @Bean Consumer/Supplier/Function beans + spring.cloud.stream.bindings.<name>-in/out-0.destination
  * become msg_edges, flowing through message_flow/docgen like native Kafka edges.
- * Drop into .ariadne/extensions/ — the same contract covers gateways, gRPC, GraphQL, etc. */
+ * Drop into .ariadne/extensions/, the same contract covers gateways, gRPC, GraphQL, etc. */
 const BEAN_RE = /@Bean\s+(?:public\s+)?(Consumer|Supplier|Function)\s*<[^>]*>\s+(\w+)\s*\(|fun\s+(\w+)\s*\(\s*\)\s*:\s*(Consumer|Supplier|Function)\b/g;
 
 export const extractors = {

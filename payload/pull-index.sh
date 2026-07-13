@@ -2,7 +2,7 @@
 # Pull the latest team-shared ariadne index built by GitLab CI (job: aegis-index).
 #
 # Works two ways (first available wins):
-#   1. glab CLI (free, official: https://gitlab.com/gitlab-org/cli) — `glab auth login` once
+#   1. glab CLI (free, official: https://gitlab.com/gitlab-org/cli). `glab auth login` once
 #   2. curl + a token in $GITLAB_TOKEN (a read_api Project Access Token is enough)
 #
 # Optional env overrides:

@@ -7,7 +7,7 @@ def register(mcp, db):
         """List TODO/FIXME markers across the workspace (todo sample extension)."""
         con = db()
         if not con.execute("SELECT name FROM sqlite_master WHERE name='todos'").fetchone():
-            return "todo extension pass hasn't run — reindex."
+            return "todo extension pass hasn't run, reindex."
         rows = con.execute("SELECT f.path, t.line, t.text FROM todos t JOIN files f ON f.id=t.file_id LIMIT ?",
                            (min(limit, 200),)).fetchall()
         return "\n".join(f"{r[0]}:{r[1]} {r[2]}" for r in rows) or "No TODOs found."

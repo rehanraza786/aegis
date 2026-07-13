@@ -176,7 +176,7 @@ public class DynamicPublisher {
     for i in range(50):
         prod.append(f'  public void p{i}(Object o) {{ kafkaTemplate.send("bulk.t{i:02d}", o); }}')
         cons.append(f'  @KafkaListener(topics = "bulk.t{i:02d}")\n  public void c{i}(Object o) {{ h(o); }}')
-    for i in range(7):  # orphan producers — must survive truncation
+    for i in range(7):  # orphan producers, must survive truncation
         prod.append(f'  public void op{i}(Object o) {{ kafkaTemplate.send("bulk.orphan{i}", o); }}')
     prod.append("}")
     cons.append("}")
@@ -191,7 +191,7 @@ public class DynamicPublisher {
     dao = ["package com.acme;", "public class BulkDao {", "  private final JdbcTemplate jdbcTemplate;"]
     for i in range(65):
         dao.append(f'  public int q{i}() {{ return jdbcTemplate.queryForObject("SELECT count(*) FROM bt_{i:02d}", Integer.class); }}')
-    for i in range(3):  # DRIFT — must survive truncation
+    for i in range(3):  # DRIFT, must survive truncation
         dao.append(f'  public int d{i}() {{ return jdbcTemplate.queryForObject("SELECT count(*) FROM bulk_drift{i}", Integer.class); }}')
     dao.append("}")
     w(sc / "src/main/java/com/acme/BulkDao.java", "\n".join(dao))
@@ -489,7 +489,7 @@ await c.close();
     doc = sidx.documents.add()
     doc.relative_path = "order-service/src/main/java/com/acme/OrderController.java"
     occ = doc.occurrences.add()
-    occ.symbol = "semanticdb maven . . com/acme/OrderController#list()."
+    occ.symbol = "semanticdb maven . com/acme/OrderController#list()."
     occ.symbol_roles = 1  # definition
     occ.range[:] = [5, 2, 6]
     doc2 = sidx.documents.add()

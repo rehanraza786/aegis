@@ -236,7 +236,7 @@ function connect() {
       try { db?.close(); } catch { /* half-open */ }
       try { fs.renameSync(DB_PATH, aside); } catch { /* best effort */ }
       for (const sfx of ["-wal", "-shm"]) { try { fs.rmSync(DB_PATH + sfx); } catch { /* absent */ } }
-      log("WARN", `Index was corrupt — moved to ${path.basename(aside)}; rebuilding fresh`);
+      log("WARN", `Index was corrupt, moved to ${path.basename(aside)}; rebuilding fresh`);
       db = new Database(DB_PATH);
     } else { throw e; }
   }
@@ -244,7 +244,7 @@ function connect() {
   db.pragma("busy_timeout = 5000");
   db.pragma("foreign_keys = ON");
   // WAL + NORMAL is durable across app crashes (only a power cut can lose the
-  // last commit — and this is a rebuildable derived index, so that's free speed).
+  // last commit, and this is a rebuildable derived index, so that's free speed).
   db.pragma("synchronous = NORMAL");
   db.pragma("cache_size = -64000");   // 64 MB page cache
   db.pragma("temp_store = MEMORY");
@@ -303,7 +303,7 @@ function connect() {
   try { db.exec("ALTER TABLE symbols ADD COLUMN parent TEXT"); } catch { /* exists */ }
   try { db.exec("ALTER TABLE files ADD COLUMN size INTEGER"); } catch { /* exists */ }
   // provenance: 'static' (parsed) vs 'asserted:<author>' (derived by an assistant).
-  // These are NEVER silently mixed — every tool that reads them reports which is which.
+  // These are NEVER silently mixed, every tool that reads them reports which is which.
   for (const t of ["msg_edges", "db_access", "http_endpoints", "http_calls"]) {
     try { db.exec(`ALTER TABLE ${t} ADD COLUMN source TEXT DEFAULT 'static'`); } catch { /* exists */ }
   }
@@ -365,7 +365,7 @@ async function indexFile(db, relpath, force = false) {
   db.prepare("DELETE FROM files WHERE path=?").run(relpath);
   const fid = db.prepare(
     "INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime) VALUES(?,?,?,?,?,?,?)"
-  ).run(relpath, lang, hash, text.split("\n").length, Date.now() / 1000, st.size, st.mtimeMs).lastInsertRowid;
+).run(relpath, lang, hash, text.split("\n").length, Date.now() / 1000, st.size, st.mtimeMs).lastInsertRowid;
 
   const insSym = db.prepare("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,?)");
   const insCall = db.prepare("INSERT INTO calls(src_symbol, callee, line) VALUES(?,?,?)");
@@ -603,7 +603,7 @@ async function kafkaPass(db, scopePrefixes = null) {
   }
 
   // ---- Assertions: facts an assistant derived where static analysis is blind ----
-  // Source of truth is docs/graph-assertions.json — committed, reviewed in PRs, shared.
+  // Source of truth is docs/graph-assertions.json, committed, reviewed in PRs, shared.
   // The index is derived from it, exactly like ADRs.
   {
     db.exec("DELETE FROM assertions");
@@ -661,7 +661,7 @@ async function kafkaPass(db, scopePrefixes = null) {
       const idm = rel.match(/(ADR-[\w.]+?)(?:[-_][\w-]*)?\.md$/i) ?? text.match(/#\s*(ADR-[\w.]+)/i);
       if (!idm) continue;
       const id = idm[1].toUpperCase();
-      const title = (text.match(/^#\s*ADR-[\w.]+\s*[:—-]\s*(.+)$/im)?.[1]
+      const title = (text.match(/^#\s*ADR-[\w.]+\s*[:, -]\s*(.+)$/im)?.[1]
         ?? text.match(/^#\s*(.+)$/m)?.[1] ?? id).trim();
       const status = (text.match(/^\s*Status\s*:\s*(\w+)/im)?.[1] ?? "accepted").toLowerCase();
       let decided = text.match(/^\s*Date\s*:\s*([\d]{4}-[\d]{2}-[\d]{2})/im)?.[1];
@@ -717,7 +717,7 @@ function stamp(db) {
 }
 
 /** Run body inside a single write transaction. Without this, better-sqlite3
- *  auto-commits every INSERT — an fsync per row, which dominates large indexes. */
+ *  auto-commits every INSERT, an fsync per row, which dominates large indexes. */
 async function inTx(db, body) {
   db.exec("BEGIN");
   try { const r = await body(); db.exec("COMMIT"); return r; }
@@ -730,7 +730,7 @@ async function fullIndex(db, rebuild = false) {
   return inTx(db, async () => {
   if (rebuild) {
     // Deleting files cascade-wipes every correlation row, so the extraction cache
-    // MUST go too — otherwise the passes compare hashes, conclude "nothing changed",
+    // MUST go too, otherwise the passes compare hashes, conclude "nothing changed",
     // and rebuild into an empty graph.
     db.exec("DELETE FROM files; DELETE FROM chunks;");
     try { db.exec("DELETE FROM extract_cache"); db.exec("DELETE FROM meta WHERE key='config_fp'"); } catch { /* fresh db */ }

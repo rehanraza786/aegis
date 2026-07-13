@@ -27,9 +27,9 @@ HOOK = f"""#!/bin/sh
 AR="{CWD.as_posix()}/.ariadne"
 [ -f "$AR/indexer.mjs" ] && IDX="node \\"$AR/indexer.mjs\\"" || IDX="${{PYTHON:-python3}} \\"$AR/indexer.py\\""
 command -v python3 >/dev/null 2>&1 || PYTHON=python
-( eval "$IDX --incremental" >> "$AR/index.log" 2>&1
+(eval "$IDX --incremental" >> "$AR/index.log" 2>&1
   if [ -f "$AR/docgen.mjs" ]; then node "$AR/docgen.mjs" >> "$AR/index.log" 2>&1; \\
-  elif [ -f "$AR/docgen.py" ]; then ${{PYTHON:-python3}} "$AR/docgen.py" >> "$AR/index.log" 2>&1; fi ) &
+  elif [ -f "$AR/docgen.py" ]; then ${{PYTHON:-python3}} "$AR/docgen.py" >> "$AR/index.log" 2>&1; fi) &
 exit 0
 """
 
@@ -62,7 +62,7 @@ if RUNTIME == "node":
 else:
     cmd = [PY, str(HERE / "indexer.py"), "--full"]
 if subprocess.run(cmd, cwd=CWD).returncode != 0:
-    sys.exit("Index failed — see .ariadne/index.log")
+    sys.exit("Index failed, see .ariadne/index.log")
 dg = HERE / ("docgen.mjs" if RUNTIME == "node" else "docgen.py")
 subprocess.run((["node"] if RUNTIME == "node" else [PY]) + [str(dg)], cwd=CWD)
 print("AEGIS setup complete.")

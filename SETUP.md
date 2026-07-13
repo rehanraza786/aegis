@@ -1,4 +1,4 @@
-# AEGIS — Setup
+# AEGIS. Setup
 
 Three roles below: **maintainer** (does this once), **each developer**
 (5 minutes), and **daily use**. Then: how to distribute this toolkit to
@@ -6,28 +6,28 @@ other teams.
 
 ---
 
-## Part 1 — Maintainer: one-time setup for your repo
+## Part 1. Maintainer: one-time setup for your repo
 
 **1. Get the toolkit onto your machine** (see Part 4 for hosting it) and run
 the installer from your project repo's root:
 
 ```bash
 cd ~/code/your-project
-bash ~/downloads/aegis-toolkit/install.sh                    # Node edition (default — fits a TS team; needs Node >=18)
+bash ~/downloads/aegis-toolkit/install.sh                    # Node edition (default, fits a TS team; needs Node >=18)
 bash ~/downloads/aegis-toolkit/install.sh --runtime=python   # Python edition (needs Python 3.10+)
 ```
 
 Both editions are functionally identical (same DB schema, same 15 MCP tools (workspace-wide),
-same SCIP support) — pick whichever runtime your team already has. The Node
+same SCIP support), pick whichever runtime your team already has. The Node
 edition's deps install via `npm install` inside `.ariadne/`; Python's via pip.
 
 The installer copies in (skipping anything that already exists):
-- `.github/skills/` — complex-task-breakdown, spec-gap-analysis, codebase-orientation, feature-delivery-loop, peer-code-review, spec-driven-artifacts
-- `.github/agents/` — daedalus, themis, pythia
-- `.github/copilot-instructions.md` — appends the routing section
-- `.ariadne/` — MCP server, indexers, scripts
-- `.vscode/mcp.json` — MCP server registration
-- `gitlab-ci-aegis.yml` — CI job to merge into your pipeline
+- `.github/skills/`: complex-task-breakdown, spec-gap-analysis, codebase-orientation, feature-delivery-loop, peer-code-review, spec-driven-artifacts
+- `.github/agents/`: daedalus, themis, pythia
+- `.github/copilot-instructions.md`: appends the routing section
+- `.ariadne/`: MCP server, indexers, scripts
+- `.vscode/mcp.json`: MCP server registration
+- `gitlab-ci-aegis.yml`: CI job to merge into your pipeline
 
 It also installs the dependencies, builds the initial index, and wires the
 git hooks for your clone.
@@ -51,7 +51,7 @@ tokens → scope `read_api`) OR tell the team to install `glab` and run
 
 ---
 
-## Part 2 — Each developer (5 minutes, per clone)
+## Part 2, Each developer (5 minutes, per clone)
 
 ```bash
 cd ~/code/your-project && git pull
@@ -60,7 +60,7 @@ cd ~/code/your-project && git pull
 bash .ariadne/install-hooks.sh
 
 # 3. pull the shared compiler-grade index from CI
-glab auth login          # once — or: export GITLAB_TOKEN=<team token>
+glab auth login          # once, or: export GITLAB_TOKEN=<team token>
 bash .ariadne/pull-index.sh
 ```
 
@@ -69,14 +69,14 @@ Then in VS Code:
    (or Command Palette → *MCP: List Servers* → ariadne → Start).
 2. Open Copilot Chat, switch to **Agent mode**, click the tools icon,
    confirm the `ariadne` tools are checked.
-3. Sanity check — ask: *"Call index_status and module_map"*.
+3. Sanity check, ask: *"Call index_status and module_map"*.
 
 Windows note: use Git Bash for the shell steps, and change `"python3"` to
 `"python"` in `.vscode/mcp.json`.
 
 ---
 
-## Part 3 — Daily use
+## Part 3. Daily use
 
 Mostly: nothing. The routing in copilot-instructions makes Copilot use the
 graph tools and knowledge base automatically. The hooks keep your local
@@ -96,9 +96,9 @@ Things you do explicitly:
 
 ---
 
-## Part 4 — Distributing this toolkit to others
+## Part 4. Distributing this toolkit to others
 
-The toolkit is just files — host it anywhere people can clone from.
+The toolkit is just files, host it anywhere people can clone from.
 
 ### Option A: GitLab (your home turf)
 
@@ -111,21 +111,21 @@ The toolkit is just files — host it anywhere people can clone from.
    cd ~/code/their-project && bash /tmp/ct/install.sh
    ```
 4. Ship updates by tagging releases (`git tag v0.2.0 && git push --tags`);
-   users re-clone and re-run — the installer never clobbers modified files.
+   users re-clone and re-run, the installer never clobbers modified files.
 
 ### Option B: GitHub (widest reach)
 
 1. Create a public repo, push the toolkit.
 2. Mark it a **Template repository** (Settings → check "Template repository")
    so others can click **Use this template** to fork their own copy.
-3. Create a **Release** and attach a zip — non-git users can just download.
+3. Create a **Release** and attach a zip, non-git users can just download.
 4. One-liner install for users:
    ```bash
    git clone https://github.com/you/aegis-toolkit.git /tmp/ct \
      && cd your-project && bash /tmp/ct/install.sh
    ```
 5. GitHub-only bonus for the skills: they can also be installed individually
-   with GitHub CLI — `gh skill install you/aegis-toolkit <skill-name>`
+   with GitHub CLI. `gh skill install you/aegis-toolkit <skill-name>`
    (requires the skills to sit in a `skills/` dir at repo root; keep a copy
    there if you want this path). You can also submit them to the community
    `github/awesome-copilot` collection.
@@ -136,7 +136,7 @@ Push to GitLab as the source of truth; add a GitHub remote and
 `git push github main` to mirror. GitLab can also do this automatically:
 Settings → Repository → Mirroring repositories.
 
-### What travels where — compatibility matrix
+### What travels where, compatibility matrix
 
 | Component | GitHub-hosted repo | GitLab-hosted repo |
 |---|---|---|
@@ -146,7 +146,7 @@ Settings → Repository → Mirroring repositories.
 | Copilot cloud agent / PR review | ✅ | ❌ (GitHub-hosted features) |
 
 *If a downstream team is on GitHub, tell them to ask Copilot to convert
-`gitlab-ci-aegis.yml` to a GitHub Actions workflow — it's a 1:1 mapping
+`gitlab-ci-aegis.yml` to a GitHub Actions workflow, it's a 1:1 mapping
 (checkout, setup-node/java/python, same script lines, upload-artifact).
 
 ---
@@ -166,45 +166,6 @@ Settings → Repository → Mirroring repositories.
 
 ---
 
-## VS Code extension distribution (.vsix)
-
-The `extension/` folder contains a packaged VS Code extension that bundles the
-whole payload. To rebuild after changing the toolkit:
-```bash
-cd extension && cp -r ../payload . && npm i -D @vscode/vsce && npx vsce package --allow-missing-repository
-```
-
-**Distribute internally (no marketplace account needed):**
-- Attach the `.vsix` to a GitLab release; devs install via
-  `code --install-extension aegis-toolkit-0.1.0.vsix` or VS Code →
-  Extensions → `...` menu → *Install from VSIX*.
-
-**Publish publicly:** create a publisher at marketplace.visualstudio.com (set
-the real `publisher` id in extension/package.json), then `npx vsce publish`.
-For an open ecosystem also publish to open-vsx.org (`npx ovsx publish`).
-
-What the extension does: one-command install of skills/agents/Ariadne into the
-current workspace, automatic MCP registration of Ariadne with Copilot (VS Code
-≥1.99 via the MCP server definition provider API; older versions use the
-generated `.vscode/mcp.json`), plus commands for reindex, index status, and
-pulling the team-shared CI index.
-
-## Exposing the .vsix from your GitHub repository
-
-1. Push this toolkit repo to GitHub — `.github/workflows/release-vsix.yml` is already in place. (GitLab ignores the .github directory, so mirroring is safe.)
-2. Tag a release: `git tag v0.1.0 && git push --tags` — the workflow builds the
-   `.vsix` and attaches it to a public Release automatically.
-3. Anyone can then install it from your repo's **Releases** page:
-   download → `code --install-extension aegis-toolkit-*.vsix`
-   (or VS Code → Extensions → ⋯ → Install from VSIX).
-4. Add a README badge/link so it's visible:
-   `[![Get the extension](https://img.shields.io/github/v/release/YOU/aegis?label=AEGIS%20vsix)](https://github.com/YOU/aegis/releases/latest)`
-5. Optional wider reach: publish to the VS Code Marketplace (`vsce publish`,
-   needs a free publisher account) and open-vsx.org (`ovsx publish`) so users
-   can install by searching "AEGIS" — see PRIVACY.md; the extension contains
-   no telemetry either way.
-
-
 ## Switching graph engines
 
 AEGIS's skills and agents are graph-engine-agnostic. The engine is selected in
@@ -223,7 +184,7 @@ paragraph appended to copilot-instructions. External engines manage their own
 indexes, so .ariadne/, git hooks, and the aegis-index CI job are skipped.
 Switching later: edit `graphEngine` (and `mcp.command/args`) in aegis.json,
 update the "Codebase graph engine" section of copilot-instructions, and reload
-VS Code. Defaults for external engines' launch commands are best-effort — verify
+VS Code. Defaults for external engines' launch commands are best-effort, verify
 against each engine's README and adjust aegis.json accordingly.
 
 
@@ -232,7 +193,7 @@ Ariadne now extracts symbols via WASM tree-sitter (Node edition) /
 tree-sitter-language-pack (Python edition) for Java, TypeScript/TSX,
 JavaScript, and Python: exact symbol locations regardless of formatting,
 class-nesting (`UserService.findById`), and a heuristic call graph powering
-two new tools — `find_callers` and `find_callees`. No native binaries in the
+two new tools. `find_callers` and `find_callees`. No native binaries in the
 Node edition's parser (WASM), so it runs in locked-down devpods. If the AST
 engine can't load, indexing falls back to the regex extractors automatically
 and logs a warning; other languages always use regex. Compiler-grade
@@ -241,38 +202,38 @@ resolution still comes from the SCIP layer (`find_references`).
 ## Kafka message-flow correlation
 Ariadne correlates inbound/outbound Kafka handling across Java/Kotlin modules
 via the `message_flow` MCP tool: each topic's producers and consumers with
-file:line, resolved through three mechanisms — string literals, static-final
+file:line, resolved through three mechanisms, string literals, static-final
 constants (`ORDERS_TOPIC`), and `${...}` placeholders looked up in flattened
 application.yaml/.properties. Orphans are flagged (produced-but-never-consumed
 and vice versa), and unresolvable dynamic expressions are listed rather than
 dropped. Detected patterns: @KafkaListener(topics=...), consumer.subscribe(...),
 *template/*producer .send(topic,...), new ProducerRecord<>(topic,...).
-Limitations: static analysis within the indexed workspace — topics built by
+Limitations: static analysis within the indexed workspace, topics built by
 runtime string concatenation and cross-repo flows aren't visible (pair with
 Confluent Stream Lineage or Springwolf AsyncAPI docs for runtime/spec views);
 Spring Cloud Stream function bindings not yet parsed.
 
 ## Database & Liquibase correlation
 The `db_map` MCP tool correlates every table with (a) the Liquibase changesets
-that shaped it — XML, YAML, and formatted-SQL changelogs, each op tagged with
-its author:id — and (b) every code site touching it: JPA @Entity/@Table
+that shaped it. XML, YAML, and formatted-SQL changelogs, each op tagged with
+its author:id, and (b) every code site touching it: JPA @Entity/@Table
 mappings (camelCase→snake_case default naming handled), Spring Data
 repositories (via their entity generic), @Query (both native SQL and JPQL
 resolved through the entity map), and JdbcTemplate calls with literal or
 constant SQL, each tagged read/write. Two drift warnings: code accessing a
 table no changelog defines, and tables defined but never accessed.
-Limitations: static analysis — dynamically built SQL, Querydsl/Criteria API,
+Limitations: static analysis, dynamically built SQL, Querydsl/Criteria API,
 custom @Table naming strategies, and cross-repo schemas aren't resolved;
 derived query methods (findByStatus...) attribute to the repository's entity
 table, not per-method.
 
 ## Multi-repo workspace mode
 Ariadne now indexes an entire VS Code workspace of repos as one graph. Root
-discovery order: ARIADNE_ROOTS env (comma-separated paths — the extension sets
+discovery order: ARIADNE_ROOTS env (comma-separated paths, the extension sets
 this automatically for multi-root workspaces) → the current git repo → child
 git directories of the cwd (a parent folder holding your repos). Paths are
 stored repo-prefixed (order-service/src/...), incremental indexing stamps and
-diffs per repo, and Kafka/DB correlation works across repos — a producer in
+diffs per repo, and Kafka/DB correlation works across repos, a producer in
 one repo matches a consumer in another. The index lives in
 $ARIADNE_HOME/.ariadne (defaults to the first root). Git hooks remain
 per-repo; a commit in any repo refreshes only that repo's slice.
@@ -285,16 +246,16 @@ search_code and the Themis gap analysis can cite them.
 
 ## Generated documentation & progress reporting
 `docgen` (node .ariadne/docgen.mjs / python3 .ariadne/docgen.py) produces five
-artifacts in docs/generated/ deterministically — zero LLM tokens — on every CI
+artifacts in docs/generated/ deterministically (zero LLM tokens) on every CI
 merge (wired into the aegis-index job, published as artifacts, with an optional
 commented block to auto-commit them back):
-- architecture.md — module map + Mermaid dependency flowchart + hotspot list
-- message-flows.md — Kafka topology diagram + per-topic sites + orphan warnings
-- data-map.md — tables ↔ services Mermaid + Liquibase changeset history + drift
-- PROGRESS.md — manager/PO report: overall %, Mermaid pie, per-feature table
-  (status, %, tasks, FRs, open clarifications, last review verdict) — computed
+- architecture.md, module map + Mermaid dependency flowchart + hotspot list
+- message-flows.md. Kafka topology diagram + per-topic sites + orphan warnings
+- data-map.md, tables ↔ services Mermaid + Liquibase changeset history + drift
+- PROGRESS.md, manager/PO report: overall %, Mermaid pie, per-feature table
+  (status, %, tasks, FRs, open clarifications, last review verdict), computed
   from docs/features/*/ artifacts, so it's true whenever the delivery loop runs
-- agent-context.md — the ~100-line orientation pack agents read FIRST
+- agent-context.md, the ~100-line orientation pack agents read FIRST
   (copilot-instructions now routes there), listing modules, topics, tables,
   high-risk files, the cheapest-first lookup order, and standing rules
 
@@ -316,18 +277,18 @@ gateway rewrites/base-path config, and GraphQL are not modeled.
 Every indexed file stores its SHA-1 **of the raw bytes** plus size and mtime.
 Two-tier skip on every run: (1) size+mtime identical → skipped without even
 reading the file; (2) stat changed but checksum identical (touch, fresh clone,
-CI checkout) → skipped after a cheap hash, **before** any extraction — so a
+CI checkout) → skipped after a cheap hash, **before** any extraction, so a
 PDF seen once is never text-extracted again unless its bytes actually change.
 Changed MDs and code reindex exactly themselves. `--full` is now *refresh*
-semantics (prune removed files, skip unchanged — cheap enough to run anywhere);
+semantics (prune removed files, skip unchanged, cheap enough to run anywhere);
 `--rebuild` forces a from-scratch reindex (schema upgrades, suspected corruption).
 One-time note upgrading from ≤2.0: hashes migrate to raw-byte semantics, so each
 file re-hashes once on its first stat change. Automation is therefore complete:
 git hooks per commit (incremental + docgen for either runtime) and the CI job
-per merge (index + SCIP + docgen + shared artifacts) — no manual steps.
+per merge (index + SCIP + docgen + shared artifacts), no manual steps.
 
 ### Maven note
-scip-java autodetects Maven from the root pom.xml (multi-module included) — the
+scip-java autodetects Maven from the root pom.xml (multi-module included), the
 CI job needs no changes for Maven; it just requires a JDK in the image. pom.xml
 files are themselves indexed (config), so search_code finds dependency and
 module declarations.
@@ -335,11 +296,11 @@ module declarations.
 ## Lombok support
 Three layers make Lombok-heavy codebases first-class:
 1. Entity detection parses the full annotation block before each class, order-
-   independently — @Table before @Entity under a stack of Lombok annotations
+   independently, @Table before @Entity under a stack of Lombok annotations
    resolves correctly (this was a latent bug for annotation-stacked entities).
 2. Generated members are synthesized into the symbol graph: @Getter/@Setter/
    @Data/@Value/@Builder produce getX/setX/isX (booleans)/builder()/build()
-   entries tagged "[Lombok-generated]", nested under their class — so
+   entries tagged "[Lombok-generated]", nested under their class, so
    find_symbol, file_outline, and find_callers resolve members that don't
    exist in source. static final constants are excluded.
 3. Compiler-grade truth still comes from SCIP: scip-java runs inside your
@@ -356,7 +317,7 @@ HTTP seam matching, PDF FTS, checksum caching, scoped passes, docgen output,
 hook installation). `.github/workflows/test.yml` runs the suite on every push
 across a matrix of ubuntu + windows × node + python; the badge goes green on your first push.
 
-**Windows:** setup is now cross-platform — `node .ariadne/setup.mjs` (or
+**Windows:** setup is now cross-platform. `node .ariadne/setup.mjs` (or
 `python .ariadne/setup.py`) installs hooks in every workspace repo, writes
 gitignores, and builds the initial index on Windows/mac/Linux; the extension
 uses these instead of bash and passes env through VS Code's terminal API
@@ -365,7 +326,7 @@ with its bundled shell. The .sh installers remain for mac/Linux/Git-Bash CLI use
 
 **Pass scoping:** the Kafka/DB/HTTP/Lombok passes now cache per-file constants
 and entity maps (keyed by content hash) and, on incremental runs, re-extract
-rows only for repos with changes — logged as "Passes scoped to N/M repos".
+rows only for repos with changes, logged as "Passes scoped to N/M repos".
 A semantic change to any application config, constant, or entity mapping
 automatically widens back to a full pass, so cross-repo correlation can never
 go stale.
@@ -374,20 +335,20 @@ go stale.
 ## LLM semantic layer
 `node .ariadne/enrich.mjs` (or `python3 .ariadne/enrich.py`) applies an LLM on
 top of the graph: per-module and per-hotspot-file insight summaries built from
-graph-derived prompt packs (outlines, callers, topics, tables, endpoints — not
+graph-derived prompt packs (outlines, callers, topics, tables, endpoints, not
 raw files), stored hash-keyed in the index and served to agents via the new
 `explain` MCP tool (with staleness flags) plus docs/generated/insights.md.
-Token economics: each target costs tokens exactly once per content change —
+Token economics: each target costs tokens exactly once per content change.
 CI re-runs are near-free. Providers: Anthropic, any OpenAI-compatible endpoint
 (set OPENAI_BASE_URL to a local Ollama/vLLM for fully-offline enrichment), or
 --provider mock (deterministic, used by the self-tests). Opt-in and off by
 default; the CI job runs it only when a key variable is present. This is the
-one feature with an LLM in the write path — everything else stays deterministic.
+one feature with an LLM in the write path, everything else stays deterministic.
 
 ## Copilot insights, plugin architecture, and updates
 **Copilot as the insight provider:** `AEGIS: Enrich Insights via Copilot` runs
 the enrichment loop through VS Code's Language Model API against your existing
-Copilot subscription — consent-prompted, no API keys, hash-cached like every
+Copilot subscription, consent-prompted, no API keys, hash-cached like every
 provider. Under the hood it's `enrich --plan` → Copilot → `enrich --apply`, so
 any external driver can implement the same loop. Additionally the new
 `save_insight` MCP tool lets any agent persist synthesized understanding
@@ -395,37 +356,37 @@ directly ("study the billing module with the graph tools, then save_insight"),
 served back by `explain` with automatic staleness.
 
 **Plugin architecture:** indexer passes, MCP tools, doc generators, insight
-providers, skills, and agents are all drop-in extensible — see EXTENDING.md.
+providers, skills, and agents are all drop-in extensible, see EXTENDING.md.
 A working TODO-scanner sample (pass + tool, both editions) ships in
 payload/extensions-samples/ and is exercised by the self-test suite.
 
 **Updates:** `AEGIS: Update Workspace Payload` overwrites AEGIS-managed files
 from the installed extension version while preserving aegis.json,
-.ariadne/config.json, your extensions/, the index, and Delphi knowledge —
+.ariadne/config.json, your extensions/, the index, and Delphi knowledge.
 solving the "install once, stuck forever" upgrade gap.
 
 
 ## Gradle, Kotlin AST, and seam extractors
 **Gradle:** scip-java autodetects Gradle (build.gradle/.kts, using ./gradlew if
-present) exactly as it does Maven — the CI job needs no changes beyond a JDK.
+present) exactly as it does Maven, the CI job needs no changes beyond a JDK.
 build.gradle and *.kts files are indexed, so search_code finds dependency
 declarations.
 
 **Kotlin:** first-class AST via the tree-sitter Kotlin grammar in both
-editions — classes/objects, methods nested under their class, and call-graph
-edges (fun handle -> repo.find), same as Java. .kts covered. All the
+editions, classes/objects, methods nested under their class, and call-graph
+edges (fun handle -> repo.find), same as Java.kts covered. All the
 regex-based seams (Kafka/DB/HTTP annotations) already matched Kotlin syntax.
 
 **Seam extractors (pluggable gap-5):** `.ariadne/extensions/*.extract.*`
 modules export per-hook functions whose rows are inserted into the NATIVE
-graph tables — so a house framework's messaging or routing shows up in
+graph tables, so a house framework's messaging or routing shows up in
 message_flow/db_map/http_map, docgen diagrams, and orphan warnings with zero
 core changes. A working Spring Cloud Stream extractor ships as the sample and
 runs in the self-test suite; gateway rewrites, gRPC service maps, and GraphQL
 resolvers follow the same ~30-line pattern.
 
 
-## Decision memory — Mnemosyne
+## Decision memory. Mnemosyne
 Gap 6 (Graphiti-style decision memory) implemented with the architecture
 inverted for privacy: git-versioned ADR markdown is the source of truth, a
 deterministic pass builds a temporal index (decided_at / valid_until /
@@ -433,9 +394,9 @@ superseded_by, resolved from Supersedes: headers), and decision→artifact links
 are cross-referenced against the live graph (topics, tables, modules). Copilot
 is the intelligence layer through three MCP tools, using only your existing
 seats: `decisions` (filter by text/target/status, time-travel via as_of),
-`decision_trace` (full supersession lineage + drift check — flags decisions
+`decision_trace` (full supersession lineage + drift check, flags decisions
 governing topics/tables that no longer exist), and `save_decision` (captures a
-choice settled in chat as a numbered ADR file + instant index entry — "we just
+choice settled in chat as a numbered ADR file + instant index entry. "we just
 decided to use the outbox pattern, record it"). docgen emits decisions.md and
 agent-context lists standing decisions so agents implement WITH the decision
 record, not against it. No graph database, no extraction API keys, zero egress.
@@ -444,10 +405,10 @@ record, not against it. No graph database, no extraction API keys, zero egress.
 - **Workspace Trust:** the extension will not auto-register a workspace's MCP
   server, install, or run setup while VS Code is in Restricted Mode; it
   activates automatically when trust is granted. (Extensions in
-  .ariadne/extensions/ execute with your privileges by design — review them
+  .ariadne/extensions/ execute with your privileges by design, review them
   like any code in your repo.)
 - **Corruption auto-recovery:** a corrupt index is detected via PRAGMA
-  quick_check, moved aside as index.db.corrupt-<ts>, and rebuilt fresh —
+  quick_check, moved aside as index.db.corrupt-<ts>, and rebuilt fresh.
   verified by a self-test that feeds the indexer a garbage file.
 - **Log rotation:** .ariadne/index.log is truncated to its last 512 KB once it
   exceeds 5 MB, at process start.
@@ -456,13 +417,13 @@ record, not against it. No graph database, no extraction API keys, zero egress.
   libraries don't break until manual intervention.
 - **Suite depth:** the self-tests now also cover corruption recovery, the SCIP
   compiler-grade layer (via a generated protobuf fixture asserting a
-  cross-stack definition→reference pair), and an MCP smoke test — a real
+  cross-stack definition→reference pair), and an MCP smoke test, a real
   protocol round-trip on the node edition (tool inventory + a decisions query)
   and module-surface calls on python. 59 assertions per edition.
 
 Known remaining items (tracked, not blockers): first Windows verification
 happens on your GitHub push (matrix is ready); large-repo (100k+ LOC)
-benchmarking — note the correlation pass holds changed-scope file texts in
+benchmarking, note the correlation pass holds changed-scope file texts in
 memory; the anthropic/openai HTTP provider paths in enrich are exercised only
 by the mock in CI; marketplace publishing; and schema DOWNGRADES require
 --rebuild (upgrades migrate automatically).
@@ -482,31 +443,31 @@ self-diagnosis when the tools misbehave).
 
 They are wired into copilot-instructions, so Copilot reaches for them from the
 phrasing of a request without being told. The self-test suite validates every
-skill's frontmatter, name/directory agreement, and description quality — twelve
+skill's frontmatter, name/directory agreement, and description quality, twelve
 skills, five agents.
 
 
 ## Three more agents
-The roster covered building, reviewing, auditing, documenting, and indexing —
+The roster covered building, reviewing, auditing, documenting, and indexing.
 but nothing owned the three activities a team actually spends its week on
 besides writing new features.
 
-- **asclepius** — diagnosis. Reproduce, map the expected path from the graph,
+- **asclepius**: diagnosis. Reproduce, map the expected path from the graph,
   walk back to the last known-good hop, form competing hypotheses and try to
   *disprove* the leading one, fix the cause, prove it, then check what else the
   fault was quietly corrupting. Knows the blind spots static analysis has
   (transaction boundaries, serialization mismatches, per-profile config) and
   checks them by hand.
-- **hephaestus** — refactoring and migration, behavior-preserving by mandate.
+- **hephaestus**: refactoring and migration, behavior-preserving by mandate.
   Inventory from compiler-grade find_references rather than grep; expand /
   migrate / contract as the default strategy; every increment ends green; the
   old surface is deleted only when proven dead; contracts (message_flow, db_map,
   http_map) must be identical before and after. Stops cleanly rather than
   leaving a half-migration.
-- **metis** — architecture counsel. Grounds options in the codebase via the
+- **metis**: architecture counsel. Grounds options in the codebase via the
   graph, checks standing ADRs before contradicting them, gives at least two real
   options with costs and blast radius, recommends with the one sentence that
-  decides it, states what would change its mind — and then calls save_decision
+  decides it, states what would change its mind, and then calls save_decision
   so the reasoning survives. This is what makes the decision-memory layer
   actually get used; a capture tool nobody remembers to call is dead weight.
 
@@ -519,14 +480,14 @@ The graph is a file: `.ariadne/index.db`. Nothing rebuilds it from scratch
 unless you run `--rebuild` explicitly.
 
 - **Locally** it persists across editor restarts, reboots, and chat sessions.
-  The MCP server opens it read-only and contains no indexing code at all — it
+  The MCP server opens it read-only and contains no indexing code at all, it
   cannot build a graph, only read one. Git hooks keep it current incrementally
   (a changed file is tens of milliseconds); `--full` is a refresh, not a
   rebuild, and reindexes zero files on an unchanged tree.
 - **Across the team**, CI publishes `.ariadne/index.db` and `docs/generated/`
   as artifacts on every default-branch merge. `pull-index.sh` (or the *Pull Team
-  Index* command) fetches it, so a new clone gets the complete graph — SCIP
-  layer included, which is the expensive part — in seconds rather than building
+  Index* command) fetches it, so a new clone gets the complete graph. SCIP
+  layer included, which is the expensive part, in seconds rather than building
   it locally.
 - **In CI**, the job now caches the index between runs (`cache.key:
   aegis-index-$CI_DEFAULT_BRANCH`), so each pipeline reindexes only what the
@@ -539,7 +500,7 @@ unless you run `--rebuild` explicitly.
 
 ## Context budget on large codebases
 
-The index itself never enters context — only tool results do — so index size is
+The index itself never enters context (only tool results do) so index size is
 free. What is not free is a tool that returns everything, so nothing does:
 
 - `message_flow`, `db_map`, and `http_map` called with no filter return a
@@ -577,7 +538,7 @@ What changed:
 - **SQLite pragmas**: `synchronous=NORMAL` (safe for a rebuildable derived index),
   a 64 MB page cache, in-memory temp store, and a 256 MB mmap.
 - **File-level extraction scoping.** The correlation passes used to re-read every
-  Java/TS file in a changed *repo* — useless on a monolith, which is one repo. They
+  Java/TS file in a changed *repo*, useless on a monolith, which is one repo. They
   now re-extract only the files whose content hash actually moved, tracked in
   `extract_cache`. A change to a config value, topic constant, or entity mapping
   still widens automatically to a full re-extract, because those can alter how every
@@ -588,7 +549,7 @@ What changed:
 
 For focus:
 
-- **`context_pack`** — one call assembles everything needed to start work on a
+- **`context_pack`**: one call assembles everything needed to start work on a
   target: outline, callers, blast radius, the Kafka topics / tables / endpoints it
   touches, the ADRs governing those, and any cached insight. Replaces six or more
   round trips with a single sub-1 KB result. Each MCP round trip costs a model turn
@@ -603,14 +564,14 @@ For focus:
 Static analysis cannot evaluate code, so runtime-assembled topics, tables, and
 routes are blind spots. Three tools close the loop:
 
-- **`graph_gaps`** — the graph's own to-do list: unresolved expressions (reported
+- **`graph_gaps`**: the graph's own to-do list: unresolved expressions (reported
   as partials like `orders.created.{?}` rather than guesses), orphan topics and
   endpoints, drift tables, each with file:line and why it could not be resolved.
-- **`assert_edge`** — records a fact an assistant derived by reading the code, with
+- **`assert_edge`**: records a fact an assistant derived by reading the code, with
   mandatory evidence. Written to `docs/graph-assertions.json` (git-committed,
   reviewed in PRs, exactly like an ADR) and loaded into the graph on the next index.
 - Provenance columns on every seam row (`static` vs `asserted:<author>`), surfaced
-  in every tool as `[ASSERTED — derived, not parsed]`. Derived facts are never
+  in every tool as `[ASSERTED, derived, not parsed]`. Derived facts are never
   silently mixed with parsed ones, and each carries the hash of its evidence file so
   it is flagged STALE when that file changes.
 
@@ -632,3 +593,30 @@ passes concluded "nothing changed" and rebuilt into an empty graph.
 that makes a toolkit feel heavier than it is. Orientation now owns the full lookup
 ladder (agent-context → generated docs → graph tools → knowledge base → source, and
 only then) plus the duty to keep the knowledge base truthful after a change.
+
+
+## Publishing to GitHub
+
+Create an empty repo (no README, no licence, no .gitignore; they are already here), then:
+
+    git init
+    git add -A
+    git commit -m "AEGIS v0.1.0"
+    git branch -M main
+    git remote add origin git@github.com:<you>/aegis.git
+    git push -u origin main
+
+The push runs `.github/workflows/test.yml`: both runtimes on ubuntu and windows.
+
+To cut a release:
+
+    git tag v0.1.0
+    git push --tags
+
+`release-vsix.yml` builds the extension, syncs its version to the tag, and attaches
+`aegis-toolkit-0.1.0.vsix` to a GitHub Release. Install with
+`code --install-extension aegis-toolkit-0.1.0.vsix`.
+
+If the release job fails with a 403 while uploading, go to Settings, Actions,
+General, Workflow permissions, and select "Read and write permissions". Actions
+minutes are unlimited on public repos and capped on private ones.

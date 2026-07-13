@@ -277,7 +277,7 @@ def connect():
                     os.remove(str(DB_PATH) + sfx)
                 except OSError:
                     pass
-            log.warning("Index was corrupt — moved to %s; rebuilding fresh", Path(aside).name)
+            log.warning("Index was corrupt, moved to %s; rebuilding fresh", Path(aside).name)
             con = sqlite3.connect(DB_PATH, timeout=10)
         else:
             raise
@@ -365,7 +365,7 @@ def index_file(con, relpath, force=False):
         buf = full.read_bytes()
     except OSError:
         return None
-    # fast path 2: raw-byte checksum, BEFORE any extraction — a touched-but-identical
+    # fast path 2: raw-byte checksum, BEFORE any extraction, a touched-but-identical
     # file (incl. PDFs) is caught here without paying extraction cost
     h = hashlib.sha1(buf).hexdigest()
     if not force and prev and prev[0] == h:
@@ -733,7 +733,7 @@ def kafka_pass(con, scope_prefixes=None):
         if not idm:
             continue
         did = idm.group(1).upper()
-        tm = re.search(r"^#\s*ADR-[\w.]+\s*[:—-]\s*(.+)$", text, re.M) or re.search(r"^#\s*(.+)$", text, re.M)
+        tm = re.search(r"^#\s*ADR-[\w.]+\s*[:, -]\s*(.+)$", text, re.M) or re.search(r"^#\s*(.+)$", text, re.M)
         title = (tm.group(1) if tm else did).strip()
         sm = re.search(r"^\s*Status\s*:\s*(\w+)", text, re.I | re.M)
         status = (sm.group(1) if sm else "accepted").lower()
@@ -804,7 +804,7 @@ def full_index(con, rebuild=False):
     t0 = time.time()
     if rebuild:
         # Deleting files cascade-wipes every correlation row, so the extraction cache
-        # must go too — otherwise the passes compare hashes, conclude "nothing changed",
+        # must go too, otherwise the passes compare hashes, conclude "nothing changed",
         # and rebuild into an empty graph.
         con.execute("DELETE FROM files")
         con.execute("DELETE FROM chunks")

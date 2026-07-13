@@ -1,5 +1,5 @@
 /**
- * AST-grade extraction via WASM tree-sitter (no native binaries — devpod-safe).
+ * AST-grade extraction via WASM tree-sitter (no native binaries, devpod-safe).
  * Extracts symbols with class nesting + signatures, and call sites for a
  * heuristic call graph. Gracefully returns null if WASM init fails, letting
  * the indexer fall back to regex extraction.
@@ -100,7 +100,7 @@ function calleeName(node) {
   const fn = node.childForFieldName?.("function") ?? node.childForFieldName?.("name")
     ?? node.childForFieldName?.("constructor") ?? node.childForFieldName?.("type");
   if (!fn) {
-    // kotlin: call_expression has no field names — first child is the callee expr
+    // kotlin: call_expression has no field names, first child is the callee expr
     const first = node.namedChildren[0];
     if (!first) return null;
     if (first.type === "simple_identifier") return first.text;

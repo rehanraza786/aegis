@@ -92,7 +92,7 @@ print(json.dumps(cfg, indent=2))
 PYEOF
     echo "  + aegis.json (engine: $ENGINE)"
   else
-    echo "  skip (exists): aegis.json — edit graphEngine there to switch"
+    echo "  skip (exists): aegis.json, edit graphEngine there to switch"
   fi
 
   if [ "$ENGINE" = ariadne ]; then
@@ -109,7 +109,7 @@ PYEOF
 
   echo "-- VS Code MCP config"
   if [ -f .vscode/mcp.json ]; then
-    echo "  skip (exists): .vscode/mcp.json — add the ariadne server manually (see SETUP.md)"
+    echo "  skip (exists): .vscode/mcp.json, add the ariadne server manually (see SETUP.md)"
   else
     mkdir -p .vscode
     if [ "$ENGINE" = ariadne ]; then
@@ -144,7 +144,7 @@ fi
 echo
 echo "Done. Next steps:"
 echo "  1. Review changes:  git status"
-echo "  2. Commit the .github/, .ariadne/, .vscode/ additions"
+echo "  2. Commit the .github/.ariadne/.vscode/ additions"
 echo "  3. GitLab teams: merge the job from gitlab-ci-aegis.yml into .gitlab-ci.yml"
 echo "  4. In VS Code: open .vscode/mcp.json and click Start; verify tools in Copilot agent mode"
 echo "  5. Read SETUP.md in the toolkit for daily-use guidance"

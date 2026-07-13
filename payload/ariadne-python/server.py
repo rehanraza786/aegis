@@ -4,7 +4,7 @@ Ariadne (GraphRAG-style)-style MCP server over the codebase index built by index
 
 Exposes compact, token-efficient tools for retrieving code knowledge:
 graph traversal (dependencies, dependents, blast radius), symbol lookup,
-and lexical full-text search — so agents pull a few precise rows instead
+and lexical full-text search, so agents pull a few precise rows instead
 of reading whole files.
 
 Run (stdio): python3 server.py
@@ -46,7 +46,7 @@ def _has_warning(r):
 
 
 def budget(result):
-    """Cap rows and bytes. Warning-bearing entries are kept FIRST and never dropped —
+    """Cap rows and bytes. Warning-bearing entries are kept FIRST and never dropped.
     a truncated dump that silently discards the drift warning is worse than useless."""
     if isinstance(result, list) and len(result) > MAX_ROWS:
         total = len(result)
@@ -60,7 +60,7 @@ def budget(result):
     out = result if isinstance(result, str) else json.dumps(result, indent=1)
     if len(out) > MAX_BYTES:
         out = out[:MAX_BYTES] + (f"\n\n… [truncated at {MAX_BYTES} chars to protect context. "
-                                 "Narrow the query — pass a filter argument, or query one item at a time.]")
+                                 "Narrow the query, pass a filter argument, or query one item at a time.]")
     return out
 
 
@@ -220,7 +220,7 @@ def context_pack(target: str) -> str:
         "database": tables or "none",
         "http": {"defines": defines, "calls": hcalls},
         "governing_decisions": govern or "none recorded",
-        "cached_insight": insight or "none — run enrichment, or synthesize and save_insight",
+        "cached_insight": insight or "none, run enrichment, or synthesize and save_insight",
         "next": "Focused context for this target. Go deeper only where needed: find_references (certainty), "
                 "blast_radius (full list), message_flow/db_map/http_map (the other side of a seam).",
     }, indent=1)
@@ -228,7 +228,7 @@ def context_pack(target: str) -> str:
 
 @mcp.tool()
 def find_symbol(name: str, exact: bool = False) -> str:
-    """Look up functions/classes/types by name (substring by default). Returns kind, signature, file, and line — enough to reference or jump to it without reading the file."""
+    """Look up functions/classes/types by name (substring by default). Returns kind, signature, file, and line, enough to reference or jump to it without reading the file."""
     con = db()
     q = name if exact else f"%{name}%"
     op = "=" if exact else "LIKE"
@@ -343,7 +343,7 @@ def find_callees(name: str) -> str:
 
 @mcp.tool()
 def find_references(name: str, limit: int = 40) -> str:
-    """COMPILER-GRADE (requires SCIP ingest): find every place a symbol is actually used, resolved by the compiler — not text matching. Give a function/class/method name. Returns definition site + all reference sites."""
+    """COMPILER-GRADE (requires SCIP ingest): find every place a symbol is actually used, resolved by the compiler, not text matching. Give a function/class/method name. Returns definition site + all reference sites."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='scip_refs'").fetchone():
         return "SCIP data not ingested. Run scip-typescript/scip-java then .ariadne/scip_ingest.py (see README). Falling back: use search_code instead."
@@ -378,11 +378,11 @@ def goto_definition(name: str) -> str:
 
 @mcp.tool()
 def explain(target: str) -> str:
-    """Cached LLM insight for a module or file: intent, responsibilities, system connections, gotchas. Hash-cached — regenerated only when content changes."""
+    """Cached LLM insight for a module or file: intent, responsibilities, system connections, gotchas. Hash-cached, regenerated only when content changes."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='insights'").fetchone():
         return ("No insights yet. Run enrichment: python3 .ariadne/enrich.py "
-                "(opt-in, supports fully-local models via OPENAI_BASE_URL — see PRIVACY.md).")
+                "(opt-in, supports fully-local models via OPENAI_BASE_URL, see PRIVACY.md).")
     row = con.execute("SELECT * FROM insights WHERE target=? OR target LIKE ? LIMIT 1",
                       (target, f"%{target}%")).fetchone()
     if not row:
@@ -391,7 +391,7 @@ def explain(target: str) -> str:
     if row["kind"] == "file":
         f = con.execute("SELECT hash FROM files WHERE path=?", (row["target"],)).fetchone()
         if f and f["hash"] != row["hash"]:
-            stale = " [STALE: file changed since this was generated — re-run enrich]"
+            stale = " [STALE: file changed since this was generated, re-run enrich]"
     return f"{row['kind']} {row['target']} (model: {row['model']}){stale}\n\n{row['summary']}"
 
 
@@ -516,7 +516,7 @@ def save_insight(target: str, kind: str, summary: str) -> str:
 
 @mcp.tool()
 def graph_gaps(limit: int = 20) -> str:
-    """Where static analysis is BLIND — the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, and drift tables, each with file:line. Investigate, then record what you work out with assert_edge. This is how the graph gets better instead of staying wrong."""
+    """Where static analysis is BLIND, the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, and drift tables, each with file:line. Investigate, then record what you work out with assert_edge. This is how the graph gets better instead of staying wrong."""
     from http_extract import paths_match as _pm
     con = db()
     n = min(max(limit, 1), 60)
@@ -530,27 +530,27 @@ def graph_gaps(limit: int = 20) -> str:
     gaps = {}
     gaps["unresolved_topic_expressions"] = [
         {"expression": r["topic"], "path": r["path"], "line": r["line"],
-         "why": "topic name is assembled at runtime — static analysis cannot evaluate it"}
+         "why": "topic name is assembled at runtime, static analysis cannot evaluate it"}
         for r in q("SELECT m.topic, f.path, m.line FROM msg_edges m JOIN files f ON f.id=m.file_id "
                    "WHERE m.resolved=0 LIMIT ?", n)]
     per = q("SELECT topic, SUM(direction='produce') p, SUM(direction='consume') c FROM msg_edges GROUP BY topic")
     gaps["topics_produced_but_never_consumed"] = [
-        {"topic": r["topic"], "why": "no consumer found — dead topic, a consumer outside the workspace, "
+        {"topic": r["topic"], "why": "no consumer found, dead topic, a consumer outside the workspace, "
                                      "or a dynamic listener the parser missed"}
         for r in per if r["p"] and not r["c"]][:n]
     gaps["topics_consumed_but_never_produced"] = [
-        {"topic": r["topic"], "why": "no producer found — an upstream repo not indexed, or a dynamic producer"}
+        {"topic": r["topic"], "why": "no producer found, an upstream repo not indexed, or a dynamic producer"}
         for r in per if r["c"] and not r["p"]][:n]
     gaps["tables_accessed_but_undefined"] = [
         {"table_name": r["tbl"], "path": r["path"], "line": r["line"],
-         "why": "DRIFT — code touches it but no Liquibase changeset defines it here"}
+         "why": "DRIFT, code touches it but no Liquibase changeset defines it here"}
         for r in q("SELECT DISTINCT a.tbl, f.path, a.line FROM db_access a JOIN files f ON f.id=a.file_id "
                    "WHERE a.tbl NOT IN (SELECT tbl FROM db_defs) LIMIT ?", n)]
     eps = q("SELECT method, path, norm FROM http_endpoints")
     calls = q("SELECT method, norm FROM http_calls")
     gaps["endpoints_with_no_caller"] = [
         {"endpoint": f"{e['method']} {e['path']}",
-         "why": "nobody in the workspace calls it — dead route, external consumer, or a gateway rewrite"}
+         "why": "nobody in the workspace calls it, dead route, external consumer, or a gateway rewrite"}
         for e in eps
         if not any(c["method"] == e["method"] and _pm(c["norm"], e["norm"]) for c in calls)][:n]
 
@@ -559,7 +559,7 @@ def graph_gaps(limit: int = 20) -> str:
         "summary": (f"{total} things static analysis could not resolve. Investigate the code at each "
                     "location; when you work out the answer, record it with assert_edge so the whole "
                     "team's graph improves.") if total else
-                   "No gaps found — static analysis resolved everything it looked at.",
+                   "No gaps found, static analysis resolved everything it looked at.",
         **gaps}, indent=1)
 
 
@@ -567,7 +567,7 @@ def graph_gaps(limit: int = 20) -> str:
 def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str = "medium",
                 topic: str = "", direction: str = "", table: str = "", mode: str = "rw",
                 method: str = "GET", path: str = "") -> str:
-    """Record a fact you DERIVED by reading code that static analysis could not resolve — a runtime-assembled Kafka topic, dynamic SQL, a gateway-rewritten route. kind: kafka|db|http_endpoint|http_call. Writes docs/graph-assertions.json (git-committed and reviewable, like an ADR) and enters the graph tagged with your name, never mistaken for a parsed fact. Requires evidence: quote the code that convinced you."""
+    """Record a fact you DERIVED by reading code that static analysis could not resolve, a runtime-assembled Kafka topic, dynamic SQL, a gateway-rewritten route. kind: kafka|db|http_endpoint|http_call. Writes docs/graph-assertions.json (git-committed and reviewable, like an ADR) and enters the graph tagged with your name, never mistaken for a parsed fact. Requires evidence: quote the code that convinced you."""
     if kind not in ("kafka", "db", "http_endpoint", "http_call"):
         return "kind must be kafka|db|http_endpoint|http_call."
     if len(evidence) < 20:
@@ -582,7 +582,7 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
     con = db()
     row = con.execute("SELECT hash FROM files WHERE path=?", (file,)).fetchone()
     if not row:
-        return f"File '{file}' is not in the index — check the path (repo-prefixed in a multi-repo workspace)."
+        return f"File '{file}' is not in the index, check the path (repo-prefixed in a multi-repo workspace)."
 
     root = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
                                text=True).stdout.strip() or Path.cwd())
@@ -605,7 +605,7 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
     af.parent.mkdir(parents=True, exist_ok=True)
     af.write_text(json.dumps(lst, indent=2) + "\n")
     return (f"Asserted and recorded in docs/graph-assertions.json ({len(lst)} total). It enters the graph on "
-            f"the next index — tagged 'asserted', never mixed with parsed facts, and marked STALE automatically "
+            f"the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically "
             f"if {file} changes. Commit the file to share it with the team.")
 
 
@@ -643,7 +643,7 @@ def message_flow(topic: str = "") -> str:
         asserted = bool(src) and src != "static"
         site = (f"{r['path']}:{r['line']}"
                 + (f" (via {r['via']})" if r["via"] and not asserted else "")
-                + (f"  [ASSERTED by {src.split(':')[1]} — derived, not parsed]" if asserted else ""))
+                + (f"  [ASSERTED by {src.split(':')[1]}, derived, not parsed]" if asserted else ""))
         if not r["resolved"]:
             t["unresolved"].append(site)
         else:
@@ -720,7 +720,7 @@ def db_map(table: str = "") -> str:
 
 @mcp.tool()
 def http_map(path: str = "") -> str:
-    """Full-stack HTTP seam: correlate REST endpoints (Spring controllers) with every caller — TS/React fetch/axios, Java RestTemplate/WebClient/Feign — matched on method + normalized path. Includes orphan endpoints and unmatched calls."""
+    """Full-stack HTTP seam: correlate REST endpoints (Spring controllers) with every caller (TS/React fetch/axios, Java RestTemplate/WebClient/Feign) matched on method + normalized path. Includes orphan endpoints and unmatched calls."""
     from http_extract import paths_match
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='http_endpoints'").fetchone():
@@ -767,7 +767,7 @@ def http_map(path: str = "") -> str:
         if not callers:
             entry["warning"] = "no caller found in the indexed workspace"
         out.append(entry)
-    unmatched = [f"{c['method']} {c['path']} — {c['fp']}:{c['line']} ({c['client']}) — no matching endpoint in workspace"
+    unmatched = [f"{c['method']} {c['path']}, {c['fp']}:{c['line']} ({c['client']}), no matching endpoint in workspace"
                  for i, c in enumerate(calls) if i not in matched and (not path or path in c["norm"])]
     if unmatched:
         out.append({"unmatched_calls": unmatched})

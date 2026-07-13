@@ -1,12 +1,12 @@
 /**
  * Database topology extraction for Spring Boot + Liquibase:
- *   definitions — Liquibase changelogs (XML / YAML / formatted SQL):
+ *   definitions. Liquibase changelogs (XML / YAML / formatted SQL):
  *       createTable, addColumn, dropTable, renameTable, FKs, raw CREATE TABLE
- *   access — JPA @Entity/@Table mapping, Spring Data repositories
+ *   access. JPA @Entity/@Table mapping, Spring Data repositories
  *       (XRepository extends JpaRepository<Entity,...>), @Query (JPQL + native),
  *       JdbcTemplate query/update/execute with literal or constant SQL.
  * Correlates table -> changesets that shaped it + every code site touching it,
- * with read/write mode — enabling drift detection (entity without changelog,
+ * with read/write mode, enabling drift detection (entity without changelog,
  * table without any code access).
  */
 

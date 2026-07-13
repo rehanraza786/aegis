@@ -6,20 +6,20 @@ Pin this. It is the whole thing.
 
 | Say this to Copilot | You get |
 | --- | --- |
-| "I'm new here — how does billing work?" | Orientation brief: structure, seams, risks, standing decisions |
-| "What breaks if I change OrderService?" | Impact across code, Kafka, DB, HTTP — and any ADR that governs it |
+| "I'm new here, how does billing work?" | Orientation brief: structure, seams, risks, standing decisions |
+| "What breaks if I change OrderService?" | Impact across code, Kafka, DB, HTTP, and any ADR that governs it |
 | "X happened but Y never did" | Traced hops with file:line, ranked suspects, honest blind spots |
 | "Add a column to payments" | Liquibase changeset → entity → every access site → verified against the graph |
 | "Publish an event when an order ships" | Topic from config (never a literal), consumers checked, correlation verified |
-| "Why do we use Kafka — still current?" | The ADR, what superseded it, what's in force now |
-| "We just decided X — record it" | A numbered ADR, written and indexed |
+| "Why do we use Kafka, still current?" | The ADR, what superseded it, what's in force now |
+| "We just decided X, record it" | A numbered ADR, written and indexed |
 | "Why can't the graph resolve this topic?" | Where it's blind, and how to teach it |
 
 ## Hand off bigger work
 
 ```
 @daedalus    build a feature end to end        @argus       review a diff before merge
-@asclepius   something's broken — diagnose it  @metis       weigh a design choice, record the ADR
+@asclepius   something's broken, diagnose it  @metis       weigh a design choice, record the ADR
 @hephaestus  rename / migrate, no behavior     @themis      does the code match the spec?
              change                            @hermes      document a flow
                                                @pythia      refresh the knowledge base
@@ -37,6 +37,6 @@ Generate Flow Docs & Progress Report · Enrich Insights via Copilot · Update Wo
 
 ## When something looks wrong
 
-`index_status` — is the graph fresh? (Hooks refresh on *commit*, not on save.)
-`graph_gaps` — what static analysis couldn't resolve, and why.
-Ask: *"aegis isn't working"* — the aegis-help skill diagnoses it.
+`index_status`, is the graph fresh? (Hooks refresh on *commit*, not on save.)
+`graph_gaps`, what static analysis couldn't resolve, and why.
+Ask: *"aegis isn't working"*, the aegis-help skill diagnoses it.

@@ -3,7 +3,7 @@
 # .ariadne/pull-index.sh
 #
 # If you already have a .gitlab-ci.yml, merge the job below into it (keep the
-# job name `aegis-index` — the pull script looks it up by name).
+# job name `aegis-index`, the pull script looks it up by name).
 
 aegis-index:
   stage: build
@@ -51,7 +51,7 @@ aegis-index:
     # ---------- Generate flow docs + progress report (zero LLM tokens) ----------
     - |
       if [ -f .ariadne/docgen.mjs ]; then node .ariadne/docgen.mjs; else python3 .ariadne/docgen.py; fi
-    # ---------- OPTIONAL: LLM semantic enrichment (opt-in — see PRIVACY.md) ----------
+    # ---------- OPTIONAL: LLM semantic enrichment (opt-in, see PRIVACY.md) ----------
     # Only runs if you set a key in CI variables; hash-caching means only changed
     # modules/files cost tokens. For fully-local models set OPENAI_BASE_URL too.
     - |
@@ -77,7 +77,7 @@ aegis-index:
       - .ariadne/index.db
     policy: pull-push
   # Tip: the slow step here is scip-java, which compiles the project. Cache your
-  # build deps too — add .m2/repository (with MAVEN_OPTS=-Dmaven.repo.local=.m2/repository)
+  # build deps too, add .m2/repository (with MAVEN_OPTS=-Dmaven.repo.local=.m2/repository)
   # or .gradle/caches to the paths above.
 
   artifacts:

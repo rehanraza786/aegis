@@ -25,9 +25,9 @@ const HOOK_BODY = `#!/bin/sh
 AR="${CWD.replaceAll("\\", "/")}/.ariadne"
 [ -f "$AR/indexer.mjs" ] && IDX="node \\"$AR/indexer.mjs\\"" || IDX="\${PYTHON:-python3} \\"$AR/indexer.py\\""
 command -v python3 >/dev/null 2>&1 || PYTHON=python
-( eval "$IDX --incremental" >> "$AR/index.log" 2>&1
+(eval "$IDX --incremental" >> "$AR/index.log" 2>&1
   if [ -f "$AR/docgen.mjs" ]; then node "$AR/docgen.mjs" >> "$AR/index.log" 2>&1; \\
-  elif [ -f "$AR/docgen.py" ]; then \${PYTHON:-python3} "$AR/docgen.py" >> "$AR/index.log" 2>&1; fi ) &
+  elif [ -f "$AR/docgen.py" ]; then \${PYTHON:-python3} "$AR/docgen.py" >> "$AR/index.log" 2>&1; fi) &
 exit 0
 `;
 
@@ -38,7 +38,7 @@ for (const repo of gitRepos()) {
   for (const h of ["post-commit", "post-merge", "post-checkout"]) {
     const f = path.join(hookDir, h);
     if (fs.existsSync(f) && !fs.readFileSync(f, "utf8").includes("AEGIS")) {
-      console.log(`  skip ${h} in ${path.basename(repo)} (existing non-AEGIS hook — append manually)`);
+      console.log(`  skip ${h} in ${path.basename(repo)} (existing non-AEGIS hook, append manually)`);
       continue;
     }
     fs.writeFileSync(f, HOOK_BODY);
@@ -55,7 +55,7 @@ console.log("Building initial index (this can take a minute on large workspaces)
 const exe = runtime === "node" ? ["node", [path.join(HERE, "indexer.mjs"), "--full"]]
   : [process.platform === "win32" ? "python" : "python3", [path.join(HERE, "indexer.py"), "--full"]];
 let r = spawnSync(exe[0], exe[1], { stdio: "inherit", cwd: CWD });
-if (r.status !== 0) { console.error("Index failed — see .ariadne/index.log"); process.exit(1); }
+if (r.status !== 0) { console.error("Index failed, see .ariadne/index.log"); process.exit(1); }
 const dg = runtime === "node" ? ["node", [path.join(HERE, "docgen.mjs")]]
   : [exe[0], [path.join(HERE, "docgen.py")]];
 spawnSync(dg[0], dg[1], { stdio: "inherit", cwd: CWD });

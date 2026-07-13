@@ -8,9 +8,9 @@ Built for Java/Kotlin on Spring Boot, TypeScript/React, Kafka, Liquibase, Lombok
 
 Copilot in agent mode is capable but blind. Ask "who consumes `payments.completed`?" and it can't answer, because the producer uses a constant, the consumer resolves the topic from a YAML placeholder, and the two services live in different repos. So it guesses, and you find out in review.
 
-AEGIS indexes all of that up front — statically, in about a second — and serves it to Copilot over MCP. It correlates Kafka producers with consumers across repos, maps Liquibase changesets to the code that touches each table (flagging schema drift), matches React `fetch`/`axios` calls to the Spring endpoints they hit, synthesizes Lombok's generated members, and answers "what breaks if I change this?" with exact file paths and line numbers.
+AEGIS indexes all of that up front (statically, in about a second) and serves it to Copilot over MCP. It correlates Kafka producers with consumers across repos, maps Liquibase changesets to the code that touches each table (flagging schema drift), matches React `fetch`/`axios` calls to the Spring endpoints they hit, synthesizes Lombok's generated members, and answers "what breaks if I change this?" with exact file paths and line numbers.
 
-It then generates architecture docs, flow diagrams, and a stakeholder progress report from the same graph — deterministically, with zero LLM tokens.
+It then generates architecture docs, flow diagrams, and a stakeholder progress report from the same graph, deterministically, with zero LLM tokens.
 
 ## Getting started
 
@@ -18,7 +18,7 @@ It then generates architecture docs, flow diagrams, and a stakeholder progress r
 2. Approve the terminal step. It builds the index and installs git hooks.
 3. Open Copilot Chat in agent mode. The tools are already there.
 
-Then just ask questions: *"What breaks if I change OrderService?"* · *"Who consumes payments.completed?"* · *"Which frontend code calls /api/orders?"* · *"Why did we choose Kafka — is that still current?"*
+Then just ask questions: *"What breaks if I change OrderService?"* · *"Who consumes payments.completed?"* · *"Which frontend code calls /api/orders?"* · *"Why did we choose Kafka, is that still current?"*
 
 You don't need to learn the tool names. Twelve skills encode the right sequence for you, and Copilot picks them up from how you phrase the request:
 
@@ -42,7 +42,7 @@ git, and either Node ≥18 or Python ≥3.10 (the Python edition is pure-stdlib 
 
 ## Settings
 
-- `aegis.runtime` — `node` or `python`.
-- `aegis.autoRegisterAriadne` — hand the graph server to Copilot automatically.
+- `aegis.runtime`: `node` or `python`.
+- `aegis.autoRegisterAriadne`: hand the graph server to Copilot automatically.
 
 MIT licensed. Full documentation, extension points, and the self-test suite are in the repository.

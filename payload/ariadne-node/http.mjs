@@ -1,5 +1,5 @@
 /**
- * HTTP seam extraction — correlates REST endpoints with their callers across
+ * HTTP seam extraction, correlates REST endpoints with their callers across
  * the full stack:
  *   endpoints (Java Spring): @RestController + @Get/Post/Put/Delete/Patch/
  *     RequestMapping, class-level prefix combined with method-level path

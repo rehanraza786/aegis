@@ -65,7 +65,7 @@ def _resolve(raw, cfg, const):
 
     # Runtime concatenation: PREFIX + "." + env. Resolve what we can and mark the whole
     # thing UNRESOLVED with a partial like "orders.created.{?}", so an assistant sees
-    # exactly what is missing — instead of silently picking one literal out of the
+    # exactly what is missing, instead of silently picking one literal out of the
     # expression and calling it the topic name, which would be a lie.
     if "+" in expr:
         parts = [p.strip() for p in expr.split("+") if p.strip()]

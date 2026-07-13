@@ -1,4 +1,4 @@
-// AEGIS VS Code extension — "Sight beyond sight."
+// AEGIS VS Code extension. "Sight beyond sight."
 // Installs the AEGIS payload into the workspace, registers the Ariadne MCP
 // server with Copilot, and provides index maintenance commands.
 "use strict";
@@ -64,7 +64,7 @@ function runInTerminal(name, cmd) {
 
 async function install(context, withAriadne) {
   if (vscode.workspace.isTrusted === false) {
-    vscode.window.showWarningMessage("AEGIS: this workspace is in Restricted Mode — trust it first (AEGIS runs indexers and git hooks).");
+    vscode.window.showWarningMessage("AEGIS: this workspace is in Restricted Mode, trust it first (AEGIS runs indexers and git hooks).");
     return;
   }
   const root = workspaceRoot();
@@ -90,7 +90,7 @@ async function install(context, withAriadne) {
   vscode.window.showInformationMessage(`AEGIS installed ${log.length} files.`);
   if (withAriadne) {
     const pick = await vscode.window.showInformationMessage(
-      "Set up Ariadne now? (installs dependencies, git hooks, and builds the initial index — runs in a terminal)",
+      "Set up Ariadne now? (installs dependencies, git hooks, and builds the initial index, runs in a terminal)",
       "Set up", "Later");
     if (pick === "Set up") {
       const rt = runtimeConfig();
@@ -120,7 +120,7 @@ function ariadneCommand(action) {
   };
 }
 
-/** Provide Ariadne to Copilot as an MCP server — no .vscode/mcp.json needed. */
+/** Provide Ariadne to Copilot as an MCP server, no .vscode/mcp.json needed. */
 function readAegisConfig(root) {
   try { return JSON.parse(fs.readFileSync(path.join(root, "aegis.json"), "utf8")); }
   catch { return null; }
@@ -171,7 +171,7 @@ async function enrichViaCopilot(context) {
   const runtime = root && detectRuntime(root);
   if (!runtime) { vscode.window.showWarningMessage("AEGIS: Ariadne not installed here."); return; }
   if (!vscode.lm || typeof vscode.lm.selectChatModels !== "function") {
-    vscode.window.showWarningMessage("AEGIS: this VS Code version has no Language Model API — use enrich.mjs with a provider instead.");
+    vscode.window.showWarningMessage("AEGIS: this VS Code version has no Language Model API, use enrich.mjs with a provider instead.");
     return;
   }
   const models = await vscode.lm.selectChatModels({ vendor: "copilot" });
@@ -185,7 +185,7 @@ async function enrichViaCopilot(context) {
   try {
     plan = JSON.parse(cp.execFileSync(exe, [script, "--plan"], { cwd: root, env: { ...process.env, ...workspaceEnv() }, encoding: "utf8" }));
   } catch (err) { vscode.window.showErrorMessage(`AEGIS enrich --plan failed: ${err.message}`); return; }
-  if (!plan.length) { vscode.window.showInformationMessage("AEGIS: all insights are current (hash-cached) — nothing to enrich."); return; }
+  if (!plan.length) { vscode.window.showInformationMessage("AEGIS: all insights are current (hash-cached), nothing to enrich."); return; }
   const results = [];
   await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: `AEGIS: enriching ${plan.length} targets via Copilot (${model.name})`, cancellable: true },
@@ -232,7 +232,7 @@ function updateWorkspace(context) {
   overwriteDir(path.join(payload, `ariadne-${runtime}`), path.join(root, ".ariadne"));
   overwriteDir(path.join(payload, ".github", "skills"), path.join(root, ".github", "skills"));
   overwriteDir(path.join(payload, ".github", "agents"), path.join(root, ".github", "agents"));
-  // new payload versions may add dependencies — refresh them
+  // new payload versions may add dependencies, refresh them
   const dep = runtime === "node"
     ? `cd "${path.join(root, ".ariadne")}" && npm install --no-audit --no-fund`
     : `${process.platform === "win32" ? "python" : "python3"} -m pip install -r "${path.join(root, ".ariadne", "requirements.txt")}"`;
@@ -256,7 +256,7 @@ function activate(context) {
       const exe = runtime === "node" ? "node .ariadne/docgen.mjs" : `${process.platform === "win32" ? "python" : "python3"} .ariadne/docgen.py`;
       runInTerminal("AEGIS docgen", exe);
     }),
-  );
+);
   registerMcpProvider(context);
 
   // Gentle one-time nudge when a workspace has no AEGIS yet
@@ -267,7 +267,7 @@ function activate(context) {
     vscode.window.showInformationMessage(
       "AEGIS: this workspace isn't set up yet. Install skills, agents, and Ariadne?",
       "Install", "Not now"
-    ).then((pick) => { if (pick === "Install") install(context, true); });
+).then((pick) => { if (pick === "Install") install(context, true); });
   }
 }
 

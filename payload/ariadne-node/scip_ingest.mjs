@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Ingest compiler-grade SCIP indexes (scip-typescript, scip-java) into the
- * .ariadne SQLite DB. Node edition — parses SCIP protobuf via protobufjs
+ * .ariadne SQLite DB. Node edition, parses SCIP protobuf via protobufjs
  * using the bundled scip.proto (no codegen step).
  *
  * Usage: node scip_ingest.mjs index.scip [more.scip ...]
