@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e3a5f"/>
+      <stop offset="1" stop-color="#0d1b2e"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e8c468"/>
+      <stop offset="0.5" stop-color="#c9962e"/>
+      <stop offset="1" stop-color="#8a641c"/>
+    </linearGradient>
+    <radialGradient id="iris" cx="0.5" cy="0.45" r="0.6">
+      <stop offset="0" stop-color="#7dd3fc"/>
+      <stop offset="0.55" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#0c4a6e"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Shield body -->
+  <path d="M128 14 L218 46 v76 c0 58 -38 96 -90 120 C76 218 38 180 38 122 V46 Z"
+        fill="url(#shield)" stroke="url(#rim)" stroke-width="10" stroke-linejoin="round"/>
+
+  <!-- Graph constellation: nodes + edges (the codebase graph) -->
+  <g stroke="#e8c468" stroke-width="2.5" opacity="0.85">
+    <line x1="128" y1="118" x2="76"  y2="70"/>
+    <line x1="128" y1="118" x2="180" y2="70"/>
+    <line x1="128" y1="118" x2="66"  y2="140"/>
+    <line x1="128" y1="118" x2="190" y2="140"/>
+    <line x1="128" y1="118" x2="98"  y2="192"/>
+    <line x1="128" y1="118" x2="158" y2="192"/>
+    <line x1="76"  y1="70"  x2="180" y2="70"/>
+  </g>
+  <g fill="#e8c468">
+    <circle cx="76"  cy="70"  r="7"/>
+    <circle cx="180" cy="70"  r="7"/>
+    <circle cx="66"  cy="140" r="6"/>
+    <circle cx="190" cy="140" r="6"/>
+    <circle cx="98"  cy="192" r="6"/>
+    <circle cx="158" cy="192" r="6"/>
+  </g>
+
+  <!-- The Eye: sight beyond sight -->
+  <g>
+    <path d="M74 118 Q128 76 182 118 Q128 160 74 118 Z"
+          fill="#0d1b2e" stroke="url(#rim)" stroke-width="6" stroke-linejoin="round"/>
+    <circle cx="128" cy="118" r="24" fill="url(#iris)"/>
+    <circle cx="128" cy="118" r="10" fill="#06121f"/>
+    <circle cx="121" cy="110" r="5" fill="#e0f2fe" opacity="0.9"/>
+  </g>
+</svg>

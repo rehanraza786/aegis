@@ -1,0 +1,91 @@
+# GitLab CI: builds the shared ariadne index on every merge to the
+# default branch and publishes it as a job artifact. Teammates pull it with
+# .ariadne/pull-index.sh
+#
+# If you already have a .gitlab-ci.yml, merge the job below into it (keep the
+# job name `aegis-index` — the pull script looks it up by name).
+
+aegis-index:
+  stage: build
+  image: node:20
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "web"'   # allow manual runs from the UI
+  variables:
+    GIT_DEPTH: "0"          # full history: indexer stamps SHAs and diffs against them
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq python3 python3-pip openjdk-21-jdk-headless curl
+    # Runtime auto-detect: Node edition (indexer.mjs) or Python edition (indexer.py)
+    - |
+      if [ -f .ariadne/indexer.mjs ]; then
+        (cd .ariadne && npm install --silent --no-audit --no-fund)
+        echo "INDEX='node .ariadne/indexer.mjs'; INGEST='node .ariadne/scip_ingest.mjs'" > /tmp/rt
+      else
+        pip3 install --break-system-packages -r .ariadne/requirements.txt
+        echo "INDEX='python3 .ariadne/indexer.py'; INGEST='python3 .ariadne/scip_ingest.py'" > /tmp/rt
+      fi
+  script:
+    - source /tmp/rt
+    # ---------- Baseline (regex) index ----------
+    - eval "$INDEX --full"
+
+    # ---------- TypeScript / React (compiler-grade) ----------
+    # ADJUST: repeat this block per directory containing a tsconfig.json
+    - |
+      (cd frontend \
+        && npm ci \
+        && npx --yes @sourcegraph/scip-typescript index --output index.scip) \
+        || echo "WARN: scip-typescript failed; baseline index still published"
+
+    # ---------- Java (compiler-grade) ----------
+    # ADJUST: run at the Gradle/Maven root. scip-java autodetects the build tool.
+    - |
+      (curl -fLo coursier https://github.com/coursier/launchers/raw/master/coursier \
+        && chmod +x coursier \
+        && ./coursier launch com.sourcegraph:scip-java_2.13:latest.stable -- index --output java.scip) \
+        || echo "WARN: scip-java failed; baseline index still published"
+
+    # ---------- Ingest whatever succeeded ----------
+    - eval "$INGEST $(ls frontend/index.scip java.scip 2>/dev/null)" || echo "no SCIP output to ingest"
+    - eval "$INDEX --status"
+    # ---------- Generate flow docs + progress report (zero LLM tokens) ----------
+    - |
+      if [ -f .ariadne/docgen.mjs ]; then node .ariadne/docgen.mjs; else python3 .ariadne/docgen.py; fi
+    # ---------- OPTIONAL: LLM semantic enrichment (opt-in — see PRIVACY.md) ----------
+    # Only runs if you set a key in CI variables; hash-caching means only changed
+    # modules/files cost tokens. For fully-local models set OPENAI_BASE_URL too.
+    - |
+      if [ -n "$ANTHROPIC_API_KEY$OPENAI_API_KEY" ]; then
+        if [ -f .ariadne/enrich.mjs ]; then node .ariadne/enrich.mjs; else python3 .ariadne/enrich.py; fi
+      fi
+    # ---------- OPTIONAL: commit generated docs back so MRs/IDEs/agents see them ----------
+    # Requires a project access token with write_repository in $AEGIS_PUSH_TOKEN.
+    # - |
+    #   if ! git diff --quiet docs/generated; then
+    #     git config user.email aegis-bot@local && git config user.name aegis-bot
+    #     git add docs/generated && git commit -m "docs: regenerate AEGIS flow docs [skip ci]"
+    #     git push "https://aegis-bot:${AEGIS_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" HEAD:$CI_DEFAULT_BRANCH
+    #   fi
+  # ---------- Reuse the previous run's graph instead of rebuilding it ----------
+  # The indexer skips unchanged files on a size+mtime then checksum check, so a
+  # restored index means only what actually changed in this MR gets reindexed.
+  # Safe to lose: if the cache is cold, missing, or corrupt, the job just builds
+  # a fresh index (corruption is detected and recovered automatically).
+  cache:
+    key: aegis-index-$CI_DEFAULT_BRANCH
+    paths:
+      - .ariadne/index.db
+    policy: pull-push
+  # Tip: the slow step here is scip-java, which compiles the project. Cache your
+  # build deps too — add .m2/repository (with MAVEN_OPTS=-Dmaven.repo.local=.m2/repository)
+  # or .gradle/caches to the paths above.
+
+  artifacts:
+    name: aegis-index
+    paths:
+      - .ariadne/index.db
+      - docs/generated/
+    expire_in: 30 days
+  # Tip: on gitlab.com free tier you get 400 compute min/month; this job is
+  # typically 2-6 min. Self-hosted runners are unmetered. To save minutes,
+  # add `interruptible: true` and consider running only on merge commits.

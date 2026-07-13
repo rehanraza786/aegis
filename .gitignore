@@ -1,0 +1,9 @@
+node_modules/
+__pycache__/
+*.pyc
+*.vsix
+.DS_Store
+.ariadne/index.db*
+.ariadne/index.log
+docs/generated/
+aegis-test-*/

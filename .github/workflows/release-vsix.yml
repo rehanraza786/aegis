@@ -1,0 +1,29 @@
+name: release-vsix
+# Builds the AEGIS .vsix and attaches it to a GitHub Release whenever you push
+# a version tag (v1.0.2, v1.1.0, ...). Everyone can then download it from the
+# repo's Releases page — no marketplace account required.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write   # needed to attach release assets
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Build .vsix
+        run: |
+          cd extension
+          rm -rf payload && cp -r ../payload .
+          npm install -D @vscode/vsce
+          # keep extension version in sync with the tag
+          npm version --no-git-tag-version "${GITHUB_REF_NAME#v}" || true
+          npx vsce package --allow-missing-repository --skip-license
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: extension/*.vsix
+          generate_release_notes: true

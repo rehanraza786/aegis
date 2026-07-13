@@ -1,0 +1,92 @@
+{
+  "name": "aegis-toolkit",
+  "displayName": "AEGIS \u2014 Agentic Engineering Guardrails & Intelligence System",
+  "description": "Sight beyond sight. Skills, agents, spec-driven artifacts, and the Ariadne codebase-graph MCP server that make Copilot (and smaller models) perform like frontier ones.",
+  "version": "0.1.0",
+  "publisher": "aegis-dev",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.99.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "keywords": [
+    "copilot",
+    "mcp",
+    "agents",
+    "skills",
+    "code-review",
+    "spec-driven"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "aegis.install",
+        "title": "AEGIS: Install into Workspace (skills, agents, Ariadne)"
+      },
+      {
+        "command": "aegis.installLite",
+        "title": "AEGIS: Install Skills & Agents Only (no Ariadne)"
+      },
+      {
+        "command": "aegis.reindex",
+        "title": "AEGIS: Rebuild Ariadne Index"
+      },
+      {
+        "command": "aegis.pullIndex",
+        "title": "AEGIS: Pull Team-Shared Index from CI"
+      },
+      {
+        "command": "aegis.status",
+        "title": "AEGIS: Ariadne Index Status"
+      },
+      {
+        "command": "aegis.enrichCopilot",
+        "title": "AEGIS: Enrich Insights via Copilot (uses your Copilot seat)"
+      },
+      {
+        "command": "aegis.update",
+        "title": "AEGIS: Update Workspace Payload (preserves config & index)"
+      }
+    ],
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "aegis.ariadne",
+        "label": "AEGIS Ariadne (codebase graph)"
+      }
+    ],
+    "configuration": {
+      "title": "AEGIS",
+      "properties": {
+        "aegis.runtime": {
+          "type": "string",
+          "enum": [
+            "node",
+            "python"
+          ],
+          "default": "node",
+          "description": "Runtime edition of the Ariadne indexer/server to install and launch."
+        },
+        "aegis.autoRegisterAriadne": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically provide the Ariadne MCP server to Copilot when .ariadne/ exists in the workspace."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.9.2"
+  },
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR-USERNAME/aegis"
+  }
+}

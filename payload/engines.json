@@ -1,0 +1,34 @@
+{
+  "_comment": "Graph-engine registry. 'aegis.json' in the repo root selects one; edit command/args there if an engine's CLI differs from these best-effort defaults (check each engine's README).",
+  "ariadne": {
+    "label": "Ariadne (built-in: SQLite graph + SCIP compiler-grade, GitLab CI team sharing)",
+    "managed": true,
+    "toolHints": "Use module_map to orient, search_code/find_symbol to locate code, file_outline instead of reading files, blast_radius before modifying shared code, find_callers/find_callees for the call graph, message_flow for Kafka topology, db_map for tables/Liquibase/drift, http_map for REST endpoint\u2194caller correlation across the stack, and find_references (SCIP) for compiler-grade lookup. Read docs/generated/agent-context.md FIRST. Check index_status if stale; reindex if fresh=false."
+  },
+  "codebase-memory": {
+    "label": "codebase-memory-mcp (external: tree-sitter, 158 languages, static binary)",
+    "managed": false,
+    "command": "codebase-memory-mcp",
+    "args": [],
+    "installHint": "Install the static binary from https://github.com/DeusData/codebase-memory-mcp then re-run this installer.",
+    "toolHints": "Use the codebase-memory graph tools for all structural questions: trace_path for callers/callees and impact, symbol lookup instead of reading files, and its search instead of repo-wide grep."
+  },
+  "code-graph": {
+    "label": "code-graph-mcp (external: tree-sitter AST graph, semantic search, impact analysis)",
+    "managed": false,
+    "command": "npx",
+    "args": [
+      "-y",
+      "@sdsrs/code-graph"
+    ],
+    "installHint": "Runs via npx; see https://github.com/sdsrss/code-graph-mcp for init/snapshot options.",
+    "toolHints": "Use the code-graph tools for all structural questions: its explore/context tools instead of reading files, impact analysis before modifying shared code, and semantic search instead of repo-wide grep."
+  },
+  "custom": {
+    "label": "Custom MCP graph server (bring your own)",
+    "managed": false,
+    "command": "REPLACE_ME",
+    "args": [],
+    "toolHints": "Prefer the configured codebase-graph MCP tools over manual file exploration for structural questions: orientation, symbol lookup, dependency/impact analysis, and code search."
+  }
+}
