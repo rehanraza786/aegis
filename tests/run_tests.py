@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """AEGIS self-test suite.
 
-Builds a fixture workspace (4 git repos: Spring services with Kafka/Liquibase/
+Builds a fixture workspace (6 git repos: Spring services with Kafka/Liquibase/
 Lombok, a React frontend, a docs repo with an ADR and a PDF), runs the chosen
 Ariadne edition against it, and asserts the graph, caching, scoping, and docgen
 behavior. Pure stdlib except for the edition's own dependencies.
@@ -246,6 +246,29 @@ Commands stay on Kafka (orders.created); read-only queries MAY use HTTP. The pay
     (d / "spec.pdf").parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(FIXTURES / "spec.pdf", d / "spec.pdf")
 
+    # ---- test code: one file per detection rule; the exact-count checks above double as leak guards ----
+    w(o / "src/test/java/com/acme/OrderPublisherTest.java", """package com.acme;
+import com.acme.OrderPublisher;
+public class OrderPublisherTest {
+  private static final String ORDERS_TOPIC = "test.orders";   // decoy: collides by NAME with prod constant
+  private final KafkaTemplate<String, Order> kafkaTemplate;
+  @Test void shouldPublishOrderCreatedEvent() { kafkaTemplate.send(ORDERS_TOPIC, new Order()); new OrderPublisher().publish(null); }
+  @Test void shouldNotPublishWhenOrderInvalid() { }
+  @KafkaListener(topics = "orders.deadletter") public void onDeadletter(Order o) { }
+}
+""")
+    w(sc / "src/test/java/com/acme/OrphanConsumerIT.java", """package com.acme;
+public class OrphanConsumerIT { @KafkaListener(topics = "bulk.orphan0") public void onOrphan(String m) { } }
+""")
+    w(b / "src/test/java/com/acme/PaymentDaoTest.java", """package com.acme;
+public class PaymentDaoTest { @Test void shouldCountScratchRows() { jdbcTemplate.queryForObject("SELECT count(*) FROM test_scratch", Integer.class); } }
+""")
+    w(f / "src/api/__tests__/orders.spec.ts", """import axios from "axios";
+const id = 123;
+describe("orders api", () => { it("fetches orders by id", async () => { await axios.get(`/api/orders/${id}`); await axios.post("/internal/testing/reset"); }); });
+""")
+    w(f / "scripts/test_smoke.py", "def test_ping():\n    assert True\n")
+
     for repo in (o, b, f, s, sc, d):
         git(["init", "-q"], repo)
         git(["add", "-A"], repo)
@@ -334,6 +357,35 @@ def main():
           q("SELECT 1 FROM msg_edges WHERE topic='stream.orders' AND direction='consume' AND via LIKE '%orders-in-0%'") != [])
     check("extractor plugin: stream binding produce",
           q("SELECT 1 FROM msg_edges WHERE topic='stream.notify' AND direction='produce'") != [])
+    # test awareness: is_test says WHERE code lives, source says WHO derived the fact
+    check("test file flagged (java src/test + Test suffix)",
+          q("SELECT 1 FROM files WHERE path LIKE '%OrderPublisherTest.java' AND is_test=1") != [])
+    check("test file flagged (java IT suffix)",
+          q("SELECT 1 FROM files WHERE path LIKE '%OrphanConsumerIT.java' AND is_test=1") != [])
+    check("test file flagged (ts __tests__/.spec)",
+          q("SELECT 1 FROM files WHERE path LIKE '%orders.spec.ts' AND is_test=1") != [])
+    check("test file flagged (py test_ prefix)",
+          q("SELECT 1 FROM files WHERE path LIKE '%test_smoke.py' AND is_test=1") != [])
+    check("prod file not flagged",
+          q("SELECT 1 FROM files WHERE path LIKE '%OrderPublisher.java' AND is_test=0") != [])
+    check("test kafka fact kept, source stays 'static'",
+          q("SELECT 1 FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE m.topic='test.orders' AND f.is_test=1 AND m.source='static'") != [])
+    check("test constant resolves via own file, never the global prod map",
+          q("SELECT 1 FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE '%OrderPublisherTest.java' AND m.topic='orders.created'") == [])
+    check("test consumer edge kept (bulk.orphan0)",
+          q("SELECT 1 FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE m.topic='bulk.orphan0' AND m.direction='consume' AND f.is_test=1") != [])
+    check("test db access kept (test_scratch)",
+          q("SELECT 1 FROM db_access a JOIN files f ON f.id=a.file_id WHERE a.tbl='test_scratch' AND f.is_test=1") != [])
+    check("test http call kept (/api/orders/{})",
+          q("SELECT 1 FROM http_calls c JOIN files f ON f.id=c.file_id WHERE c.norm='/api/orders/{}' AND f.is_test=1") != [])
+    check("test case extracted (java @Test)",
+          q("SELECT 1 FROM test_cases WHERE name='shouldPublishOrderCreatedEvent'") != [])
+    check("test case extracted (jest string)",
+          q("SELECT 1 FROM test_cases WHERE name='fetches orders by id'") != [])
+    check("test case extracted (python def)",
+          q("SELECT 1 FROM test_cases WHERE name='test_ping'") != [])
+    check("no test cases from prod files",
+          q("SELECT 1 FROM test_cases tc JOIN files f ON f.id=tc.file_id WHERE f.is_test=0") == [])
     db.close()
 
     # ---- Mnemosyne decision memory ----
@@ -372,6 +424,23 @@ def main():
           db.execute("SELECT COUNT(*) FROM msg_edges WHERE topic='orders.created'").fetchone()[0] == 2)
     db.close()
 
+    # ---- test classification survives the incremental path ----
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    n_tst = db.execute("SELECT COUNT(*) FROM msg_edges WHERE topic='test.orders'").fetchone()[0]
+    db.close()
+    tst = ws / "order-service" / "src/test/java/com/acme/OrderPublisherTest.java"
+    tst.write_text(tst.read_text() + "// touched\n")
+    git(["add", "-A"], ws / "order-service")
+    git(["commit", "-qm", "t"], ws / "order-service")
+    code, ot = run(exe + [idx, "--incremental"], ws)
+    check("incremental picks changed test file", "1 changed" in ot, ot[-300:])
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("is_test survives reindex",
+          db.execute("SELECT is_test FROM files WHERE path LIKE '%OrderPublisherTest.java'").fetchone()[0] == 1)
+    check("test edge count unchanged by incremental",
+          db.execute("SELECT COUNT(*) FROM msg_edges WHERE topic='test.orders'").fetchone()[0] == n_tst)
+    db.close()
+
     # ---- context budget at scale: summaries, warning survival, hard byte cap ----
     if rt == "node":
         probe = ws / ".ariadne" / "_scale.mjs"
@@ -382,10 +451,22 @@ const c = new Client({ name: "s", version: "1" });
 await c.connect(t);
 const call = async (n, a = {}) => (await c.callTool({ name: n, arguments: a })).content[0].text;
 const mf = await call("message_flow"), dm = await call("db_map"), hm = await call("http_map");
+const bo = JSON.parse(await call("message_flow", { topic: "bulk.orphan0" }))[0];
+const tu = ((bo.test_usage || {}).consumers || [""])[0];
+const tun = JSON.parse(await call("http_map", { path: "/internal/testing" }));
 const out = { mf: mf.length, dm: dm.length, hm: hm.length,
   orphans: JSON.parse(mf).warnings.produced_but_never_consumed.length,
   drift: JSON.parse(dm).warnings.DRIFT_accessed_but_no_changeset.length,
-  scoped: (await call("message_flow", { topic: "bulk.t07" })).includes("Bulk.java") };
+  scoped: (await call("message_flow", { topic: "bulk.t07" })).includes("Bulk.java"),
+  testOnly: (JSON.parse(mf).warnings.topics_only_exercised_by_tests || []).includes("test.orders"),
+  driftClean: !JSON.parse(dm).warnings.DRIFT_accessed_but_no_changeset.includes("test_scratch"),
+  testAcc: (JSON.parse(dm).warnings.accessed_only_by_tests || []).includes("test_scratch"),
+  orphanProd: bo.producers.some((p) => p.includes("Bulk.java")) && bo.consumers.length === 0,
+  orphanWarn: (bo.warning || "").includes("produced but no consumer"),
+  orphanTest: tu.includes("OrphanConsumerIT") && tu.includes("[TEST]"),
+  dmProd: JSON.parse(dm).summary.includes("more only in tests"),
+  testUnmatched: tun.some((x) => (x.test_unmatched_calls || []).some((s) => s.includes("orders.spec.ts") && s.includes("[TEST]")))
+    && !tun.some((x) => (x.unmatched_calls || []).some((s) => s.includes("/internal/testing"))) };
 console.log("SCALE:" + JSON.stringify(out));
 await c.close();
 """)
@@ -400,14 +481,34 @@ await c.close();
         check("orphan topics survive truncation", sc_res.get("orphans", 0) >= 7, str(sc_res.get("orphans")))
         check("DRIFT tables survive truncation", sc_res.get("drift", 0) >= 3, str(sc_res.get("drift")))
         check("scoped query still returns full detail", sc_res.get("scoped") is True)
+        check("test-only topic reported as warning, not topology", sc_res.get("testOnly") is True, str(sc_res))
+        check("DRIFT list free of test-only tables", sc_res.get("driftClean") is True)
+        check("test-only table gets its own warning", sc_res.get("testAcc") is True)
+        check("orphan detail keeps prod-only producers/consumers", sc_res.get("orphanProd") is True)
+        check("test consumer does not cure the orphan warning", sc_res.get("orphanWarn") is True)
+        check("test consumer routed to test_usage, labeled [TEST]", sc_res.get("orphanTest") is True)
+        check("db_map headline counts production tables only", sc_res.get("dmProd") is True)
+        check("test-only external call listed and labeled, never a warning", sc_res.get("testUnmatched") is True)
     else:
         code, osc2 = run([py, "-c",
             "import sys, os, json; os.chdir(r'" + str(ws) + "'); sys.path.insert(0, r'" + str(ar) + "'); "
             "import server; mf=server.message_flow(); dm=server.db_map(); hm=server.http_map(); "
+            "bo=json.loads(server.message_flow(topic='bulk.orphan0'))[0]; "
+            "tu=bo.get('test_usage', {}).get('consumers', [''])[0]; "
+            "tun=json.loads(server.http_map(path='/internal/testing')); "
             "print('SCALE:' + json.dumps({'mf': len(mf), 'dm': len(dm), 'hm': len(hm), "
             "'orphans': len(json.loads(mf)['warnings']['produced_but_never_consumed']), "
             "'drift': len(json.loads(dm)['warnings']['DRIFT_accessed_but_no_changeset']), "
-            "'scoped': 'Bulk.java' in server.message_flow(topic='bulk.t07')}))"], ws)
+            "'scoped': 'Bulk.java' in server.message_flow(topic='bulk.t07'), "
+            "'testOnly': 'test.orders' in json.loads(mf)['warnings'].get('topics_only_exercised_by_tests', []), "
+            "'driftClean': 'test_scratch' not in json.loads(dm)['warnings']['DRIFT_accessed_but_no_changeset'], "
+            "'testAcc': 'test_scratch' in json.loads(dm)['warnings'].get('accessed_only_by_tests', []), "
+            "'orphanProd': any('Bulk.java' in p for p in bo['producers']) and bo['consumers'] == [], "
+            "'orphanWarn': 'produced but no consumer' in bo.get('warning', ''), "
+            "'orphanTest': 'OrphanConsumerIT' in tu and '[TEST]' in tu, "
+            "'dmProd': 'more only in tests' in json.loads(dm)['summary'], "
+            "'testUnmatched': any('orders.spec.ts' in s and '[TEST]' in s for x in tun for s in x.get('test_unmatched_calls', [])) "
+            "and not any('/internal/testing' in s for x in tun for s in x.get('unmatched_calls', []))}))"], ws)
         m = re.search(r"SCALE:(\{.*\})", osc2)
         import json as _j
         sc_res = _j.loads(m.group(1)) if m else {}
@@ -417,6 +518,14 @@ await c.close();
         check("orphan topics survive truncation", sc_res.get("orphans", 0) >= 7)
         check("DRIFT tables survive truncation", sc_res.get("drift", 0) >= 3)
         check("scoped query still returns full detail", sc_res.get("scoped") is True)
+        check("test-only topic reported as warning, not topology", sc_res.get("testOnly") is True, str(sc_res))
+        check("DRIFT list free of test-only tables", sc_res.get("driftClean") is True)
+        check("test-only table gets its own warning", sc_res.get("testAcc") is True)
+        check("orphan detail keeps prod-only producers/consumers", sc_res.get("orphanProd") is True)
+        check("test consumer does not cure the orphan warning", sc_res.get("orphanWarn") is True)
+        check("test consumer routed to test_usage, labeled [TEST]", sc_res.get("orphanTest") is True)
+        check("db_map headline counts production tables only", sc_res.get("dmProd") is True)
+        check("test-only external call listed and labeled, never a warning", sc_res.get("testUnmatched") is True)
 
     # ---- performance: extraction is scoped to changed FILES, and loses no rows ----
     before = sqlite3.connect(ws / ".ariadne" / "index.db")
@@ -447,8 +556,10 @@ const c = new Client({ name: "cp", version: "1" });
 await c.connect(t);
 const r = (await c.callTool({ name: "context_pack", arguments: { target: "OrderPublisher" } })).content[0].text;
 const o = JSON.parse(r);
+const ts = typeof o.tests === "object" && o.tests !== null ? o.tests : { files: [], behaviors: [] };
 console.log("CP:" + JSON.stringify({ size: r.length, kafka: Array.isArray(o.kafka) ? o.kafka.length : 0,
-  hasOutline: (o.outline || []).length > 0, gov: Array.isArray(o.governing_decisions) ? o.governing_decisions.length : 0 }));
+  hasOutline: (o.outline || []).length > 0, gov: Array.isArray(o.governing_decisions) ? o.governing_decisions.length : 0,
+  tests: ts.files.some((f) => f.includes("OrderPublisherTest.java")) && ts.behaviors.includes("should publish order created event") }));
 await c.close();
 """)
         code, ocp = run(["node", str(cp)], ws)
@@ -459,17 +570,21 @@ await c.close();
         check("context_pack returns focused bundle", cp_res.get("hasOutline") is True and cp_res.get("kafka", 0) >= 1, ocp[-200:])
         check("context_pack stays small (<4KB)", 0 < cp_res.get("size", 1e9) < 4000, str(cp_res.get("size")))
         check("context_pack surfaces governing decisions", cp_res.get("gov", 0) >= 1, str(cp_res))
+        check("context_pack names the tests exercising the target", cp_res.get("tests") is True, str(cp_res))
     else:
         code, ocp = run([py, "-c",
             "import sys, os, json; os.chdir(r'" + str(ws) + "'); sys.path.insert(0, r'" + str(ar) + "'); "
             "import server; o = json.loads(server.context_pack('OrderPublisher')); "
+            "ts = o['tests'] if isinstance(o.get('tests'), dict) else {'files': [], 'behaviors': []}; "
             "print('CP:' + json.dumps({'kafka': len(o['kafka']) if isinstance(o['kafka'], list) else 0, "
-            "'hasOutline': len(o['outline']) > 0, 'gov': len(o['governing_decisions']) if isinstance(o['governing_decisions'], list) else 0}))"], ws)
+            "'hasOutline': len(o['outline']) > 0, 'gov': len(o['governing_decisions']) if isinstance(o['governing_decisions'], list) else 0, "
+            "'tests': any('OrderPublisherTest.java' in x for x in ts['files']) and 'should publish order created event' in ts['behaviors']}))"], ws)
         m2 = re.search(r"CP:(\{.*\})", ocp)
         import json as _j3
         cp_res = _j3.loads(m2.group(1)) if m2 else {}
         check("context_pack returns focused bundle", cp_res.get("hasOutline") is True and cp_res.get("kafka", 0) >= 1, ocp[-200:])
         check("context_pack surfaces governing decisions", cp_res.get("gov", 0) >= 1, str(cp_res))
+        check("context_pack names the tests exercising the target", cp_res.get("tests") is True, str(cp_res))
 
     # ---- graph augmentation: gap -> assert -> labelled edge ----
     db = sqlite3.connect(ws / ".ariadne" / "index.db")
@@ -500,6 +615,9 @@ await c.close();
     check("--rebuild produces a COMPLETE graph, not an empty one",
           db.execute("SELECT COUNT(*) FROM msg_edges").fetchone()[0] > 5
           and db.execute("SELECT COUNT(*) FROM db_access").fetchone()[0] > 5, orb[-200:])
+    check("--rebuild reclassifies tests and re-extracts cases",
+          db.execute("SELECT is_test FROM files WHERE path LIKE '%OrderPublisherTest.java'").fetchone()[0] == 1
+          and db.execute("SELECT COUNT(*) FROM test_cases WHERE name='shouldPublishOrderCreatedEvent'").fetchone()[0] == 1)
     db.close()
 
     # ---- corruption auto-recovery ----
@@ -581,6 +699,14 @@ await c.close();
     check("docgen wrote decisions.md", (gen / "decisions.md").exists())
     check("decisions.md shows supersession",
           "superseded by **ADR-012**" in (gen / "decisions.md").read_text(encoding="utf-8"))
+    mfd = (gen / "message-flows.md").read_text(encoding="utf-8")
+    check("message-flows mermaid is production-only",
+          "OrphanConsumerIT" not in mfd.split("## Per-topic detail")[0])
+    check("message-flows lists tested-by sites", "tested by:" in mfd)
+    check("data-map mermaid is production-only",
+          "test_scratch" not in (gen / "data-map.md").read_text(encoding="utf-8").split("## Per-table detail")[0])
+    check("agent-context reports indexed test files",
+          "test files indexed" in (gen / "agent-context.md").read_text(encoding="utf-8"))
 
     # ---- plugin hooks: pass extension populated todos table ----
     db = sqlite3.connect(ws / ".ariadne" / "index.db")

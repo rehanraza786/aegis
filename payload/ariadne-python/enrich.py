@@ -37,6 +37,9 @@ con.execute("""CREATE TABLE IF NOT EXISTS insights(
   model TEXT, generated_at REAL)""")
 q = lambda sql, *a: con.execute(sql, a).fetchall()
 svc = lambda p: p.split("/")[0]
+# insights describe production intent: seam facts from test files stay out of
+# the prompts (column exists only once an indexer >= schema v5 has run)
+PROD = " AND f.is_test=0" if q("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'")[0]["c"] else ""
 
 
 def _post(url, headers, body):
@@ -89,9 +92,9 @@ def prompt_for(t):
         like = t["target"] + "/%"
         syms = q("SELECT s.name FROM symbols s JOIN files f ON f.id=s.file_id "
                  "WHERE f.path LIKE ? AND s.kind IN ('class','type') LIMIT 25", like)
-        topics = q("SELECT DISTINCT m.topic, m.direction FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?", like)
-        tables = q("SELECT DISTINCT a.tbl, a.mode FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?", like)
-        eps = q("SELECT e.method, e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ? LIMIT 15", like)
+        topics = q(f"SELECT DISTINCT m.topic, m.direction FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?{PROD}", like)
+        tables = q(f"SELECT DISTINCT a.tbl, a.mode FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?{PROD}", like)
+        eps = q(f"SELECT e.method, e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ?{PROD} LIMIT 15", like)
         return header + (
             f"Classes/types: {', '.join(s['name'] for s in syms) or 'n/a'}\n"
             f"Kafka: {', '.join(x['direction'] + ' ' + x['topic'] for x in topics) or 'none'}\n"

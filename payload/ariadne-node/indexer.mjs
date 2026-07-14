@@ -20,7 +20,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 // ---------------------------------------------------------------- utilities
 function git(args, opts = {}) {
@@ -82,6 +82,8 @@ const DEFAULTS = {
   maxFileBytes: 1_500_000,
   chunkLines: 40,
   extraExtensions: {},
+  testPathPatterns: [],
+  prodPathPatterns: [],
 };
 let config = DEFAULTS;
 try {
@@ -98,6 +100,24 @@ const LANG_BY_EXT = {
   ".scala": "scala", ".sql": "sql", ".sh": "shell", ".yaml": "config", ".yml": "config",
   ".toml": "config", ".json": "config", ".xml": "config", ".md": "docs", ".pdf": "docs", ...config.extraExtensions,
 };
+
+// classifies WHERE a file lives (test vs production), decided once at index time;
+// readers consume files.is_test. parity: must match is_test_path (Python edition)
+const TEST_PATTERNS = config.testPathPatterns.map((p) => new RegExp(p));
+const PROD_PATTERNS = config.prodPathPatterns.map((p) => new RegExp(p));
+const TEST_DIRS = new Set(["test", "tests", "__tests__", "__mocks__"]);
+export function isTestPath(rel) {
+  if (PROD_PATTERNS.some((p) => p.test(rel))) return false;
+  if (/(^|\/)src\/main\//.test(rel)) return false;
+  if (/(^|\/)src\/(test|integrationTest|testFixtures)\//.test(rel)) return true;
+  const segs = rel.split("/");
+  if (segs.slice(0, -1).some((s) => TEST_DIRS.has(s))) return true;
+  const base = segs.at(-1);
+  if (/(Test|Tests|IT|ITCase)\.(java|kt|kts)$/.test(base)) return true;
+  if (/\.(test|spec)\.(ts|tsx|mts|js|jsx|mjs|cjs)$/.test(base)) return true;
+  if (/^test_.+\.py$/.test(base) || /_test\.py$/.test(base) || base === "conftest.py") return true;
+  return TEST_PATTERNS.some((p) => p.test(rel));
+}
 
 // ------------------------------------------------------------- extraction
 const S = (re) => new RegExp(re, "gm");
@@ -293,6 +313,9 @@ function connect() {
     CREATE INDEX IF NOT EXISTS idx_dlinks ON decision_links(target);
     CREATE TABLE IF NOT EXISTS extract_cache(
       path TEXT PRIMARY KEY, hash TEXT, constants TEXT, entities TEXT);
+    CREATE TABLE IF NOT EXISTS test_cases(
+      id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+      name TEXT NOT NULL, line INTEGER);
     CREATE TABLE IF NOT EXISTS edges(
       src INTEGER REFERENCES files(id) ON DELETE CASCADE,
       dst INTEGER REFERENCES files(id) ON DELETE CASCADE,
@@ -308,6 +331,16 @@ function connect() {
     try { db.exec(`ALTER TABLE ${t} ADD COLUMN source TEXT DEFAULT 'static'`); } catch { /* exists */ }
   }
   try { db.exec("ALTER TABLE files ADD COLUMN mtime REAL"); } catch { /* exists */ }
+  // `source` answers WHO derived a fact (parser vs author); is_test answers WHERE
+  // the code lives (production vs test). Orthogonal axes: a parsed edge in a test
+  // file stays source='static'. Never write test provenance into `source`.
+  let addedIsTest = false;
+  try { db.exec("ALTER TABLE files ADD COLUMN is_test INTEGER DEFAULT 0"); addedIsTest = true; } catch { /* exists */ }
+  if (addedIsTest) {
+    // one-time in-process backfill (SQLite has no regex); new rows classify on insert
+    const upd = db.prepare("UPDATE files SET is_test=1 WHERE id=?");
+    for (const r of db.prepare("SELECT id, path FROM files").all()) if (isTestPath(r.path)) upd.run(r.id);
+  }
   const v = db.prepare("SELECT value FROM meta WHERE key='schema_version'").get();
   if (v && Number(v.value) > SCHEMA_VERSION) {
     throw new Error(`Index schema v${v.value} is newer than this indexer (v${SCHEMA_VERSION}). Update the toolkit.`);
@@ -360,12 +393,13 @@ async function indexFile(db, relpath, force = false) {
     }
   } catch (e) { log("DEBUG", `skip unreadable: ${relpath} (${e.code ?? e.message})`); return null; }
   const lang = LANG_BY_EXT[path.extname(full).toLowerCase()] ?? "other";
+  const isTest = isTestPath(relpath) ? 1 : 0;
 
   db.prepare("DELETE FROM chunks WHERE path=?").run(relpath);
   db.prepare("DELETE FROM files WHERE path=?").run(relpath);
   const fid = db.prepare(
-    "INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime) VALUES(?,?,?,?,?,?,?)"
-).run(relpath, lang, hash, text.split("\n").length, Date.now() / 1000, st.size, st.mtimeMs).lastInsertRowid;
+    "INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime, is_test) VALUES(?,?,?,?,?,?,?,?)"
+).run(relpath, lang, hash, text.split("\n").length, Date.now() / 1000, st.size, st.mtimeMs, isTest).lastInsertRowid;
 
   const insSym = db.prepare("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,?)");
   const insCall = db.prepare("INSERT INTO calls(src_symbol, callee, line) VALUES(?,?,?)");
@@ -387,6 +421,18 @@ async function indexFile(db, relpath, force = false) {
     }
   } else {
     for (const s of extractSymbols(lang, text)) insSym.run(fid, s.name, s.kind, s.line, s.sig, null);
+  }
+
+  if (isTest) {
+    // behaviors, not helpers: annotation-gated for JUnit, so a @KafkaListener
+    // method inside a test class never lands here
+    const insTc = db.prepare("INSERT INTO test_cases(file_id, name, line) VALUES(?,?,?)");
+    const tcRe = lang === "java" || lang === "kotlin"
+      ? /@(?:Test|ParameterizedTest|RepeatedTest|TestFactory)\b[\s\S]{0,300}?(?:void|fun)\s+(\w+)\s*\(/g
+      : lang === "typescript" || lang === "javascript"
+        ? /\b(?:it|test)(?:\.each\([^)]*\))?\s*\(\s*[`'"]([^`'"]{1,200})[`'"]/g
+        : lang === "python" ? /^\s*def\s+(test_\w+)\s*\(/gm : null;
+    if (tcRe) for (const m of text.matchAll(tcRe)) insTc.run(fid, m[1], text.slice(0, m.index).split("\n").length);
   }
 
   const lines = text.split("\n");
@@ -479,6 +525,10 @@ async function kafkaPass(db, scopePrefixes = null) {
       if (!c || c.constants !== cj || c.entities !== ej) mapsChanged = true;
       putCache.run(rel, fh ?? "", cj, ej);
     }
+    // test files are cached like any other (the semantic-delta trigger stays
+    // byte-identical) but never merge into the global maps: a test constant or
+    // @Entity must not shadow a prod mapping
+    if (isTestPath(rel)) continue;
     for (const [k, v] of Object.entries(consts)) if (!constants.has(k)) constants.set(k, v);
     for (const [k, v] of Object.entries(ents)) entityTables.set(k, v);
   }
@@ -511,6 +561,14 @@ async function kafkaPass(db, scopePrefixes = null) {
   if (!mapsChanged && dirty.size < candidates.length) {
     log("INFO", `Extraction scoped to ${dirty.size}/${candidates.length} changed files`);
   }
+  // a test file's own constants/entities overlay the global maps (own wins): a
+  // test-local ORDERS_TOPIC resolves to the test's literal, never to the prod
+  // mapping; anything the file doesn't define itself stays resolved=0
+  const overlay = (globalMap, rel, col) => {
+    if (!isTestPath(rel)) return globalMap;
+    const own = getCache.get(rel);
+    return new Map([...globalMap, ...Object.entries(JSON.parse(own?.[col] ?? "{}"))]);
+  };
 
   // ---- Kafka ----
   scopedDelete("msg_edges");
@@ -521,7 +579,7 @@ async function kafkaPass(db, scopePrefixes = null) {
     const text = readText(rel);
     const fid = idByPath.get(rel)?.id;
     if (!fid || text == null || !/Kafka|ProducerRecord|\.send\s*\(|subscribe/.test(text)) continue;
-    for (const e of extractKafkaEdges(text, configMap, constants)) {
+    for (const e of extractKafkaEdges(text, configMap, overlay(constants, rel, "constants"))) {
       ins.run(fid, e.topic, e.direction, e.line, e.resolved ? 1 : 0, e.via);
       n++;
     }
@@ -558,7 +616,7 @@ async function kafkaPass(db, scopePrefixes = null) {
     const fid = idByPath.get(rel)?.id;
     if (!fid || text == null) continue;
     if (/@Entity|Repository|@Query|[Jj]dbc|Template|com\.querydsl|JPAQueryFactory/.test(text)) {
-      for (const a of extractDbAccess(text, entityTables, constants)) { insAcc.run(fid, a.table, a.kind, a.mode, a.line, a.detail); accs++; }
+      for (const a of extractDbAccess(text, overlay(entityTables, rel, "entities"), overlay(constants, rel, "constants"))) { insAcc.run(fid, a.table, a.kind, a.mode, a.line, a.detail); accs++; }
     }
     if (/@(?:Data|Value|Getter|Setter|(?:Super)?Builder)\b/.test(text)) {
       delSynth.run(fid);

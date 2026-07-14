@@ -38,6 +38,9 @@ con.row_factory = sqlite3.Row
 q = lambda sql, *a: con.execute(sql, a).fetchall()
 svc = lambda p: p.split("/")[0]
 mm = lambda s: re.sub(r"[^\w]", "_", s)
+# present only once an indexer >= schema v5 has run; older indexes still docgen
+has_test = q("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'")[0]["c"]
+is_t = lambda r: r["is_test"] if has_test else 0
 
 
 def write(name, body):
@@ -79,7 +82,8 @@ md += "".join(f"- `{h['path']}`, {h['n']} dependents\n" for h in hot)
 write("architecture.md", md)
 
 # message flows
-rows = q("SELECT m.topic, m.direction, f.path, m.line, m.via FROM msg_edges m JOIN files f ON f.id=m.file_id ORDER BY m.topic")
+rows = q("SELECT m.topic, m.direction, f.path, m.line, m.via" + (", f.is_test" if has_test else "")
+         + " FROM msg_edges m JOIN files f ON f.id=m.file_id ORDER BY m.topic")
 md = "# Kafka Message Flows (generated)\n\n" + big_doc_banner(len({r["topic"] for r in rows}), "topics", "message_flow topic:<name>")
 if not rows:
     md += "_No Kafka producers/consumers detected._\n"
@@ -87,12 +91,17 @@ else:
     topics = {}
     for r in rows:
         topics.setdefault(r["topic"], []).append(r)
+    # the diagram and the main bullets are production topology; test usage
+    # appears only as "tested by" bullets
     md += "```mermaid\nflowchart LR\n"
     seen = set()
     for topic, hs in topics.items():
+        ph = [h for h in hs if not is_t(h)]
+        if not ph:
+            continue
         t = f"T_{mm(topic)}"
         md += f'  {t}(["{topic}"]):::topic\n'
-        for h in hs:
+        for h in ph:
             s = mm(svc(h["path"]))
             if s not in seen:
                 md += f'  {s}["{svc(h["path"])}"]\n'
@@ -101,21 +110,29 @@ else:
     md += "  classDef topic fill:#1e3a5f,color:#e8c468,stroke:#c9962e\n```\n\n## Per-topic detail\n\n"
     for topic, hs in topics.items():
         md += f"### `{topic}`\n"
-        prod = [h for h in hs if h["direction"] == "produce"]
-        cons = [h for h in hs if h["direction"] == "consume"]
+        prod = [h for h in hs if h["direction"] == "produce" and not is_t(h)]
+        cons = [h for h in hs if h["direction"] == "consume" and not is_t(h)]
+        tst = [h for h in hs if is_t(h)]
         for h in hs:
+            if is_t(h):
+                continue
             via = f" (via `{h['via']}`)" if h["via"] else ""
             md += f"- **{'publish' if h['direction']=='produce' else 'consume'}**. `{h['path']}:{h['line']}`{via}\n"
         if prod and not cons:
-            md += "- ⚠️ produced but no consumer found in the indexed workspace\n"
+            md += "- ⚠️ produced but no consumer found in the indexed workspace" + (" (exercised only by tests)" if any(h["direction"] == "consume" for h in tst) else "") + "\n"
         if cons and not prod:
-            md += "- ⚠️ consumed but no producer found in the indexed workspace\n"
+            md += "- ⚠️ consumed but no producer found in the indexed workspace" + (" (exercised only by tests)" if any(h["direction"] == "produce" for h in tst) else "") + "\n"
+        for h in tst[:3]:
+            md += f"- tested by: `{h['path']}:{h['line']}`\n"
+        if len(tst) > 3:
+            md += f"- tested by: +{len(tst) - 3} more\n"
         md += "\n"
 write("message-flows.md", md)
 
 # data map
 defs = q("SELECT d.tbl, d.op, f.path, d.line, d.changeset FROM db_defs d LEFT JOIN files f ON f.id=d.file_id ORDER BY d.tbl")
-accs = q("SELECT a.tbl, a.kind, a.mode, f.path, a.line, a.detail FROM db_access a JOIN files f ON f.id=a.file_id ORDER BY a.tbl")
+accs = q("SELECT a.tbl, a.kind, a.mode, f.path, a.line, a.detail" + (", f.is_test" if has_test else "")
+         + " FROM db_access a JOIN files f ON f.id=a.file_id ORDER BY a.tbl")
 md = "# Data Map, tables, services, changesets (generated)\n\n" + big_doc_banner(len({d["tbl"] for d in defs} | {a["tbl"] for a in accs}), "tables", "db_map table:<name>")
 if not defs and not accs:
     md += "_No Liquibase changelogs or DB access detected._\n"
@@ -125,11 +142,15 @@ else:
         tables.setdefault(d["tbl"], {"defs": [], "accs": []})["defs"].append(d)
     for a in accs:
         tables.setdefault(a["tbl"], {"defs": [], "accs": []})["accs"].append(a)
+    # diagram and main bullets are production topology; test access shows as "tested by"
     md += "```mermaid\nflowchart LR\n"
     seen = set()
     for tbl, t in tables.items():
+        pa = [a for a in t["accs"] if not is_t(a)]
+        if not t["defs"] and not pa:
+            continue
         md += f'  DB_{mm(tbl)}[("{tbl}")]:::tbl\n'
-        for a in t["accs"]:
+        for a in pa:
             s = mm(svc(a["path"]))
             if s not in seen:
                 md += f'  {s}["{svc(a["path"])}"]\n'
@@ -138,46 +159,67 @@ else:
     md += "  classDef tbl fill:#0d1b2e,color:#7dd3fc,stroke:#38bdf8\n```\n\n## Per-table detail\n\n"
     for tbl in sorted(tables):
         t = tables[tbl]
+        pa = [a for a in t["accs"] if not is_t(a)]
+        ta = [a for a in t["accs"] if is_t(a)]
         md += f"### `{tbl}`\n"
         if t["defs"]:
             md += "**Schema history:** " + " → ".join(f"{d['op']}{' ['+d['changeset']+']' if d['changeset'] else ''}" for d in t["defs"]) + "\n"
             md += "".join(f"- {d['op']} @ `{d['path']}:{d['line']}`\n" for d in t["defs"])
         else:
-            md += "- ⚠️ **DRIFT**, accessed by code but no Liquibase changeset defines it in the indexed workspace\n"
-        md += "".join(f"- {a['kind']} [{a['mode']}]. `{a['path']}:{a['line']}` ({a['detail']})\n" for a in t["accs"])
-        if t["defs"] and not t["accs"]:
-            md += "- ⚠️ defined in changelog but no code access found\n"
+            md += "- ⚠️ **DRIFT**, accessed by code but no Liquibase changeset defines it in the indexed workspace" + ("" if pa else " (exercised only by tests)") + "\n"
+        md += "".join(f"- {a['kind']} [{a['mode']}]. `{a['path']}:{a['line']}` ({a['detail']})\n" for a in pa)
+        if t["defs"] and not pa:
+            md += "- ⚠️ defined in changelog but no code access found" + (" (exercised only by tests)" if ta else "") + "\n"
+        for a in ta[:3]:
+            md += f"- tested by: `{a['path']}:{a['line']}`\n"
+        if len(ta) > 3:
+            md += f"- tested by: +{len(ta) - 3} more\n"
         md += "\n"
 write("data-map.md", md)
 
 # http map
 from http_extract import paths_match
-eps = q("SELECT e.method, e.path, e.norm, f.path fp, e.line FROM http_endpoints e JOIN files f ON f.id=e.file_id ORDER BY e.norm")
-hcalls = q("SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client FROM http_calls c JOIN files f ON f.id=c.file_id")
+eps = q("SELECT e.method, e.path, e.norm, f.path fp, e.line" + (", f.is_test" if has_test else "")
+        + " FROM http_endpoints e JOIN files f ON f.id=e.file_id ORDER BY e.norm")
+hcalls = q("SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client" + (", f.is_test" if has_test else "")
+           + " FROM http_calls c JOIN files f ON f.id=c.file_id")
 md = "# HTTP Seam, endpoints and callers (generated)\n\n" + big_doc_banner(len(eps), "endpoints", "http_map path:<fragment>")
 if not eps and not hcalls:
     md += "_No REST endpoints or HTTP clients detected._\n"
 else:
+    # diagram and main bullets are production topology; test callers show as
+    # "tested by", test-defined endpoints (WireMock stubs) are omitted
     md += "```mermaid\nflowchart LR\n"
     seen, matched = set(), set()
     for e in eps:
+        if is_t(e):
+            continue
         es = mm(svc(e["fp"]))
         if es not in seen:
             md += f'  {es}["{svc(e["fp"])}"]\n'; seen.add(es)
         for i, c in enumerate(hcalls):
             if c["method"] == e["method"] and paths_match(c["norm"], e["norm"]):
                 matched.add(i)
+                if is_t(c):
+                    continue
                 cs = mm(svc(c["fp"]))
                 if cs not in seen:
                     md += f'  {cs}["{svc(c["fp"])}"]\n'; seen.add(cs)
                 md += f'  {cs} -->|"{e["method"]} {e["norm"]}"| {es}\n'
     md += "```\n\n## Endpoints\n\n"
     for e in eps:
-        callers = [c for c in hcalls if c["method"] == e["method"] and paths_match(c["norm"], e["norm"])]
+        if is_t(e):
+            continue
+        callers = [c for c in hcalls if not is_t(c) and c["method"] == e["method"] and paths_match(c["norm"], e["norm"])]
+        tcallers = [c for c in hcalls if is_t(c) and c["method"] == e["method"] and paths_match(c["norm"], e["norm"])]
         md += f"- **{e['method']} {e['path']}**. `{e['fp']}:{e['line']}`"
         md += ("\n" + "\n".join(f"  - caller: `{c['fp']}:{c['line']}` ({c['client']})" for c in callers)
-               if callers else ", ⚠️ no caller found in the indexed workspace") + "\n"
-    un = [c for i, c in enumerate(hcalls) if i not in matched]
+               if callers else ", ⚠️ no caller found in the indexed workspace" + (" (exercised only by tests)" if tcallers else "")) + "\n"
+        for c in tcallers[:3]:
+            md += f"  - tested by: `{c['fp']}:{c['line']}`\n"
+        if len(tcallers) > 3:
+            md += f"  - tested by: +{len(tcallers) - 3} more\n"
+    un = [c for i, c in enumerate(hcalls) if i not in matched and not is_t(c)]
     if un:
         md += "\n## Unmatched outbound calls (external APIs or dynamic paths)\n\n"
         md += "\n".join(f"- {c['method']} {c['path']}. `{c['fp']}:{c['line']}` ({c['client']})" for c in un) + "\n"
@@ -243,6 +285,7 @@ hot6 = q("SELECT f.path, COUNT(e.src) n FROM files f JOIN edges e ON e.dst=f.id 
 sym = q("SELECT COUNT(*) c FROM symbols")[0]["c"]
 top_topics = [r[0] for r in q("SELECT topic, COUNT(*) n FROM msg_edges GROUP BY topic ORDER BY n DESC LIMIT 15")]
 top_tables = [r[0] for r in q("SELECT tbl, COUNT(*) n FROM db_access GROUP BY tbl ORDER BY n DESC LIMIT 15")]
+n_test = q("SELECT COUNT(*) c FROM files WHERE is_test=1")[0]["c"] if has_test else 0
 _more = lambda all_, n, doc: f" (+{len(all_) - n} more, see {doc})" if len(all_) > n else ""  # noqa: E731
 md = f"""# Agent Context Pack (generated, read this FIRST, then use Ariadne tools)
 
@@ -257,6 +300,7 @@ Kafka topics: {(str(len(topics_l)) + ", busiest: " + ", ".join(f'`{t}`' for t in
 REST endpoints: {q("SELECT COUNT(*) c FROM http_endpoints")[0]["c"]} (see docs/generated/http-map.md).
 Standing decisions: {"; ".join(r[0] for r in q("SELECT id || ' ' || title FROM decisions WHERE valid_until IS NULL ORDER BY decided_at DESC LIMIT 6")) if q("SELECT name FROM sqlite_master WHERE name='decisions'") else "none recorded"}, query via decisions/decision_trace; capture via save_decision.
 Database tables: {(str(len(tables_l)) + ", most accessed: " + ", ".join(f'`{t}`' for t in top_tables) + _more(tables_l, 15, "data-map.md, or call db_map")) if tables_l else "none detected"}.
+Tests: {n_test} test files indexed. Test-derived facts are labeled [TEST] in tools and excluded from the topology above.
 
 ## How to look things up (cheapest first)
 1. This pack + `docs/generated/*.md` (architecture, message-flows, data-map), already summarized.

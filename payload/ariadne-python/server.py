@@ -15,6 +15,7 @@ import functools
 import json
 import hashlib
 import os
+import re
 import sqlite3
 import sys
 import subprocess
@@ -208,6 +209,23 @@ def context_pack(target: str) -> str:
     except sqlite3.Error:
         pass
 
+    # which tests import this target, and the behaviors they assert
+    tests = "none found — no test imports this target"
+    try:
+        tf = [r["path"] for r in con.execute(
+            "SELECT DISTINCT f2.path FROM edges e JOIN files f2 ON f2.id=e.src "
+            "WHERE e.dst=? AND f2.is_test=1 LIMIT 5", (fid,))]
+        if tf:
+            marks = ",".join("?" * len(tf))
+            # jest strings are already prose; camelCase/snake_case method names get decamelized
+            decamel = lambda s: s if " " in s else re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s).replace("_", " ").lower()  # noqa: E731
+            behaviors = [decamel(r["name"]) for r in con.execute(
+                f"SELECT tc.name FROM test_cases tc JOIN files f2 ON f2.id=tc.file_id "
+                f"WHERE f2.path IN ({marks}) LIMIT 5", tf)]
+            tests = {"files": tf, "behaviors": behaviors}
+    except sqlite3.Error:
+        pass  # files.is_test / test_cases may predate this index build
+
     return json.dumps({
         "target": (f"{(symbol['parent'] + '.') if symbol and symbol['parent'] else ''}{symbol['name']} ({symbol['kind']})"
                    if symbol else fpath),
@@ -221,6 +239,7 @@ def context_pack(target: str) -> str:
         "http": {"defines": defines, "calls": hcalls},
         "governing_decisions": govern or "none recorded",
         "cached_insight": insight or "none, run enrichment, or synthesize and save_insight",
+        "tests": tests,
         "next": "Focused context for this target. Go deeper only where needed: find_references (certainty), "
                 "blast_radius (full list), message_flow/db_map/http_map (the other side of a seam).",
     }, indent=1)
@@ -265,20 +284,31 @@ def blast_radius(path: str, depth: int = 2) -> str:
     f = con.execute("SELECT id FROM files WHERE path=?", (path,)).fetchone()
     if not f:
         return "File not in index."
+    has_test = con.execute("SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='is_test'").fetchone()[0]
     frontier, seen, levels = {f["id"]}, {f["id"]}, []
+    tests_affected = set()
     for _ in range(max(1, min(depth, 5))):
         if not frontier:
             break
         marks = ",".join("?" * len(frontier))
         rows = con.execute(
-            f"SELECT DISTINCT e.src, f2.path FROM edges e JOIN files f2 ON f2.id=e.src "
+            f"SELECT DISTINCT e.src, f2.path{', f2.is_test' if has_test else ''} FROM edges e JOIN files f2 ON f2.id=e.src "
             f"WHERE e.dst IN ({marks})", tuple(frontier)).fetchall()
         frontier = {r["src"] for r in rows} - seen
         seen |= frontier
-        if rows:
-            levels.append(sorted({r["path"] for r in rows}))
+        # tests ride along in the traversal but stay out of the production counts
+        for r in rows:
+            if has_test and r["is_test"]:
+                tests_affected.add(r["path"])
+        prod = [r for r in rows if not (has_test and r["is_test"])]
+        if prod:
+            levels.append(sorted({r["path"] for r in prod}))
     total = sum(len(x) for x in levels)
-    return json.dumps({"file": path, "affected_total": total, "by_depth": levels}, indent=1)
+    out = {"file": path, "affected_total": total, "by_depth": levels}
+    if has_test:
+        out["tests_affected"] = sorted(tests_affected)
+        out["tests_affected_total"] = len(tests_affected)
+    return json.dumps(out, indent=1)
 
 
 @mcp.tool()
@@ -527,30 +557,51 @@ def graph_gaps(limit: int = 20) -> str:
         except sqlite3.Error:
             return []
 
+    # gap math is production-only: a test consumer must not cure a dead topic.
+    # test coverage surfaces as a `note` on the entry, never as a fix
+    has_test = bool(q("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'")[0]["c"])
+    prod = " AND f.is_test=0" if has_test else ""
+
     gaps = {}
     gaps["unresolved_topic_expressions"] = [
         {"expression": r["topic"], "path": r["path"], "line": r["line"],
          "why": "topic name is assembled at runtime, static analysis cannot evaluate it"}
         for r in q("SELECT m.topic, f.path, m.line FROM msg_edges m JOIN files f ON f.id=m.file_id "
-                   "WHERE m.resolved=0 LIMIT ?", n)]
-    per = q("SELECT topic, SUM(direction='produce') p, SUM(direction='consume') c FROM msg_edges GROUP BY topic")
+                   f"WHERE m.resolved=0{prod} LIMIT ?", n)]
+    if has_test:
+        per = q("SELECT m.topic, SUM(m.direction='produce') p, SUM(m.direction='consume') c FROM msg_edges m "
+                "JOIN files f ON f.id=m.file_id WHERE f.is_test=0 GROUP BY m.topic")
+        test_per = {r["topic"]: dict(r) for r in q(
+            "SELECT m.topic, SUM(m.direction='produce') p, SUM(m.direction='consume') c FROM msg_edges m "
+            "JOIN files f ON f.id=m.file_id WHERE f.is_test=1 GROUP BY m.topic")}
+    else:
+        per = q("SELECT topic, SUM(direction='produce') p, SUM(direction='consume') c FROM msg_edges GROUP BY topic")
+        test_per = {}
     gaps["topics_produced_but_never_consumed"] = [
         {"topic": r["topic"], "why": "no consumer found, dead topic, a consumer outside the workspace, "
-                                     "or a dynamic listener the parser missed"}
+                                     "or a dynamic listener the parser missed",
+         **({"note": "exercised only by tests"} if test_per.get(r["topic"], {}).get("c") else {})}
         for r in per if r["p"] and not r["c"]][:n]
     gaps["topics_consumed_but_never_produced"] = [
-        {"topic": r["topic"], "why": "no producer found, an upstream repo not indexed, or a dynamic producer"}
+        {"topic": r["topic"], "why": "no producer found, an upstream repo not indexed, or a dynamic producer",
+         **({"note": "exercised only by tests"} if test_per.get(r["topic"], {}).get("p") else {})}
         for r in per if r["c"] and not r["p"]][:n]
+    # drift and unresolved entries carry no test note: test access neither causes nor cures them
     gaps["tables_accessed_but_undefined"] = [
         {"table_name": r["tbl"], "path": r["path"], "line": r["line"],
          "why": "DRIFT, code touches it but no Liquibase changeset defines it here"}
         for r in q("SELECT DISTINCT a.tbl, f.path, a.line FROM db_access a JOIN files f ON f.id=a.file_id "
-                   "WHERE a.tbl NOT IN (SELECT tbl FROM db_defs) LIMIT ?", n)]
-    eps = q("SELECT method, path, norm FROM http_endpoints")
-    calls = q("SELECT method, norm FROM http_calls")
+                   f"WHERE a.tbl NOT IN (SELECT tbl FROM db_defs){prod} LIMIT ?", n)]
+    eps = q("SELECT e.method, e.path, e.norm FROM http_endpoints e"
+            + (" JOIN files f ON f.id=e.file_id WHERE f.is_test=0" if has_test else ""))
+    calls = q("SELECT c.method, c.norm FROM http_calls c"
+              + (" JOIN files f ON f.id=c.file_id WHERE f.is_test=0" if has_test else ""))
+    test_calls = q("SELECT c.method, c.norm FROM http_calls c JOIN files f ON f.id=c.file_id WHERE f.is_test=1") if has_test else []
     gaps["endpoints_with_no_caller"] = [
         {"endpoint": f"{e['method']} {e['path']}",
-         "why": "nobody in the workspace calls it, dead route, external consumer, or a gateway rewrite"}
+         "why": "nobody in the workspace calls it, dead route, external consumer, or a gateway rewrite",
+         **({"note": "exercised only by tests"} if any(
+             c["method"] == e["method"] and _pm(c["norm"], e["norm"]) for c in test_calls) else {})}
         for e in eps
         if not any(c["method"] == e["method"] and _pm(c["norm"], e["norm"]) for c in calls)][:n]
 
@@ -616,34 +667,54 @@ def message_flow(topic: str = "") -> str:
     if not con.execute("SELECT name FROM sqlite_master WHERE name='msg_edges'").fetchone():
         return "No message-edge data; reindex with the current Ariadne"
     n_topics = con.execute("SELECT COUNT(DISTINCT topic) FROM msg_edges").fetchone()[0]
+    has_test = con.execute("SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='is_test'").fetchone()[0]
     if not topic and n_topics > SUMMARY_THRESHOLD:
-        per = con.execute("SELECT topic, SUM(direction='produce') p, SUM(direction='consume') c "
-                          "FROM msg_edges GROUP BY topic").fetchall()
+        # topology is production-only; a topic touched only by tests is a warning, not topology
+        if has_test:
+            per = con.execute("SELECT m.topic, SUM(m.direction='produce') p, SUM(m.direction='consume') c "
+                              "FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.is_test=0 GROUP BY m.topic").fetchall()
+            test_only = [r[0] for r in con.execute(
+                "SELECT DISTINCT m.topic FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.is_test=1 "
+                "AND m.topic NOT IN (SELECT m2.topic FROM msg_edges m2 JOIN files f2 ON f2.id=m2.file_id WHERE f2.is_test=0)")]
+        else:
+            per = con.execute("SELECT topic, SUM(direction='produce') p, SUM(direction='consume') c "
+                              "FROM msg_edges GROUP BY topic").fetchall()
+            test_only = []
         cap = lambda a: (a[:25] + [f"…and {len(a) - 25} more"]) if len(a) > 25 else a  # noqa: E731
         return json.dumps({
-            "summary": f"{n_topics} topics; {sum(r['p'] for r in per)} producer sites, "
-                       f"{sum(r['c'] for r in per)} consumer sites.",
+            "summary": f"{len(per)} topics{f' ({len(test_only)} more only in tests)' if test_only else ''}; "
+                       f"{sum(r['p'] for r in per)} producer sites, {sum(r['c'] for r in per)} consumer sites.",
             "warnings": {
                 "produced_but_never_consumed": cap([r["topic"] for r in per if r["p"] and not r["c"]]),
                 "consumed_but_never_produced": cap([r["topic"] for r in per if r["c"] and not r["p"]]),
-                "unresolved_topic_expressions": con.execute("SELECT COUNT(*) FROM msg_edges WHERE resolved=0").fetchone()[0],
+                **({"topics_only_exercised_by_tests": cap(test_only)} if test_only else {}),
+                "unresolved_topic_expressions": con.execute(
+                    "SELECT COUNT(*) FROM msg_edges m JOIN files f ON f.id=m.file_id "
+                    "WHERE m.resolved=0 AND f.is_test=0").fetchone()[0] if has_test
+                else con.execute("SELECT COUNT(*) FROM msg_edges WHERE resolved=0").fetchone()[0],
             },
             "busiest_topics": [dict(r) for r in sorted(per, key=lambda r: -(r["p"] + r["c"]))[:10]],
             "next": "Full listing: docs/generated/message-flows.md. For sites on one topic: message_flow topic:<name>.",
         }, indent=1)
-    q = ("SELECT m.topic, m.direction, f.path, m.line, m.resolved, m.via, m.source FROM msg_edges m "
+    q = ("SELECT m.topic, m.direction, f.path, m.line, m.resolved, m.via, m.source"
+         + (", f.is_test" if has_test else "") + " FROM msg_edges m "
          "JOIN files f ON f.id=m.file_id " + ("WHERE m.topic=? " if topic else "") + "ORDER BY m.topic, m.direction")
     rows = con.execute(q, (topic,) if topic else ()).fetchall()
     if not rows:
         return f"No handlers found for topic '{topic}'." if topic else "No Kafka producers/consumers detected."
     topics = {}
     for r in rows:
-        t = topics.setdefault(r["topic"], {"producers": [], "consumers": [], "unresolved": []})
+        t = topics.setdefault(r["topic"], {"producers": [], "consumers": [], "unresolved": [],
+                                           "test_producers": [], "test_consumers": []})
         src = r["source"] if "source" in r.keys() else "static"
         asserted = bool(src) and src != "static"
         site = (f"{r['path']}:{r['line']}"
                 + (f" (via {r['via']})" if r["via"] and not asserted else "")
                 + (f"  [ASSERTED by {src.split(':')[1]}, derived, not parsed]" if asserted else ""))
+        if has_test and r["is_test"]:
+            t["test_producers" if r["direction"] == "produce" else "test_consumers"].append(
+                site + ("" if r["resolved"] else " (unresolved)") + "  [TEST]")
+            continue
         if not r["resolved"]:
             t["unresolved"].append(site)
         else:
@@ -654,9 +725,21 @@ def message_flow(topic: str = "") -> str:
         if t["unresolved"]:
             entry["unresolved_expressions"] = t["unresolved"]
         if t["producers"] and not t["consumers"]:
-            entry["warning"] = "produced but no consumer found in this repo"
+            n_tc = len(t["test_consumers"])
+            entry["warning"] = ("produced but no consumer found in this repo"
+                                + (f" ({n_tc} test consumer" + (" exists" if n_tc == 1 else "s exist") + ")" if n_tc else ""))
         if t["consumers"] and not t["producers"]:
-            entry["warning"] = "consumed but no producer found in this repo"
+            n_tp = len(t["test_producers"])
+            entry["warning"] = ("consumed but no producer found in this repo"
+                                + (f" ({n_tp} test producer" + (" exists" if n_tp == 1 else "s exist") + ")" if n_tp else ""))
+        if not t["producers"] and not t["consumers"] and not t["unresolved"] and (t["test_producers"] or t["test_consumers"]):
+            entry["warning"] = "only exercised by tests — no production usage in this repo"
+        if t["test_producers"] or t["test_consumers"]:
+            entry["test_usage"] = {}
+            if t["test_producers"]:
+                entry["test_usage"]["producers"] = t["test_producers"]
+            if t["test_consumers"]:
+                entry["test_usage"]["consumers"] = t["test_consumers"]
         out.append(entry)
     return json.dumps(out, indent=1)
 
@@ -668,20 +751,28 @@ def db_map(table: str = "") -> str:
     if not con.execute("SELECT name FROM sqlite_master WHERE name='db_defs'").fetchone():
         return "No DB-layer data; reindex with the current Ariadne"
     n_tables = con.execute("SELECT COUNT(*) FROM (SELECT tbl FROM db_defs UNION SELECT tbl FROM db_access)").fetchone()[0]
+    has_test = con.execute("SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='is_test'").fetchone()[0]
     if not table and n_tables > SUMMARY_THRESHOLD:
+        # topology and drift math are production-only; test-only access is its own warning
+        prod_acc = ("SELECT a2.tbl tbl FROM db_access a2 JOIN files f2 ON f2.id=a2.file_id WHERE f2.is_test=0"
+                    if has_test else "SELECT tbl FROM db_access")
         cap = lambda a: (a[:25] + [f"…and {len(a) - 25} more"]) if len(a) > 25 else a  # noqa: E731
+        n_prod = con.execute(f"SELECT COUNT(*) FROM (SELECT tbl FROM db_defs UNION SELECT tbl FROM ({prod_acc}))").fetchone()[0]
         return json.dumps({
-            "summary": f"{n_tables} tables; "
+            "summary": f"{n_prod} tables{f' ({n_tables - n_prod} more only in tests)' if n_tables > n_prod else ''}; "
                        f"{con.execute('SELECT COUNT(DISTINCT tbl) FROM db_defs').fetchone()[0]} defined by Liquibase, "
-                       f"{con.execute('SELECT COUNT(DISTINCT tbl) FROM db_access').fetchone()[0]} touched by code.",
+                       f"{con.execute(f'SELECT COUNT(DISTINCT tbl) FROM ({prod_acc})').fetchone()[0]} touched by code.",
             "warnings": {
                 "DRIFT_accessed_but_no_changeset": cap([r[0] for r in con.execute(
-                    "SELECT DISTINCT tbl FROM db_access WHERE tbl NOT IN (SELECT tbl FROM db_defs)")]),
+                    f"SELECT DISTINCT tbl FROM ({prod_acc}) WHERE tbl NOT IN (SELECT tbl FROM db_defs)")]),
                 "defined_but_never_accessed": cap([r[0] for r in con.execute(
-                    "SELECT DISTINCT tbl FROM db_defs WHERE tbl NOT IN (SELECT tbl FROM db_access)")]),
+                    f"SELECT DISTINCT tbl FROM db_defs WHERE tbl NOT IN ({prod_acc})")]),
+                **({"accessed_only_by_tests": cap([r[0] for r in con.execute(
+                    "SELECT DISTINCT a.tbl FROM db_access a JOIN files f ON f.id=a.file_id "
+                    f"WHERE f.is_test=1 AND a.tbl NOT IN ({prod_acc})")])} if has_test else {}),
             },
             "most_accessed_tables": [dict(r) for r in con.execute(
-                "SELECT tbl, COUNT(*) sites FROM db_access GROUP BY tbl ORDER BY sites DESC LIMIT 10")],
+                f"SELECT tbl, COUNT(*) sites FROM ({prod_acc}) GROUP BY tbl ORDER BY sites DESC LIMIT 10")],
             "next": "Full listing: docs/generated/data-map.md. For one table: db_map table:<name>.",
         }, indent=1)
     t = table.lower() if table else None
@@ -689,7 +780,8 @@ def db_map(table: str = "") -> str:
         "SELECT d.tbl, d.op, f.path, d.line, d.changeset FROM db_defs d LEFT JOIN files f ON f.id=d.file_id "
         + ("WHERE d.tbl=? " if t else "") + "ORDER BY d.tbl", (t,) if t else ()).fetchall()
     accs = con.execute(
-        "SELECT a.tbl, a.kind, a.mode, f.path, a.line, a.detail FROM db_access a JOIN files f ON f.id=a.file_id "
+        "SELECT a.tbl, a.kind, a.mode, f.path, a.line, a.detail" + (", f.is_test" if has_test else "")
+        + " FROM db_access a JOIN files f ON f.id=a.file_id "
         + ("WHERE a.tbl=? " if t else "") + "ORDER BY a.tbl, a.kind", (t,) if t else ()).fetchall()
     if not defs and not accs:
         return f"No definition or access found for table '{t}'." if t else "No Liquibase changelogs or DB access detected."
@@ -701,6 +793,9 @@ def db_map(table: str = "") -> str:
     for r in accs:
         e = tables.setdefault(r["tbl"], {"schema_ops": [], "entity": None, "repositories": [], "sql_sites": []})
         site = f"{r['path']}:{r['line']} ({r['detail']})"
+        if has_test and r["is_test"]:
+            e.setdefault("test_sites", []).append(f"[{r['mode']}] {site}  [TEST]")
+            continue
         if r["kind"] == "entity":
             e["entity"] = site
         elif r["kind"] == "repository":
@@ -709,11 +804,14 @@ def db_map(table: str = "") -> str:
             e["sql_sites"].append(f"[{r['mode']}] {site}")
     out = []
     for name, e in tables.items():
+        prod_empty = not e["entity"] and not e["repositories"] and not e["sql_sites"]
         entry = {"table": name, **e}
         if not e["schema_ops"]:
-            entry["warning"] = "DRIFT: accessed by code but no Liquibase changeset defines it in this repo"
-        elif not e["entity"] and not e["repositories"] and not e["sql_sites"]:
-            entry["warning"] = "defined in changelog but no code access found"
+            entry["warning"] = ("DRIFT: accessed by code but no Liquibase changeset defines it in this repo"
+                                + (" (exercised only by tests)" if prod_empty and e.get("test_sites") else ""))
+        elif prod_empty:
+            entry["warning"] = ("defined in changelog but no code access found"
+                                + (" (exercised only by tests)" if e.get("test_sites") else ""))
         out.append(entry)
     return json.dumps(out, indent=1)
 
@@ -726,10 +824,14 @@ def http_map(path: str = "") -> str:
     if not con.execute("SELECT name FROM sqlite_master WHERE name='http_endpoints'").fetchone():
         return "No HTTP-seam data; reindex with the current Ariadne"
     n_ep = con.execute("SELECT COUNT(*) FROM http_endpoints").fetchone()[0]
+    has_test = con.execute("SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='is_test'").fetchone()[0]
     if not path and n_ep > SUMMARY_THRESHOLD:
         from http_extract import paths_match as _pm
-        eps0 = con.execute("SELECT method, path, norm FROM http_endpoints").fetchall()
-        calls0 = con.execute("SELECT method, path, norm, client FROM http_calls").fetchall()
+        # orphan math is production-only: a WireMock stub or a test caller cures nothing
+        eps0 = con.execute("SELECT e.method, e.path, e.norm FROM http_endpoints e"
+                           + (" JOIN files f ON f.id=e.file_id WHERE f.is_test=0" if has_test else "")).fetchall()
+        calls0 = con.execute("SELECT c.method, c.path, c.norm, c.client FROM http_calls c"
+                             + (" JOIN files f ON f.id=c.file_id WHERE f.is_test=0" if has_test else "")).fetchall()
         matched, orphans = set(), []
         for e in eps0:
             hit = False
@@ -749,8 +851,10 @@ def http_map(path: str = "") -> str:
             },
             "next": "Full listing: docs/generated/http-map.md. For one route: http_map path:<fragment>.",
         }, indent=1)
-    eps = con.execute("SELECT e.method, e.path, e.norm, f.path fp, e.line FROM http_endpoints e JOIN files f ON f.id=e.file_id ORDER BY e.norm").fetchall()
-    calls = con.execute("SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client FROM http_calls c JOIN files f ON f.id=c.file_id ORDER BY c.norm").fetchall()
+    eps = con.execute("SELECT e.method, e.path, e.norm, f.path fp, e.line" + (", f.is_test" if has_test else "")
+                      + " FROM http_endpoints e JOIN files f ON f.id=e.file_id ORDER BY e.norm").fetchall()
+    calls = con.execute("SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client" + (", f.is_test" if has_test else "")
+                        + " FROM http_calls c JOIN files f ON f.id=c.file_id ORDER BY c.norm").fetchall()
     if not eps and not calls:
         return "No REST endpoints or HTTP clients detected."
     matched = set()
@@ -762,15 +866,31 @@ def http_map(path: str = "") -> str:
         for i, c in enumerate(calls):
             if c["method"] == e["method"] and paths_match(c["norm"], e["norm"]):
                 matched.add(i)
-                callers.append(f"{c['fp']}:{c['line']} ({c['client']})")
-        entry = {"endpoint": f"{e['method']} {e['path']}", "defined": f"{e['fp']}:{e['line']}", "callers": callers}
-        if not callers:
-            entry["warning"] = "no caller found in the indexed workspace"
+                callers.append(c)
+        prod_callers = [c for c in callers if not (has_test and c["is_test"])]
+        test_callers = [c for c in callers if has_test and c["is_test"]]
+        # an endpoint defined in a test file (WireMock/contract stub) is labeled, never an orphan
+        ep_test = has_test and e["is_test"]
+        entry = {"endpoint": f"{e['method']} {e['path']}",
+                 "defined": f"{e['fp']}:{e['line']}" + ("  [TEST]" if ep_test else ""),
+                 "callers": [f"{c['fp']}:{c['line']} ({c['client']})" for c in prod_callers]}
+        if test_callers:
+            entry["test_callers"] = [f"{c['fp']}:{c['line']} ({c['client']})  [TEST]" for c in test_callers]
+        if not prod_callers and not ep_test:
+            entry["warning"] = (f"no caller found in the indexed workspace (exercised only by tests: {len(test_callers)})"
+                                if test_callers else "no caller found in the indexed workspace")
         out.append(entry)
     unmatched = [f"{c['method']} {c['path']}, {c['fp']}:{c['line']} ({c['client']}), no matching endpoint in workspace"
-                 for i, c in enumerate(calls) if i not in matched and (not path or path in c["norm"])]
+                 for i, c in enumerate(calls)
+                 if i not in matched and not (has_test and c["is_test"]) and (not path or path in c["norm"])]
     if unmatched:
         out.append({"unmatched_calls": unmatched})
+    # test calls to endpoints outside the workspace are listed, not dropped, and never a warning
+    test_unmatched = [f"{c['method']} {c['path']}, {c['fp']}:{c['line']} ({c['client']})  [TEST]"
+                      for i, c in enumerate(calls)
+                      if i not in matched and has_test and c["is_test"] and (not path or path in c["norm"])]
+    if test_unmatched:
+        out.append({"test_unmatched_calls": test_unmatched})
     return json.dumps(out, indent=1)
 
 

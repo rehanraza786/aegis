@@ -42,6 +42,8 @@ if (!fs.existsSync(DB_PATH)) {
 fs.mkdirSync(OUT, { recursive: true });
 const db = new Database(DB_PATH, { readonly: true });
 const q = (sql, ...a) => db.prepare(sql).all(...a);
+// present only once an indexer >= schema v5 has run; older indexes still docgen
+const hasTest = q("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'")[0].c;
 const svc = (p) => p.split("/")[0];               // repo/module = first path segment
 const mmId = (s) => s.replace(/[^\w]/g, "_");     // mermaid-safe id
 const write = (name, body) => {
@@ -89,7 +91,7 @@ const write = (name, body) => {
 
 /* ---------------- message-flows.md ---------------- */
 {
-  const rows = q(`SELECT m.topic, m.direction, f.path, m.line, m.via, m.resolved
+  const rows = q(`SELECT m.topic, m.direction, f.path, m.line, m.via${hasTest ? ", f.is_test" : ""}
                   FROM msg_edges m JOIN files f ON f.id=m.file_id ORDER BY m.topic`);
   const topicCount = new Set(rows.map((r) => r.topic)).size;
   let md = `# Kafka Message Flows (generated)\n\n` + bigDocBanner(topicCount, "topics", "message_flow topic:<name>");
@@ -98,12 +100,16 @@ const write = (name, body) => {
   } else {
     const topics = {};
     for (const r of rows) (topics[r.topic] ??= []).push(r);
+    // the diagram and the main bullets are production topology; test usage
+    // appears only as "tested by" bullets
     md += "```mermaid\nflowchart LR\n";
     const seen = new Set();
     for (const [topic, hs] of Object.entries(topics)) {
+      const ph = hs.filter((h) => !h.is_test);
+      if (!ph.length) continue;
       const t = `T_${mmId(topic)}`;
       md += `  ${t}(["${topic}"]):::topic\n`;
-      for (const h of hs) {
+      for (const h of ph) {
         const s = mmId(svc(h.path));
         if (!seen.has(s)) { md += `  ${s}["${svc(h.path)}"]\n`; seen.add(s); }
         md += h.direction === "produce" ? `  ${s} -->|publish| ${t}\n` : `  ${t} -->|consume| ${s}\n`;
@@ -111,13 +117,16 @@ const write = (name, body) => {
     }
     md += "  classDef topic fill:#1e3a5f,color:#e8c468,stroke:#c9962e\n```\n\n## Per-topic detail\n\n";
     for (const [topic, hs] of Object.entries(topics)) {
-      const prod = hs.filter((h) => h.direction === "produce");
-      const cons = hs.filter((h) => h.direction === "consume");
+      const prod = hs.filter((h) => h.direction === "produce" && !h.is_test);
+      const cons = hs.filter((h) => h.direction === "consume" && !h.is_test);
+      const tst = hs.filter((h) => h.is_test);
       md += `### \`${topic}\`\n`;
       for (const p of prod) md += `- **publish**, \`${p.path}:${p.line}\`${p.via ? ` (via \`${p.via}\`)` : ""}\n`;
       for (const c of cons) md += `- **consume**, \`${c.path}:${c.line}\`${c.via ? ` (via \`${c.via}\`)` : ""}\n`;
-      if (prod.length && !cons.length) md += `- ⚠️ produced but no consumer found in the indexed workspace\n`;
-      if (cons.length && !prod.length) md += `- ⚠️ consumed but no producer found in the indexed workspace\n`;
+      if (prod.length && !cons.length) md += `- ⚠️ produced but no consumer found in the indexed workspace${tst.some((h) => h.direction === "consume") ? " (exercised only by tests)" : ""}\n`;
+      if (cons.length && !prod.length) md += `- ⚠️ consumed but no producer found in the indexed workspace${tst.some((h) => h.direction === "produce") ? " (exercised only by tests)" : ""}\n`;
+      for (const h of tst.slice(0, 3)) md += `- tested by: \`${h.path}:${h.line}\`\n`;
+      if (tst.length > 3) md += `- tested by: +${tst.length - 3} more\n`;
       md += "\n";
     }
   }
@@ -128,7 +137,7 @@ const write = (name, body) => {
 {
   const defs = q(`SELECT d.tbl, d.op, f.path, d.line, d.changeset FROM db_defs d
                   LEFT JOIN files f ON f.id=d.file_id ORDER BY d.tbl`);
-  const accs = q(`SELECT a.tbl, a.kind, a.mode, f.path, a.line, a.detail FROM db_access a
+  const accs = q(`SELECT a.tbl, a.kind, a.mode, f.path, a.line, a.detail${hasTest ? ", f.is_test" : ""} FROM db_access a
                   JOIN files f ON f.id=a.file_id ORDER BY a.tbl`);
   const tblCount = new Set([...defs.map((d2) => d2.tbl), ...accs.map((a) => a.tbl)]).size;
   let md = `# Data Map, tables, services, changesets (generated)\n\n` + bigDocBanner(tblCount, "tables", "db_map table:<name>");
@@ -138,11 +147,14 @@ const write = (name, body) => {
     const tables = new Map();
     for (const d of defs) (tables.get(d.tbl) ?? tables.set(d.tbl, { defs: [], accs: [] }).get(d.tbl)).defs.push(d);
     for (const a of accs) (tables.get(a.tbl) ?? tables.set(a.tbl, { defs: [], accs: [] }).get(a.tbl)).accs.push(a);
+    // diagram and main bullets are production topology; test access shows as "tested by"
     md += "```mermaid\nflowchart LR\n";
     const seenSvc = new Set();
     for (const [tbl, t] of tables) {
+      const pa = t.accs.filter((a) => !a.is_test);
+      if (!t.defs.length && !pa.length) continue;
       md += `  DB_${mmId(tbl)}[("${tbl}")]:::tbl\n`;
-      for (const a of t.accs) {
+      for (const a of pa) {
         const s = mmId(svc(a.path));
         if (!seenSvc.has(s)) { md += `  ${s}["${svc(a.path)}"]\n`; seenSvc.add(s); }
         md += `  ${s} -->|${a.mode}| DB_${mmId(tbl)}\n`;
@@ -150,15 +162,19 @@ const write = (name, body) => {
     }
     md += "  classDef tbl fill:#0d1b2e,color:#7dd3fc,stroke:#38bdf8\n```\n\n## Per-table detail\n\n";
     for (const [tbl, t] of [...tables].sort()) {
+      const pa = t.accs.filter((a) => !a.is_test);
+      const ta = t.accs.filter((a) => a.is_test);
       md += `### \`${tbl}\`\n`;
       if (t.defs.length) {
         md += `**Schema history:** ` + t.defs.map((d) => `${d.op}${d.changeset ? ` [${d.changeset}]` : ""}`).join(" → ") + `\n`;
         md += t.defs.map((d) => `- ${d.op} @ \`${d.path}:${d.line}\``).join("\n") + "\n";
       } else {
-        md += `- ⚠️ **DRIFT**, accessed by code but no Liquibase changeset defines it in the indexed workspace\n`;
+        md += `- ⚠️ **DRIFT**, accessed by code but no Liquibase changeset defines it in the indexed workspace${pa.length ? "" : " (exercised only by tests)"}\n`;
       }
-      for (const a of t.accs) md += `- ${a.kind} [${a.mode}], \`${a.path}:${a.line}\` (${a.detail})\n`;
-      if (t.defs.length && !t.accs.length) md += `- ⚠️ defined in changelog but no code access found\n`;
+      for (const a of pa) md += `- ${a.kind} [${a.mode}], \`${a.path}:${a.line}\` (${a.detail})\n`;
+      if (t.defs.length && !pa.length) md += `- ⚠️ defined in changelog but no code access found${ta.length ? " (exercised only by tests)" : ""}\n`;
+      for (const a of ta.slice(0, 3)) md += `- tested by: \`${a.path}:${a.line}\`\n`;
+      if (ta.length > 3) md += `- tested by: +${ta.length - 3} more\n`;
       md += "\n";
     }
   }
@@ -167,22 +183,26 @@ const write = (name, body) => {
 
 /* ---------------- http-map.md ---------------- */
 {
-  const eps = q(`SELECT e.method, e.path, e.norm, f.path fp, e.line FROM http_endpoints e JOIN files f ON f.id=e.file_id ORDER BY e.norm`);
-  const calls = q(`SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client FROM http_calls c JOIN files f ON f.id=c.file_id`);
+  const eps = q(`SELECT e.method, e.path, e.norm, f.path fp, e.line${hasTest ? ", f.is_test" : ""} FROM http_endpoints e JOIN files f ON f.id=e.file_id ORDER BY e.norm`);
+  const calls = q(`SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client${hasTest ? ", f.is_test" : ""} FROM http_calls c JOIN files f ON f.id=c.file_id`);
   let md = `# HTTP Seam, endpoints and callers (generated)\n\n` + bigDocBanner(eps.length, "endpoints", "http_map path:<fragment>");
   if (!eps.length && !calls.length) {
     md += "_No REST endpoints or HTTP clients detected._\n";
   } else {
     const { pathsMatch } = await import("./http.mjs");
+    // diagram and main bullets are production topology; test callers show as
+    // "tested by", test-defined endpoints (WireMock stubs) are omitted
     md += "```mermaid\nflowchart LR\n";
     const seen = new Set();
     const matched = new Set();
     for (const e of eps) {
+      if (e.is_test) continue;
       const es = mmId(svc(e.fp)); if (!seen.has(es)) { md += `  ${es}["${svc(e.fp)}"]\n`; seen.add(es); }
       for (let i = 0; i < calls.length; i++) {
         const c = calls[i];
         if (c.method === e.method && pathsMatch(c.norm, e.norm)) {
           matched.add(i);
+          if (c.is_test) continue;
           const cs = mmId(svc(c.fp)); if (!seen.has(cs)) { md += `  ${cs}["${svc(c.fp)}"]\n`; seen.add(cs); }
           md += `  ${cs} -->|"${e.method} ${e.norm}"| ${es}\n`;
         }
@@ -190,12 +210,16 @@ const write = (name, body) => {
     }
     md += "```\n\n## Endpoints\n\n";
     for (const e of eps) {
-      const callers = calls.filter((c) => c.method === e.method && pathsMatch(c.norm, e.norm));
+      if (e.is_test) continue;
+      const callers = calls.filter((c) => !c.is_test && c.method === e.method && pathsMatch(c.norm, e.norm));
+      const tcallers = calls.filter((c) => c.is_test && c.method === e.method && pathsMatch(c.norm, e.norm));
       md += `- **${e.method} ${e.path}**, \`${e.fp}:${e.line}\`` + (callers.length
         ? "\n" + callers.map((c) => `  - caller: \`${c.fp}:${c.line}\` (${c.client})`).join("\n")
-        : ", ⚠️ no caller found in the indexed workspace") + "\n";
+        : `, ⚠️ no caller found in the indexed workspace${tcallers.length ? " (exercised only by tests)" : ""}`) + "\n";
+      for (const c of tcallers.slice(0, 3)) md += `  - tested by: \`${c.fp}:${c.line}\`\n`;
+      if (tcallers.length > 3) md += `  - tested by: +${tcallers.length - 3} more\n`;
     }
-    const un = calls.filter((_, i) => !matched.has(i));
+    const un = calls.filter((c, i) => !matched.has(i) && !c.is_test);
     if (un.length) {
       md += "\n## Unmatched outbound calls (external APIs or dynamic paths)\n\n";
       md += un.map((c) => `- ${c.method} ${c.path}, \`${c.fp}:${c.line}\` (${c.client})`).join("\n") + "\n";
@@ -277,6 +301,7 @@ const write = (name, body) => {
   const topTopics = q(`SELECT topic, COUNT(*) n FROM msg_edges GROUP BY topic ORDER BY n DESC LIMIT 15`).map((r) => r.topic);
   const topTables = q(`SELECT tbl, COUNT(*) n FROM db_access GROUP BY tbl ORDER BY n DESC LIMIT 15`).map((r) => r.tbl);
   const topMods = [...services].slice(0, 15);
+  const nTest = hasTest ? q("SELECT COUNT(*) c FROM files WHERE is_test=1")[0].c : 0;
   const more = (all, shownN, doc) => all.length > shownN ? ` (+${all.length - shownN} more, see ${doc})` : "";
   let md = `# Agent Context Pack (generated, read this FIRST, then use Ariadne tools)\n
 This file plus one or two tool calls should orient you completely. Do not
@@ -288,7 +313,8 @@ ${services.length} modules${services.length ? ": " + topMods.join(", ") + more(s
 Kafka topics: ${topics.length ? `${topics.length}, busiest: ` + topTopics.map((t) => `\`${t}\``).join(", ") + more(topics, 15, "message-flows.md, or call message_flow") : "none detected"}.
 REST endpoints: ${q("SELECT COUNT(*) c FROM http_endpoints")[0].c} (see docs/generated/http-map.md).
 Standing decisions: ${(q("SELECT name FROM sqlite_master WHERE name='decisions'").length ? q("SELECT id || ' ' || title t FROM decisions WHERE valid_until IS NULL ORDER BY decided_at DESC LIMIT 6") : []).map((r) => r.t).join("; ") || "none recorded"}, query via decisions/decision_trace; capture via save_decision.
-Database tables: ${tables.length ? `${tables.length}, most accessed: ` + topTables.map((t) => `\`${t}\``).join(", ") + more(tables, 15, "data-map.md, or call db_map") : "none detected"}.\n
+Database tables: ${tables.length ? `${tables.length}, most accessed: ` + topTables.map((t) => `\`${t}\``).join(", ") + more(tables, 15, "data-map.md, or call db_map") : "none detected"}.
+Tests: ${nTest} test files indexed. Test-derived facts are labeled [TEST] in tools and excluded from the topology above.\n
 ## How to look things up (cheapest first)
 1. This pack + \`docs/generated/*.md\` (architecture, message-flows, data-map), already summarized.
 2. Ariadne MCP tools, \`find_symbol\`, \`file_outline\`, \`find_callers\`, \`blast_radius\`, \`message_flow\`, \`db_map\`, \`find_references\` (SCIP, compiler-grade).

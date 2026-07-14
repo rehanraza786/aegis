@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 def _discover_roots():
     env = os.environ.get("ARIADNE_ROOTS")
@@ -64,7 +64,8 @@ logging.basicConfig(
 log = logging.getLogger("ariadne")
 
 # Optional overrides from .ariadne/config.json: skipDirs, aliasPrefixes,
-# maxFileBytes, chunkLines, extraExtensions ({".vue": "javascript"})
+# maxFileBytes, chunkLines, extraExtensions ({".vue": "javascript"}),
+# testPathPatterns, prodPathPatterns
 _cfg = {}
 try:
     _cfg = json.loads((DB_DIR / "config.json").read_text(encoding="utf-8"))
@@ -89,6 +90,32 @@ SKIP_DIRS = {".git", ".ariadne", "node_modules", "vendor", "dist", "build", "tar
 SKIP_DIRS |= set(_cfg.get("skipDirs", []))
 MAX_FILE_BYTES = int(_cfg.get("maxFileBytes", 1_500_000))
 CHUNK_LINES = int(_cfg.get("chunkLines", 40))
+
+# classifies WHERE a file lives (test vs production), decided once at index time;
+# readers consume files.is_test. parity: must match isTestPath (Node edition)
+TEST_PATTERNS = [re.compile(p) for p in _cfg.get("testPathPatterns", [])]
+PROD_PATTERNS = [re.compile(p) for p in _cfg.get("prodPathPatterns", [])]
+TEST_DIRS = {"test", "tests", "__tests__", "__mocks__"}
+
+
+def is_test_path(rel):
+    if any(p.search(rel) for p in PROD_PATTERNS):
+        return False
+    if re.search(r"(^|/)src/main/", rel):
+        return False
+    if re.search(r"(^|/)src/(test|integrationTest|testFixtures)/", rel):
+        return True
+    segs = rel.split("/")
+    if any(s in TEST_DIRS for s in segs[:-1]):
+        return True
+    base = segs[-1]
+    if re.search(r"(Test|Tests|IT|ITCase)\.(java|kt|kts)$", base):
+        return True
+    if re.search(r"\.(test|spec)\.(ts|tsx|mts|js|jsx|mjs|cjs)$", base):
+        return True
+    if re.search(r"^test_.+\.py$", base) or re.search(r"_test\.py$", base) or base == "conftest.py":
+        return True
+    return any(p.search(rel) for p in TEST_PATTERNS)
 
 # ---------------------------------------------------------------- extraction
 
@@ -234,6 +261,9 @@ CREATE TABLE IF NOT EXISTS decision_links(decision_id TEXT, kind TEXT, target TE
 CREATE INDEX IF NOT EXISTS idx_dlinks ON decision_links(target);
 CREATE TABLE IF NOT EXISTS extract_cache(
   path TEXT PRIMARY KEY, hash TEXT, constants TEXT, entities TEXT);
+CREATE TABLE IF NOT EXISTS test_cases(
+  id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  name TEXT NOT NULL, line INTEGER);
 CREATE TABLE IF NOT EXISTS edges(
   src INTEGER REFERENCES files(id) ON DELETE CASCADE,
   dst INTEGER REFERENCES files(id) ON DELETE CASCADE,
@@ -306,6 +336,20 @@ def connect():
             con.execute(f"ALTER TABLE {t} ADD COLUMN source TEXT DEFAULT 'static'")
         except sqlite3.OperationalError:
             pass
+    # `source` answers WHO derived a fact (parser vs author); is_test answers WHERE
+    # the code lives (production vs test). Orthogonal axes: a parsed edge in a test
+    # file stays source='static'. Never write test provenance into `source`.
+    added_is_test = False
+    try:
+        con.execute("ALTER TABLE files ADD COLUMN is_test INTEGER DEFAULT 0")
+        added_is_test = True
+    except sqlite3.OperationalError:
+        pass
+    if added_is_test:
+        # one-time in-process backfill (SQLite has no regex); new rows classify on insert
+        for fid, p in con.execute("SELECT id, path FROM files").fetchall():
+            if is_test_path(p):
+                con.execute("UPDATE files SET is_test=1 WHERE id=?", (fid,))
     row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     if row and int(row[0]) > SCHEMA_VERSION:
         raise SystemExit(f"Index schema v{row[0]} is newer than this indexer (v{SCHEMA_VERSION}). Update the toolkit.")
@@ -384,14 +428,15 @@ def index_file(con, relpath, force=False):
     else:
         text = buf.decode("utf-8", errors="replace")
     lang = LANG_BY_EXT.get(full.suffix.lower(), "other")
+    is_test = 1 if is_test_path(relpath) else 0
 
     con.execute("DELETE FROM chunks WHERE path=?", (relpath,))
     old = con.execute("SELECT id FROM files WHERE path=?", (relpath,)).fetchone()
     if old:
         con.execute("DELETE FROM files WHERE id=?", (old[0],))
     cur = con.execute(
-        "INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime) VALUES(?,?,?,?,?,?,?)",
-        (relpath, lang, h, text.count("\n") + 1, time.time(), st.st_size, st.st_mtime))
+        "INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime, is_test) VALUES(?,?,?,?,?,?,?,?)",
+        (relpath, lang, h, text.count("\n") + 1, time.time(), st.st_size, st.st_mtime, is_test))
     fid = cur.lastrowid
 
     ast_result = None
@@ -420,6 +465,22 @@ def index_file(con, relpath, force=False):
         for name, kind, line, sig in extract_symbols(lang, text):
             con.execute("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,NULL)",
                         (fid, name, kind, line, sig))
+
+    if is_test:
+        # behaviors, not helpers: annotation-gated for JUnit, so a @KafkaListener
+        # method inside a test class never lands here
+        if lang in ("java", "kotlin"):
+            tc_re = re.compile(r"@(?:Test|ParameterizedTest|RepeatedTest|TestFactory)\b[\s\S]{0,300}?(?:void|fun)\s+(\w+)\s*\(")
+        elif lang in ("typescript", "javascript"):
+            tc_re = re.compile(r"""\b(?:it|test)(?:\.each\([^)]*\))?\s*\(\s*[`'"]([^`'"]{1,200})[`'"]""")
+        elif lang == "python":
+            tc_re = re.compile(r"^\s*def\s+(test_\w+)\s*\(", re.M)
+        else:
+            tc_re = None
+        if tc_re:
+            for m in tc_re.finditer(text):
+                con.execute("INSERT INTO test_cases(file_id, name, line) VALUES(?,?,?)",
+                            (fid, m.group(1), text.count("\n", 0, m.start()) + 1))
 
     lines = text.splitlines()
     for start in range(0, len(lines), CHUNK_LINES):
@@ -524,6 +585,11 @@ def kafka_pass(con, scope_prefixes=None):
                 maps_changed = True
             con.execute("INSERT OR REPLACE INTO extract_cache(path, hash, constants, entities) VALUES(?,?,?,?)",
                         (rel, fh or "", cj, ej))
+        # test files are cached like any other (the semantic-delta trigger stays
+        # byte-identical) but never merge into the global maps: a test constant or
+        # @Entity must not shadow a prod mapping
+        if is_test_path(rel):
+            continue
         for k, v in consts.items():
             constants.setdefault(k, v)
         entity_tables.update(ents)
@@ -549,6 +615,15 @@ def kafka_pass(con, scope_prefixes=None):
     if not maps_changed and len(dirty) < len(candidates):
         log.info("Extraction scoped to %d/%d changed files", len(dirty), len(candidates))
 
+    # a test file's own constants/entities overlay the global maps (own wins): a
+    # test-local ORDERS_TOPIC resolves to the test's literal, never to the prod
+    # mapping; anything the file doesn't define itself stays resolved=0
+    def overlay(global_map, rel, col):
+        if not is_test_path(rel):
+            return global_map
+        own = con.execute(f"SELECT {col} FROM extract_cache WHERE path=?", (rel,)).fetchone()
+        return {**global_map, **_json.loads(own[0] if own and own[0] else "{}")}
+
     scoped_delete("msg_edges")
     n = 0
     for rel in javaish:
@@ -558,7 +633,7 @@ def kafka_pass(con, scope_prefixes=None):
         fid = id_by_path.get(rel)
         if not fid or text is None or not any(k in text for k in ("Kafka", "ProducerRecord", ".send(", "subscribe")):
             continue
-        for e in extract_kafka_edges(text, cfg, constants):
+        for e in extract_kafka_edges(text, cfg, overlay(constants, rel, "constants")):
             con.execute("INSERT INTO msg_edges(file_id, topic, direction, line, resolved, via) VALUES(?,?,?,?,?,?)",
                         (fid, e["topic"], e["direction"], e["line"], 1 if e["resolved"] else 0, e["via"]))
             n += 1
@@ -601,7 +676,7 @@ def kafka_pass(con, scope_prefixes=None):
         if not fid or text is None:
             continue
         if re.search(r"@Entity|Repository|@Query|[Jj]dbc|Template|com\.querydsl|JPAQueryFactory", text):
-            for a in extract_db_access(text, entity_tables, constants):
+            for a in extract_db_access(text, overlay(entity_tables, rel, "entities"), overlay(constants, rel, "constants")):
                 con.execute("INSERT INTO db_access(file_id, tbl, kind, mode, line, detail) VALUES(?,?,?,?,?,?)",
                             (fid, a["table"], a["kind"], a["mode"], a["line"], a["detail"]))
                 accs += 1

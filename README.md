@@ -155,6 +155,8 @@ Two are worth knowing by name:
 
 **Documents**: Markdown, ADRs, and PDFs all land in the full-text index, so a requirement written in a PDF spec is searchable and citable.
 
+**Test code**: classified at index time by path and name (`src/test/`, `*Test.java`, `*.spec.ts`, `__tests__/`, `test_*.py`, and friends; force files either way with `testPathPatterns` / `prodPathPatterns`). Test facts are never dropped, they're *labeled*: the topology in `message_flow`, `db_map`, `http_map`, and the generated diagrams is production-only, and test usage rides alongside tagged `[TEST]`, so an integration test can never silently "cure" an orphan-topic or drift warning. Test method and `it()` names are captured too, which is how `context_pack` can tell you which behaviors are asserted about a target. This is a second provenance axis, orthogonal to the first: `source` records *who* derived a fact (parser vs assistant), `is_test` records *where* the code lives. Upgrading an existing index migrates the classification automatically; run *Rebuild Index* once to backfill the test behaviors immediately.
+
 ## Generated documentation
 
 A script (not an agent, not a model) reads the graph and writes `docs/generated/`. Zero tokens, deterministic, safe to run on every merge and every commit.
@@ -261,7 +263,7 @@ Nothing rebuilds from scratch unless you run `--rebuild`. Every file stores a SH
 
 **`aegis.json`**: which graph engine backs the tools. Swap Ariadne for an external MCP graph server and the skills and agents don't care; they're engine-agnostic.
 
-**`.ariadne/config.json`**: `skipDirs`, `aliasPrefixes`, `extraExtensions`, `maxFileBytes`, `tableNameOverrides` (for a custom Hibernate naming strategy, the indexer can't execute your Java), plus the context-budget knobs (`maxToolRows`, `maxToolBytes`, `summaryThreshold`, `maxDiagramNodes`, `maxDocItems`).
+**`.ariadne/config.json`**: `skipDirs`, `aliasPrefixes`, `extraExtensions`, `maxFileBytes`, `tableNameOverrides` (for a custom Hibernate naming strategy, the indexer can't execute your Java), `testPathPatterns` / `prodPathPatterns` (regexes that force files into or out of test classification), plus the context-budget knobs (`maxToolRows`, `maxToolBytes`, `summaryThreshold`, `maxDiagramNodes`, `maxDocItems`).
 
 **VS Code**: `aegis.runtime` (`node` | `python`), `aegis.autoRegisterAriadne`.
 
@@ -312,6 +314,7 @@ Stated plainly, because you'll find them anyway. This is a 0.1: the mechanisms a
 - **AST covers six languages.** Everything else is regex-tier: searchable and outline-able, no call graph.
 - **Spring profiles are flattened.** All `application-*.yaml` merge into one map, so profile-specific names can mis-correlate.
 - **Gateway rewrites, GraphQL, and gRPC aren't modeled.** All three are good `.extract` extension candidates.
+- **Test detection is path- and name-based.** Convention-defying test code needs a `testPathPatterns` entry. The SCIP `SymbolRole.Test` bit isn't ingested yet (the compiler-grade upgrade path), and there is deliberately no `tests_for` tool, `context_pack`, `message_flow`, `db_map`, and `http_map` already answer it.
 - **Measured to 2,000 files, not 200,000.** Cold index 3.7 s, incremental 360 ms at that size. The correlation pass holds in-scope file text in memory; that's the first place to look if a much larger codebase drags.
 - **Windows is CI-verified, not battle-tested.** The matrix runs `windows-latest` on every push, but nobody has used it in anger there.
 - **`PROGRESS.md` reflects your artifacts.** Garbage in, confident garbage out.
@@ -323,7 +326,7 @@ python3 tests/run_tests.py --runtime node
 python3 tests/run_tests.py --runtime python
 ```
 
-Builds a six-repo fixture workspace from scratch. Spring services with Kafka, Liquibase in XML and SQL, a Lombok-stacked entity, Spring Cloud Stream bindings, a deliberately dynamic topic, Kotlin, Gradle, a React frontend, and a docs repo with an ADR chain and a PDF, then asserts ~70 behaviors end to end: AST nesting, Lombok synthesis, cross-repo Kafka correlation, schema drift, HTTP seam matching, PDF indexing, checksum caching, scoped extraction, SCIP ingest, decision supersession, context budget with warning survival, graph assertions with provenance, corruption recovery, and an MCP protocol round trip.
+Builds a six-repo fixture workspace from scratch. Spring services with Kafka, Liquibase in XML and SQL, a Lombok-stacked entity, Spring Cloud Stream bindings, a deliberately dynamic topic, Kotlin, Gradle, a React frontend, and a docs repo with an ADR chain and a PDF, plus a test file for every detection convention, then asserts ~100 behaviors end to end: AST nesting, Lombok synthesis, cross-repo Kafka correlation, schema drift, HTTP seam matching, PDF indexing, checksum caching, scoped extraction, SCIP ingest, decision supersession, context budget with warning survival, test-aware topology (production-only maps, `[TEST]`-labeled usage), graph assertions with provenance, corruption recovery, and an MCP protocol round trip.
 
 CI runs the whole thing on **ubuntu and windows, against both runtimes**, on every push. That matrix is the reason anyone other than the author should trust this.
 

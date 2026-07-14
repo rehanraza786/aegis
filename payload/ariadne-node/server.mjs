@@ -172,6 +172,21 @@ tool(server, "context_pack",
       if (row) insight = row.summary;
     } catch { /* no insights yet */ }
 
+    // which tests import this target, and the behaviors they assert
+    let tests = "none found — no test imports this target";
+    try {
+      const tf = d.prepare(`SELECT DISTINCT f2.path FROM edges e JOIN files f2 ON f2.id=e.src
+        WHERE e.dst=? AND f2.is_test=1 LIMIT 5`).all(file.id).map((r) => r.path);
+      if (tf.length) {
+        const marks = tf.map(() => "?").join(",");
+        // jest strings are already prose; camelCase/snake_case method names get decamelized
+        const decamel = (s) => s.includes(" ") ? s : s.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/_/g, " ").toLowerCase();
+        const behaviors = d.prepare(`SELECT tc.name FROM test_cases tc JOIN files f2 ON f2.id=tc.file_id
+          WHERE f2.path IN (${marks}) LIMIT 5`).all(...tf).map((r) => decamel(r.name));
+        tests = { files: tf, behaviors };
+      }
+    } catch { /* files.is_test / test_cases may predate this index build */ }
+
     return {
       target: symbol ? `${symbol.parent ? symbol.parent + "." : ""}${symbol.name} (${symbol.kind})` : file.path,
       file: file.path + (symbol ? `:${symbol.line}` : ""),
@@ -187,6 +202,7 @@ tool(server, "context_pack",
       },
       governing_decisions: govern.length ? govern.map((g) => `${g.id}: ${g.title}`) : "none recorded",
       cached_insight: insight ?? "none, run enrichment, or synthesize and save_insight",
+      tests,
       next: "This is the focused context for this target. Go deeper only where needed: find_references (certainty), blast_radius (full list), message_flow/db_map/http_map (the other side of a seam).",
     };
   }));
@@ -224,20 +240,26 @@ tool(server, "blast_radius",
   ({ path: p, depth }) => withDb((d) => {
     const f = d.prepare("SELECT id FROM files WHERE path=?").get(p);
     if (!f) return "File not in index.";
+    const hasTest = d.prepare("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'").get().c;
     let frontier = new Set([f.id]);
     const seen = new Set([f.id]);
     const levels = [];
+    const testsAffected = new Set();
     for (let i = 0; i < clamp(depth ?? 2, 1, 5); i++) {
       if (!frontier.size) break;
       const marks = [...frontier].map(() => "?").join(",");
       const rows = d.prepare(
-        `SELECT DISTINCT e.src, f2.path FROM edges e JOIN files f2 ON f2.id=e.src WHERE e.dst IN (${marks})`
+        `SELECT DISTINCT e.src, f2.path${hasTest ? ", f2.is_test" : ""} FROM edges e JOIN files f2 ON f2.id=e.src WHERE e.dst IN (${marks})`
 ).all(...frontier);
       frontier = new Set(rows.map((r) => r.src).filter((id) => !seen.has(id)));
       frontier.forEach((id) => seen.add(id));
-      if (rows.length) levels.push([...new Set(rows.map((r) => r.path))].sort());
+      // tests ride along in the traversal but stay out of the production counts
+      for (const r of rows) if (r.is_test) testsAffected.add(r.path);
+      const prod = rows.filter((r) => !r.is_test);
+      if (prod.length) levels.push([...new Set(prod.map((r) => r.path))].sort());
     }
-    return { file: p, affected_total: levels.reduce((a, l) => a + l.length, 0), by_depth: levels };
+    return { file: p, affected_total: levels.reduce((a, l) => a + l.length, 0), by_depth: levels,
+      ...(hasTest ? { tests_affected: [...testsAffected].sort(), tests_affected_total: testsAffected.size } : {}) };
   }));
 
 tool(server, "dependencies",
@@ -463,29 +485,45 @@ tool(server, "graph_gaps",
     const n = clamp(limit ?? 20, 1, 60);
     const gaps = {};
     const q = (sql, ...a) => { try { return d.prepare(sql).all(...a); } catch { return []; } };
+    // gap math is production-only: a test consumer must not cure a dead topic.
+    // test coverage surfaces as a `note` on the entry, never as a fix
+    const hasTest = d.prepare("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'").get().c;
+    const prod = hasTest ? " AND f.is_test=0" : "";
 
     gaps.unresolved_topic_expressions = q(
       `SELECT m.topic AS expression, f.path, m.line FROM msg_edges m JOIN files f ON f.id=m.file_id
-       WHERE m.resolved=0 LIMIT ?`, n)
+       WHERE m.resolved=0${prod} LIMIT ?`, n)
       .map((r) => ({ ...r, why: "topic name is assembled at runtime, static analysis cannot evaluate it" }));
 
-    const per = q(`SELECT topic, SUM(direction='produce') p, SUM(direction='consume') c FROM msg_edges GROUP BY topic`);
+    const per = hasTest
+      ? q(`SELECT m.topic, SUM(m.direction='produce') p, SUM(m.direction='consume') c FROM msg_edges m
+           JOIN files f ON f.id=m.file_id WHERE f.is_test=0 GROUP BY m.topic`)
+      : q(`SELECT topic, SUM(direction='produce') p, SUM(direction='consume') c FROM msg_edges GROUP BY topic`);
+    const testPer = new Map((hasTest
+      ? q(`SELECT m.topic, SUM(m.direction='produce') p, SUM(m.direction='consume') c FROM msg_edges m
+           JOIN files f ON f.id=m.file_id WHERE f.is_test=1 GROUP BY m.topic`)
+      : []).map((r) => [r.topic, r]));
     gaps.topics_produced_but_never_consumed = per.filter((t) => t.p && !t.c).slice(0, n)
-      .map((t) => ({ topic: t.topic, why: "no consumer found, dead topic, a consumer outside the workspace, or a dynamic listener the parser missed" }));
+      .map((t) => ({ topic: t.topic, why: "no consumer found, dead topic, a consumer outside the workspace, or a dynamic listener the parser missed",
+        ...(testPer.get(t.topic)?.c ? { note: "exercised only by tests" } : {}) }));
     gaps.topics_consumed_but_never_produced = per.filter((t) => t.c && !t.p).slice(0, n)
-      .map((t) => ({ topic: t.topic, why: "no producer found, an upstream repo not indexed, or a dynamic producer the parser missed" }));
+      .map((t) => ({ topic: t.topic, why: "no producer found, an upstream repo not indexed, or a dynamic producer the parser missed",
+        ...(testPer.get(t.topic)?.p ? { note: "exercised only by tests" } : {}) }));
 
+    // drift and unresolved entries carry no test note: test access neither causes nor cures them
     gaps.tables_accessed_but_undefined = q(
       `SELECT DISTINCT a.tbl AS table_name, f.path, a.line FROM db_access a JOIN files f ON f.id=a.file_id
-       WHERE a.tbl NOT IN (SELECT tbl FROM db_defs) LIMIT ?`, n)
+       WHERE a.tbl NOT IN (SELECT tbl FROM db_defs)${prod} LIMIT ?`, n)
       .map((r) => ({ ...r, why: "DRIFT, code touches it but no Liquibase changeset defines it here (other repo? dynamic DDL? a real bug?)" }));
 
-    const eps = q(`SELECT e.method, e.path, e.norm FROM http_endpoints e`);
-    const calls = q(`SELECT c.method, c.norm FROM http_calls c`);
+    const eps = q(`SELECT e.method, e.path, e.norm FROM http_endpoints e${hasTest ? " JOIN files f ON f.id=e.file_id WHERE f.is_test=0" : ""}`);
+    const calls = q(`SELECT c.method, c.norm FROM http_calls c${hasTest ? " JOIN files f ON f.id=c.file_id WHERE f.is_test=0" : ""}`);
+    const testCalls = hasTest ? q(`SELECT c.method, c.norm FROM http_calls c JOIN files f ON f.id=c.file_id WHERE f.is_test=1`) : [];
     gaps.endpoints_with_no_caller = eps
       .filter((e) => !calls.some((c) => c.method === e.method && pathsMatch(c.norm, e.norm)))
       .slice(0, n)
-      .map((e) => ({ endpoint: `${e.method} ${e.path}`, why: "nobody in the workspace calls it, dead route, an external consumer, or a gateway rewrite the parser cannot see" }));
+      .map((e) => ({ endpoint: `${e.method} ${e.path}`, why: "nobody in the workspace calls it, dead route, an external consumer, or a gateway rewrite the parser cannot see",
+        ...(testCalls.some((c) => c.method === e.method && pathsMatch(c.norm, e.norm)) ? { note: "exercised only by tests" } : {}) }));
 
     const total = Object.values(gaps).reduce((a, b) => a + b.length, 0);
     return {
@@ -543,16 +581,29 @@ tool(server, "message_flow",
     }
     // Large system, no filter: a full dump is useless AND huge. Return the signal instead.
     const nTopics = d.prepare("SELECT COUNT(DISTINCT topic) c FROM msg_edges").get().c;
+    const hasTest = d.prepare("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'").get().c;
     if (!topic && nTopics > SUMMARY_THRESHOLD) {
-      const per = d.prepare(`SELECT topic, SUM(direction='produce') producers,
-        SUM(direction='consume') consumers FROM msg_edges GROUP BY topic`).all();
+      // topology is production-only; a topic touched only by tests is a warning, not topology
+      const per = hasTest
+        ? d.prepare(`SELECT m.topic, SUM(m.direction='produce') producers,
+            SUM(m.direction='consume') consumers FROM msg_edges m
+            JOIN files f ON f.id=m.file_id WHERE f.is_test=0 GROUP BY m.topic`).all()
+        : d.prepare(`SELECT topic, SUM(direction='produce') producers,
+            SUM(direction='consume') consumers FROM msg_edges GROUP BY topic`).all();
+      const testOnly = hasTest
+        ? d.prepare(`SELECT DISTINCT m.topic FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.is_test=1
+            AND m.topic NOT IN (SELECT m2.topic FROM msg_edges m2 JOIN files f2 ON f2.id=m2.file_id WHERE f2.is_test=0)`).all().map((r) => r.topic)
+        : [];
       const cap = (a) => (a.length > 25 ? [...a.slice(0, 25), `…and ${a.length - 25} more`] : a);
       return {
-        summary: `${nTopics} topics; ${per.reduce((x, t) => x + t.producers, 0)} producer sites, ${per.reduce((x, t) => x + t.consumers, 0)} consumer sites.`,
+        summary: `${per.length} topics${testOnly.length ? ` (${testOnly.length} more only in tests)` : ""}; ${per.reduce((x, t) => x + t.producers, 0)} producer sites, ${per.reduce((x, t) => x + t.consumers, 0)} consumer sites.`,
         warnings: {
           produced_but_never_consumed: cap(per.filter((t) => t.producers > 0 && t.consumers === 0).map((t) => t.topic)),
           consumed_but_never_produced: cap(per.filter((t) => t.consumers > 0 && t.producers === 0).map((t) => t.topic)),
-          unresolved_topic_expressions: d.prepare("SELECT COUNT(*) c FROM msg_edges WHERE resolved=0").get().c,
+          ...(testOnly.length ? { topics_only_exercised_by_tests: cap(testOnly) } : {}),
+          unresolved_topic_expressions: hasTest
+            ? d.prepare("SELECT COUNT(*) c FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE m.resolved=0 AND f.is_test=0").get().c
+            : d.prepare("SELECT COUNT(*) c FROM msg_edges WHERE resolved=0").get().c,
         },
         busiest_topics: per.sort((a, b) => (b.producers + b.consumers) - (a.producers + a.consumers)).slice(0, 10),
         next: "Full listing: docs/generated/message-flows.md. For the sites on one topic: message_flow topic:<name>.",
@@ -561,24 +612,37 @@ tool(server, "message_flow",
     const where = topic ? "WHERE m.topic = ?" : "";
     const hasSrc = d.prepare("SELECT COUNT(*) c FROM pragma_table_info('msg_edges') WHERE name='source'").get().c;
     const rows = d.prepare(
-      `SELECT m.topic, m.direction, f.path, m.line, m.resolved, m.via${hasSrc ? ", m.source" : ""} FROM msg_edges m
+      `SELECT m.topic, m.direction, f.path, m.line, m.resolved, m.via${hasSrc ? ", m.source" : ""}${hasTest ? ", f.is_test" : ""} FROM msg_edges m
        JOIN files f ON f.id=m.file_id ${where} ORDER BY m.topic, m.direction`
 ).all(...(topic ? [topic] : []));
     if (!rows.length) return topic ? `No handlers found for topic '${topic}'.` : "No Kafka producers/consumers detected.";
     const topics = {};
     for (const r of rows) {
-      const t = (topics[r.topic] ??= { producers: [], consumers: [], unresolved: [] });
+      const t = (topics[r.topic] ??= { producers: [], consumers: [], unresolved: [], test_producers: [], test_consumers: [] });
       const asserted = r.source && r.source !== "static";
       const site = `${r.path}:${r.line}` + (r.via && !asserted ? ` (via ${r.via})` : "")
         + (asserted ? `  [ASSERTED by ${r.source.split(":")[1]}, derived, not parsed]` : "");
+      if (r.is_test) {
+        (r.direction === "produce" ? t.test_producers : t.test_consumers)
+          .push(site + (r.resolved ? "" : " (unresolved)") + "  [TEST]");
+        continue;
+      }
       if (!r.resolved) t.unresolved.push(site);
       else (r.direction === "produce" ? t.producers : t.consumers).push(site);
     }
     const out = Object.entries(topics).map(([t, v]) => ({
       topic: t, producers: v.producers, consumers: v.consumers,
       ...(v.unresolved.length ? { unresolved_expressions: v.unresolved } : {}),
-      ...(v.producers.length && !v.consumers.length ? { warning: "produced but no consumer found in this repo" } : {}),
-      ...(v.consumers.length && !v.producers.length ? { warning: "consumed but no producer found in this repo" } : {}),
+      ...(v.producers.length && !v.consumers.length ? { warning: "produced but no consumer found in this repo"
+        + (v.test_consumers.length ? ` (${v.test_consumers.length} test consumer${v.test_consumers.length === 1 ? " exists" : "s exist"})` : "") } : {}),
+      ...(v.consumers.length && !v.producers.length ? { warning: "consumed but no producer found in this repo"
+        + (v.test_producers.length ? ` (${v.test_producers.length} test producer${v.test_producers.length === 1 ? " exists" : "s exist"})` : "") } : {}),
+      ...(!v.producers.length && !v.consumers.length && !v.unresolved.length && (v.test_producers.length || v.test_consumers.length)
+        ? { warning: "only exercised by tests — no production usage in this repo" } : {}),
+      ...(v.test_producers.length || v.test_consumers.length ? { test_usage: {
+        ...(v.test_producers.length ? { producers: v.test_producers } : {}),
+        ...(v.test_consumers.length ? { consumers: v.test_consumers } : {}),
+      } } : {}),
     }));
     return out;
   }));
@@ -591,22 +655,30 @@ tool(server, "db_map",
       return "No DB-layer data; reindex with the current Ariadne";
     }
     const nTables = d.prepare("SELECT COUNT(*) c FROM (SELECT tbl FROM db_defs UNION SELECT tbl FROM db_access)").get().c;
+    const hasTest = d.prepare("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'").get().c;
     if (!table && nTables > SUMMARY_THRESHOLD) {
+      // topology and drift math are production-only; test-only access is its own warning
+      const prodAcc = hasTest
+        ? "SELECT a2.tbl tbl FROM db_access a2 JOIN files f2 ON f2.id=a2.file_id WHERE f2.is_test=0"
+        : "SELECT tbl FROM db_access";
       const cap = (a) => (a.length > 25 ? [...a.slice(0, 25), `…and ${a.length - 25} more`] : a);
+      const nProd = d.prepare(`SELECT COUNT(*) c FROM (SELECT tbl FROM db_defs UNION SELECT tbl FROM (${prodAcc}))`).get().c;
       return {
-        summary: `${nTables} tables; ${d.prepare("SELECT COUNT(DISTINCT tbl) c FROM db_defs").get().c} defined by Liquibase, ${d.prepare("SELECT COUNT(DISTINCT tbl) c FROM db_access").get().c} touched by code.`,
+        summary: `${nProd} tables${nTables > nProd ? ` (${nTables - nProd} more only in tests)` : ""}; ${d.prepare("SELECT COUNT(DISTINCT tbl) c FROM db_defs").get().c} defined by Liquibase, ${d.prepare(`SELECT COUNT(DISTINCT tbl) c FROM (${prodAcc})`).get().c} touched by code.`,
         warnings: {
-          DRIFT_accessed_but_no_changeset: cap(d.prepare("SELECT DISTINCT tbl FROM db_access WHERE tbl NOT IN (SELECT tbl FROM db_defs)").all().map((r) => r.tbl)),
-          defined_but_never_accessed: cap(d.prepare("SELECT DISTINCT tbl FROM db_defs WHERE tbl NOT IN (SELECT tbl FROM db_access)").all().map((r) => r.tbl)),
+          DRIFT_accessed_but_no_changeset: cap(d.prepare(`SELECT DISTINCT tbl FROM (${prodAcc}) WHERE tbl NOT IN (SELECT tbl FROM db_defs)`).all().map((r) => r.tbl)),
+          defined_but_never_accessed: cap(d.prepare(`SELECT DISTINCT tbl FROM db_defs WHERE tbl NOT IN (${prodAcc})`).all().map((r) => r.tbl)),
+          ...(hasTest ? { accessed_only_by_tests: cap(d.prepare(`SELECT DISTINCT a.tbl FROM db_access a JOIN files f ON f.id=a.file_id
+            WHERE f.is_test=1 AND a.tbl NOT IN (${prodAcc})`).all().map((r) => r.tbl)) } : {}),
         },
-        most_accessed_tables: d.prepare("SELECT tbl, COUNT(*) sites FROM db_access GROUP BY tbl ORDER BY sites DESC LIMIT 10").all(),
+        most_accessed_tables: d.prepare(`SELECT tbl, COUNT(*) sites FROM (${prodAcc}) GROUP BY tbl ORDER BY sites DESC LIMIT 10`).all(),
         next: "Full listing: docs/generated/data-map.md. For changesets and access sites on one table: db_map table:<name>.",
       };
     }
     const t = table?.toLowerCase();
     const defs = d.prepare(`SELECT db.tbl, db.op, f.path, db.line, db.changeset FROM db_defs db
       LEFT JOIN files f ON f.id=db.file_id ${t ? "WHERE db.tbl=?" : ""} ORDER BY db.tbl`).all(...(t ? [t] : []));
-    const accs = d.prepare(`SELECT a.tbl, a.kind, a.mode, f.path, a.line, a.detail FROM db_access a
+    const accs = d.prepare(`SELECT a.tbl, a.kind, a.mode, f.path, a.line, a.detail${hasTest ? ", f.is_test" : ""} FROM db_access a
       JOIN files f ON f.id=a.file_id ${t ? "WHERE a.tbl=?" : ""} ORDER BY a.tbl, a.kind`).all(...(t ? [t] : []));
     if (!defs.length && !accs.length) return t ? `No definition or access found for table '${t}'.` : "No Liquibase changelogs or DB access detected.";
     const tables = {};
@@ -617,16 +689,22 @@ tool(server, "db_map",
     for (const r of accs) {
       const e = (tables[r.tbl] ??= { schema_ops: [], entity: null, repositories: [], sql_sites: [] });
       const site = `${r.path}:${r.line} (${r.detail})`;
+      if (r.is_test) { (e.test_sites ??= []).push(`[${r.mode}] ${site}  [TEST]`); continue; }
       if (r.kind === "entity") e.entity = site;
       else if (r.kind === "repository") e.repositories.push(site);
       else e.sql_sites.push(`[${r.mode}] ${site}`);
     }
-    return Object.entries(tables).map(([name, e]) => ({
-      table: name, ...e,
-      ...(!e.schema_ops.length ? { warning: "DRIFT: accessed by code but no Liquibase changeset defines it in this repo" } : {}),
-      ...(e.schema_ops.length && !e.entity && !e.repositories.length && !e.sql_sites.length
-        ? { warning: "defined in changelog but no code access found" } : {}),
-    }));
+    return Object.entries(tables).map(([name, e]) => {
+      const prodEmpty = !e.entity && !e.repositories.length && !e.sql_sites.length;
+      return {
+        table: name, ...e,
+        ...(!e.schema_ops.length ? { warning: "DRIFT: accessed by code but no Liquibase changeset defines it in this repo"
+          + (prodEmpty && e.test_sites?.length ? " (exercised only by tests)" : "") } : {}),
+        ...(e.schema_ops.length && prodEmpty
+          ? { warning: "defined in changelog but no code access found"
+            + (e.test_sites?.length ? " (exercised only by tests)" : "") } : {}),
+      };
+    });
   }));
 
 tool(server, "http_map",
@@ -637,9 +715,11 @@ tool(server, "http_map",
       return "No HTTP-seam data; reindex with the current Ariadne";
     }
     const nEp = d.prepare("SELECT COUNT(*) c FROM http_endpoints").get().c;
+    const hasTest = d.prepare("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'").get().c;
     if (!pf && nEp > SUMMARY_THRESHOLD) {
-      const eps0 = d.prepare("SELECT e.method, e.path, e.norm FROM http_endpoints e").all();
-      const calls0 = d.prepare("SELECT c.method, c.path, c.norm, c.client FROM http_calls c").all();
+      // orphan math is production-only: a WireMock stub or a test caller cures nothing
+      const eps0 = d.prepare(`SELECT e.method, e.path, e.norm FROM http_endpoints e${hasTest ? " JOIN files f ON f.id=e.file_id WHERE f.is_test=0" : ""}`).all();
+      const calls0 = d.prepare(`SELECT c.method, c.path, c.norm, c.client FROM http_calls c${hasTest ? " JOIN files f ON f.id=c.file_id WHERE f.is_test=0" : ""}`).all();
       const matched = new Set();
       const orphanEps = [];
       for (const e of eps0) {
@@ -659,9 +739,9 @@ tool(server, "http_map",
         next: "Full listing: docs/generated/http-map.md. For callers of one route: http_map path:<fragment>.",
       };
     }
-    const eps = d.prepare(`SELECT e.method, e.path, e.norm, f.path fp, e.line, e.detail
+    const eps = d.prepare(`SELECT e.method, e.path, e.norm, f.path fp, e.line, e.detail${hasTest ? ", f.is_test" : ""}
       FROM http_endpoints e JOIN files f ON f.id=e.file_id ORDER BY e.norm`).all();
-    const calls = d.prepare(`SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client
+    const calls = d.prepare(`SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client${hasTest ? ", f.is_test" : ""}
       FROM http_calls c JOIN files f ON f.id=c.file_id ORDER BY c.norm`).all();
     if (!eps.length && !calls.length) return "No REST endpoints or HTTP clients detected.";
     const matchedCalls = new Set();
@@ -673,13 +753,24 @@ tool(server, "http_map",
         if (ok) matchedCalls.add(i);
         return ok;
       });
-      out.push({ endpoint: `${e.method} ${e.path}`, defined: `${e.fp}:${e.line}`,
-        callers: callers.map((c) => `${c.fp}:${c.line} (${c.client})`),
-        ...(callers.length ? {} : { warning: "no caller found in the indexed workspace" }) });
+      const prodCallers = callers.filter((c) => !c.is_test);
+      const testCallers = callers.filter((c) => c.is_test);
+      // an endpoint defined in a test file (WireMock/contract stub) is labeled, never an orphan
+      out.push({ endpoint: `${e.method} ${e.path}`, defined: `${e.fp}:${e.line}` + (e.is_test ? "  [TEST]" : ""),
+        callers: prodCallers.map((c) => `${c.fp}:${c.line} (${c.client})`),
+        ...(testCallers.length ? { test_callers: testCallers.map((c) => `${c.fp}:${c.line} (${c.client})  [TEST]`) } : {}),
+        ...(prodCallers.length || e.is_test ? {} : { warning: testCallers.length
+          ? `no caller found in the indexed workspace (exercised only by tests: ${testCallers.length})`
+          : "no caller found in the indexed workspace" }) });
     }
-    const unmatched = calls.filter((c, i) => !matchedCalls.has(i) && (!pf || c.norm.includes(pf)));
+    const unmatched = calls.filter((c, i) => !matchedCalls.has(i) && !c.is_test && (!pf || c.norm.includes(pf)));
     if (unmatched.length) {
       out.push({ unmatched_calls: unmatched.map((c) => `${c.method} ${c.path}, ${c.fp}:${c.line} (${c.client}), no matching endpoint in workspace (external API, or path built dynamically)`) });
+    }
+    // test calls to endpoints outside the workspace are listed, not dropped, and never a warning
+    const testUnmatched = calls.filter((c, i) => !matchedCalls.has(i) && c.is_test && (!pf || c.norm.includes(pf)));
+    if (testUnmatched.length) {
+      out.push({ test_unmatched_calls: testUnmatched.map((c) => `${c.method} ${c.path}, ${c.fp}:${c.line} (${c.client})  [TEST]`) });
     }
     return out;
   }));

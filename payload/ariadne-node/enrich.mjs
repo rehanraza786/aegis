@@ -50,6 +50,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS insights(
   model TEXT, generated_at REAL)`);
 const q = (sql, ...a) => db.prepare(sql).all(...a);
 const svc = (p) => p.split("/")[0];
+// insights describe production intent: seam facts from test files stay out of
+// the prompts (column exists only once an indexer >= schema v5 has run)
+const PROD = q("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'")[0].c ? " AND f.is_test=0" : "";
 
 /* ---------------- LLM call ---------------- */
 async function complete(prompt) {
@@ -110,9 +113,9 @@ TARGET: ${t.kind} ${t.target}\n`;
   if (t.kind === "module") {
     const syms = q(`SELECT s.name, s.kind FROM symbols s JOIN files f ON f.id=s.file_id
                     WHERE f.path LIKE ? AND s.kind IN ('class','type') LIMIT 25`, t.target + "/%");
-    const topics = q(`SELECT DISTINCT m.topic, m.direction FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?`, t.target + "/%");
-    const tables = q(`SELECT DISTINCT a.tbl, a.mode FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?`, t.target + "/%");
-    const eps = q(`SELECT e.method, e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ? LIMIT 15`, t.target + "/%");
+    const topics = q(`SELECT DISTINCT m.topic, m.direction FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?${PROD}`, t.target + "/%");
+    const tables = q(`SELECT DISTINCT a.tbl, a.mode FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?${PROD}`, t.target + "/%");
+    const eps = q(`SELECT e.method, e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ?${PROD} LIMIT 15`, t.target + "/%");
     return header +
       `Classes/types: ${syms.map((s) => s.name).join(", ") || "n/a"}\n` +
       `Kafka: ${topics.map((x) => `${x.direction} ${x.topic}`).join(", ") || "none"}\n` +

@@ -23,3 +23,9 @@ Rules of the road: extensions run inside the index transaction (fail-safe:
 errors are logged, never abort indexing); scope-aware extensions should honor
 `inScope(rel)`; prefix your tables to avoid collisions; and if you add tables
 referencing `files(id)`, use `ON DELETE CASCADE` so pruning stays clean.
+
+One provenance rule for seam rows: `source` stays two-valued (`static` for
+parsed, `asserted:<author>` for derived), never encode test-ness there. Whether
+code is test code lives on `files.is_test` (JOIN `files` for it), set from path
+conventions plus the `testPathPatterns` / `prodPathPatterns` regex arrays in
+`.ariadne/config.json`.

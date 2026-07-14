@@ -39,4 +39,5 @@ Generate Flow Docs & Progress Report · Enrich Insights via Copilot · Update Wo
 
 `index_status`, is the graph fresh? (Hooks refresh on *commit*, not on save.)
 `graph_gaps`, what static analysis couldn't resolve, and why.
+A topic looks orphaned but a test uses it? By design: `message_flow` / `db_map` / `http_map` topology is production-only, test usage is listed separately and labeled `[TEST]`.
 Ask: *"aegis isn't working"*, the aegis-help skill diagnoses it.
