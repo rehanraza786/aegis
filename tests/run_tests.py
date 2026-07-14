@@ -278,7 +278,10 @@ def main():
         check("npm install", code == 0, out[-400:])
         # The SCIP fixture below is built with Python's protobuf (scip_pb2) no
         # matter which runtime is under test, so protobuf must be present here too.
-        code, out = pip_install(["protobuf"], ws)
+        # scip_pb2.py is gencode 7.35; the runtime must be at least that new, and a
+        # bare "protobuf" is satisfied by any preinstalled older copy (e.g. Anaconda
+        # ships 5.x), which then dies with VersionError at import.
+        code, out = pip_install(["protobuf>=7.35"], ws)
         check("pip install (protobuf fixture dep)", code == 0, out[-400:])
     else:
         # Install from the edition's own requirements.txt rather than a hand-kept
