@@ -67,7 +67,7 @@ log = logging.getLogger("ariadne")
 # maxFileBytes, chunkLines, extraExtensions ({".vue": "javascript"})
 _cfg = {}
 try:
-    _cfg = json.loads((DB_DIR / "config.json").read_text())
+    _cfg = json.loads((DB_DIR / "config.json").read_text(encoding="utf-8"))
     log.info("Loaded .ariadne/config.json overrides")
 except (OSError, json.JSONDecodeError):
     pass
@@ -683,7 +683,7 @@ def kafka_pass(con, scope_prefixes=None):
         con.execute(f"DELETE FROM {t} WHERE source LIKE 'asserted%'")
     af = REPO_ROOT / "docs" / "graph-assertions.json"
     try:
-        alist = json.loads(af.read_text())
+        alist = json.loads(af.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         alist = []
     if isinstance(alist, list) and alist:

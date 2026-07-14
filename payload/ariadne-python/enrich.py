@@ -120,7 +120,7 @@ if A.plan:
     sys.exit(0)
 
 if A.apply:
-    items = json.loads(Path(A.apply).read_text())
+    items = json.loads(Path(A.apply).read_text(encoding="utf-8"))
     for it in items:
         con.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)",
                     (it["target"], it["kind"], it["hash"], str(it["summary"])[:4000], it.get("model", "external"), time.time()))
@@ -163,5 +163,5 @@ if rows:
     hot = [r for r in rows if r["kind"] == "file"]
     if hot:
         md += "## High-blast-radius files\n\n" + "\n\n".join(f"**`{r['target']}`**, {r['summary']}" for r in hot) + "\n"
-    (out / "insights.md").write_text(md)
+    (out / "insights.md").write_text(md, encoding="utf-8")
     print("  + docs/generated/insights.md")

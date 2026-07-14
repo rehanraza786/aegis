@@ -23,6 +23,9 @@ from pathlib import Path
 TOOLKIT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FAILURES = []
+# Use the exact interpreter running this harness for child Python processes
+# rather than a literal "python3"/"python" that may not be on PATH (Windows).
+py = sys.executable
 
 
 def check(name, cond, detail=""):
@@ -35,8 +38,26 @@ def run(cmd, cwd, env=None):
     e = dict(os.environ)
     if env:
         e.update(env)
+    cmd = list(cmd)
+    if os.name == "nt":
+        # Windows has no npm.exe (only npm.cmd), and CreateProcess only appends
+        # ".exe" for a bare name -- so a plain "npm" is never found. Resolve the
+        # real path via PATHEXT, and launch .cmd/.bat shims through COMSPEC since
+        # CreateProcess cannot execute batch files directly.
+        resolved = shutil.which(cmd[0])
+        if resolved:
+            cmd[0] = resolved
+            if resolved.lower().endswith((".cmd", ".bat")):
+                cmd = [os.environ.get("COMSPEC", "cmd.exe"), "/c"] + cmd
     r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, env=e)
     return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def pip_install(pkgs, cwd):
+    code, out = run([py, "-m", "pip", "install", "-q"] + pkgs, cwd)
+    if code != 0:  # PEP 668 externally-managed environments (some sandboxes/distros)
+        code, out = run([py, "-m", "pip", "install", "-q", "--break-system-packages"] + pkgs, cwd)
+    return code, out
 
 
 def git(args, cwd):
@@ -242,7 +263,6 @@ def main():
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
     rt = args.runtime
-    py = "python" if os.name == "nt" else "python3"
     exe = ["node"] if rt == "node" else [py]
 
     tmp = Path(tempfile.mkdtemp(prefix="aegis-test-"))
@@ -256,11 +276,16 @@ def main():
     if rt == "node":
         code, out = run(["npm", "install", "--no-audit", "--no-fund", "--silent"], ar)
         check("npm install", code == 0, out[-400:])
+        # The SCIP fixture below is built with Python's protobuf (scip_pb2) no
+        # matter which runtime is under test, so protobuf must be present here too.
+        code, out = pip_install(["protobuf"], ws)
+        check("pip install (protobuf fixture dep)", code == 0, out[-400:])
     else:
-        pkgs = ["tree-sitter", "tree-sitter-language-pack", "pypdf", "protobuf"]
-        code, out = run([py, "-m", "pip", "install", "-q"] + pkgs, ws)
-        if code != 0:  # PEP 668 externally-managed environments (some sandboxes/distros)
-            code, out = run([py, "-m", "pip", "install", "-q", "--break-system-packages"] + pkgs, ws)
+        # Install from the edition's own requirements.txt rather than a hand-kept
+        # list, so the test environment can never drift from the real deps (this
+        # is what silently dropped `mcp`, which server.py imports).
+        req = TOOLKIT / "payload" / "ariadne-python" / "requirements.txt"
+        code, out = pip_install(["-r", str(req)], ws)
         check("pip install", code == 0, out[-400:])
 
     install_sample_extensions(ws, rt)

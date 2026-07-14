@@ -40,10 +40,10 @@ for repo in git_repos():
         continue
     for h in ("post-commit", "post-merge", "post-checkout"):
         f = hook_dir / h
-        if f.exists() and "AEGIS" not in f.read_text(errors="replace"):
+        if f.exists() and "AEGIS" not in f.read_text(encoding="utf-8", errors="replace"):
             print(f"  skip {h} in {repo.name} (existing non-AEGIS hook)")
             continue
-        f.write_text(HOOK)
+        f.write_text(HOOK, encoding="utf-8")
         try:
             f.chmod(f.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         except OSError:
@@ -51,8 +51,8 @@ for repo in git_repos():
         hooks += 1
     gi = repo / ".gitignore"
     entries = "\n# AEGIS\n.ariadne/index.db*\n.ariadne/index.log\n.ariadne/index.lock\n.ariadne/node_modules/\ndocs/generated/\n"
-    if not gi.exists() or ".ariadne/index.db" not in gi.read_text(errors="replace"):
-        with gi.open("a") as fh:
+    if not gi.exists() or ".ariadne/index.db" not in gi.read_text(encoding="utf-8", errors="replace"):
+        with gi.open("a", encoding="utf-8") as fh:
             fh.write(entries)
 print(f"Hooks installed: {hooks}")
 

@@ -32,7 +32,7 @@ mcp = FastMCP("ariadne")
 
 # ---- result budget: no single tool call may flood the model's context ----
 try:
-    _cfg = json.loads((DB_PATH.parent / "config.json").read_text())
+    _cfg = json.loads((DB_PATH.parent / "config.json").read_text(encoding="utf-8"))
 except Exception:  # noqa: BLE001
     _cfg = {}
 MAX_ROWS = _cfg.get("maxToolRows", 50)
@@ -474,7 +474,7 @@ def save_decision(title: str, decision: str, rationale: str, alternatives: str =
             + f"\n## Decision\n\n{decision}\n\n## Rationale\n\n{rationale}\n"
             + (f"\n## Alternatives considered\n\n{alternatives}\n" if alternatives else "")
             + "\n<!-- captured via AEGIS save_decision -->\n")
-    file.write_text(body)
+    file.write_text(body, encoding="utf-8")
     wcon = sqlite3.connect(DB_PATH)
     try:
         wcon.execute("""CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY, title TEXT, status TEXT,
@@ -588,7 +588,7 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
                                text=True).stdout.strip() or Path.cwd())
     af = root / "docs" / "graph-assertions.json"
     try:
-        lst = json.loads(af.read_text())
+        lst = json.loads(af.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         lst = []
     rec = {"kind": kind, "file": file, "line": line, "evidence": evidence, "confidence": confidence,
@@ -603,7 +603,7 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
                                   and x.get("path") == (path or None))]
     lst.append(rec)
     af.parent.mkdir(parents=True, exist_ok=True)
-    af.write_text(json.dumps(lst, indent=2) + "\n")
+    af.write_text(json.dumps(lst, indent=2) + "\n", encoding="utf-8")
     return (f"Asserted and recorded in docs/graph-assertions.json ({len(lst)} total). It enters the graph on "
             f"the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically "
             f"if {file} changes. Commit the file to share it with the team.")
