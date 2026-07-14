@@ -396,10 +396,18 @@ async function indexFile(db, relpath, force = false) {
   const isTest = isTestPath(relpath) ? 1 : 0;
 
   db.prepare("DELETE FROM chunks WHERE path=?").run(relpath);
+  const old = db.prepare("SELECT id FROM files WHERE path=?").get(relpath);
+  // Non-import edges (e.g. SCIP-derived 'ref') are owned by other passes; the
+  // file-row swap below cascade-deletes them, so carry them over to the new id.
+  const keptEdges = old
+    ? db.prepare("SELECT src, dst, kind FROM edges WHERE (src=? OR dst=?) AND kind != 'import'").all(old.id, old.id)
+    : [];
   db.prepare("DELETE FROM files WHERE path=?").run(relpath);
   const fid = db.prepare(
     "INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime, is_test) VALUES(?,?,?,?,?,?,?,?)"
 ).run(relpath, lang, hash, text.split("\n").length, Date.now() / 1000, st.size, st.mtimeMs, isTest).lastInsertRowid;
+  const insKept = db.prepare("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,?)");
+  for (const e of keptEdges) insKept.run(e.src === old.id ? fid : e.src, e.dst === old.id ? fid : e.dst, e.kind);
 
   const insSym = db.prepare("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,?)");
   const insCall = db.prepare("INSERT INTO calls(src_symbol, callee, line) VALUES(?,?,?)");

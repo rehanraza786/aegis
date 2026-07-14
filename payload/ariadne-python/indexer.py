@@ -432,12 +432,21 @@ def index_file(con, relpath, force=False):
 
     con.execute("DELETE FROM chunks WHERE path=?", (relpath,))
     old = con.execute("SELECT id FROM files WHERE path=?", (relpath,)).fetchone()
+    # Non-import edges (e.g. SCIP-derived 'ref') are owned by other passes; the
+    # file-row swap below cascade-deletes them, so carry them over to the new id.
+    kept_edges = []
     if old:
+        kept_edges = con.execute(
+            "SELECT src, dst, kind FROM edges WHERE (src=? OR dst=?) AND kind != 'import'",
+            (old[0], old[0])).fetchall()
         con.execute("DELETE FROM files WHERE id=?", (old[0],))
     cur = con.execute(
         "INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime, is_test) VALUES(?,?,?,?,?,?,?,?)",
         (relpath, lang, h, text.count("\n") + 1, time.time(), st.st_size, st.st_mtime, is_test))
     fid = cur.lastrowid
+    for src, dst, kind in kept_edges:
+        con.execute("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,?)",
+                    (fid if src == old[0] else src, fid if dst == old[0] else dst, kind))
 
     ast_result = None
     if lang in AST_LANGS and AST_EXTRACT is None and not globals().get("_ast_tried"):

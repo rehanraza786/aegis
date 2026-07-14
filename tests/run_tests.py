@@ -693,6 +693,19 @@ await c.close();
     db.commit()
     db.close()
 
+    # ---- ref edges must also survive reindexing of their OWN endpoints ----
+    # index_file swaps the files row, which hands the path a fresh id; without
+    # carrying non-import edges across the swap, the cascade eats them silently.
+    orders_ts = ws / "web-app" / "src/api/orders.ts"
+    orders_ts.write_text(orders_ts.read_text() + "// touched after scip\n")
+    ctrl = ws / "order-service" / "src/main/java/com/acme/OrderController.java"
+    ctrl.write_text(ctrl.read_text() + "// touched after scip\n")
+    code, ose = run(exe + [idx, "--full"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("ref edge survives reindex of its own src and dst files",
+          code == 0 and db.execute(ref_edge).fetchone() is not None, ose[-300:])
+    db.close()
+
     # ---- MCP tool smoke (end-to-end through the protocol / module surface) ----
     if rt == "node":
         client = ws / ".ariadne" / "_smoke.mjs"
