@@ -6,8 +6,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
+// fileURLToPath decodes percent-encoding and handles drive letters; the old
+// URL.pathname hack left e.g. RUNNER~1 as RUNNER%7E1, so on Windows HERE was
+// a nonexistent path and the runtime probe below misdetected the edition.
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CWD = process.cwd();
 const runtime = fs.existsSync(path.join(HERE, "indexer.mjs")) ? "node" : "python";
 

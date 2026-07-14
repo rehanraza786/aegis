@@ -31,14 +31,17 @@ export function loadConfigMap(repoRoot, trackedFiles, log = () => {}) {
     let text;
     try { text = fs.readFileSync(path.join(repoRoot, rel), "utf8"); } catch { continue; }
     if (rel.endsWith(".properties")) {
-      for (const line of text.split("\n")) {
+      // split on \r?\n: Windows checkouts/editors produce CRLF, and in JS regex
+      // `.` excludes \r while `$` only matches true end-of-string, so a stray
+      // \r makes every value line silently fail to parse.
+      for (const line of text.split(/\r?\n/)) {
         const m = line.match(/^\s*([\w.\-\[\]]+)\s*[=:]\s*(.+?)\s*$/);
         if (m && !line.trim().startsWith("#")) map.set(m[1], m[2]);
       }
     } else {
       // minimal YAML flattener: indentation-based, scalars only (enough for topic keys)
       const stack = [];
-      for (const raw of text.split("\n")) {
+      for (const raw of text.split(/\r?\n/)) {
         if (!raw.trim() || raw.trim().startsWith("#") || raw.trim() === "---") continue;
         const indent = raw.match(/^ */)[0].length;
         const m = raw.match(/^\s*([\w.\-\[\]"']+)\s*:\s*(.*)$/);
