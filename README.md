@@ -67,6 +67,8 @@ Open your workspace. One repo or a folder of repos both work. The extension offe
 
 Requirements: git, and either Node ≥18 or Python ≥3.10. VS Code ≥1.99 registers the MCP server automatically.
 
+There is a shell installer too, plus configuration and CI wiring, in [SETUP.md](SETUP.md).
+
 ---
 
 ## Using it
@@ -216,7 +218,7 @@ Four ways to run it: **through Copilot** (`AEGIS: Enrich Insights via Copilot`, 
 
 **CI** does the heavy work once for everyone. `gitlab-ci-aegis.yml` adds a job on default-branch merges: index, then `scip-typescript` and `scip-java` for the compiler-grade layer, then docgen, publishing the index and the docs as artifacts. Teammates run *Pull Team Index* and get the complete graph, SCIP included, in seconds. Nobody builds SCIP locally. The job caches the index between runs, so each pipeline reindexes only what the merge changed.
 
-GitLab is what's wired because that's what this was built for. The job is thirty lines of shell.
+GitLab is what's wired because that's what this was built for. The job is thirty lines of shell. Details, plus the configuration reference and troubleshooting, are in [SETUP.md](SETUP.md).
 
 ## Multi-repo workspaces
 

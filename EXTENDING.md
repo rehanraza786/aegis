@@ -1,7 +1,7 @@
 # Extending AEGIS
 
-Every layer is pluggable. Extensions are plain files dropped into the repo.
-no build step, no registration, versioned with your code.
+Every layer is pluggable. Extensions are plain files dropped into the repo: no build
+step, no registration, and they are versioned alongside your code.
 
 | Layer | How to extend | Contract |
 |---|---|---|
