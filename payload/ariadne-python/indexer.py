@@ -76,15 +76,15 @@ ALIAS_PREFIXES = tuple(_cfg.get("aliasPrefixes", ["@/", "~/"]))
 AST_EXTRACT = None
 AST_LANGS = {"java", "kotlin", "typescript", "javascript", "python"}
 
-LANG_BY_EXT = dict(_cfg.get("extraExtensions", {}))
-LANG_BY_EXT.update({
+LANG_BY_EXT = {
     ".py": "python", ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
     ".ts": "typescript", ".tsx": "typescript", ".java": "java", ".cs": "csharp",
     ".go": "go", ".rs": "rust", ".rb": "ruby", ".php": "php", ".c": "c", ".h": "c",
     ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp", ".kt": "kotlin", ".kts": "kotlin", ".gradle": "config", ".swift": "swift",
     ".scala": "scala", ".sql": "sql", ".sh": "shell", ".yaml": "config", ".yml": "config",
     ".toml": "config", ".json": "config", ".xml": "config", ".md": "docs", ".pdf": "docs",
-})
+}
+LANG_BY_EXT.update(_cfg.get("extraExtensions", {}))  # user mappings override built-ins
 SKIP_DIRS = {".git", ".ariadne", "node_modules", "vendor", "dist", "build", "target",
              "__pycache__", ".venv", "venv", ".next", "coverage", ".idea", ".vscode"}
 SKIP_DIRS |= set(_cfg.get("skipDirs", []))
@@ -496,12 +496,13 @@ def rebuild_edges(con, touched):
     all_paths = [r[0] for r in con.execute("SELECT path FROM files")]
     id_by_path = {r[1]: r[0] for r in con.execute("SELECT id, path FROM files")}
     for fid, lang, text in touched:
-        con.execute("DELETE FROM edges WHERE src=?", (fid,))
+        # only import edges are ours to clear; kind='ref' rows belong to scip_ingest
+        con.execute("DELETE FROM edges WHERE src=? AND kind='import'", (fid,))
         src_path = con.execute("SELECT path FROM files WHERE id=?", (fid,)).fetchone()[0]
         for mod in extract_imports(lang, text):
             dst = resolve_import(mod, src_path, all_paths)
             if dst and dst != src_path and dst in id_by_path:
-                con.execute("INSERT OR IGNORE INTO edges(src, dst) VALUES(?,?)",
+                con.execute("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,'import')",
                             (fid, id_by_path[dst]))
 
 

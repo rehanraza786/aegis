@@ -654,6 +654,43 @@ await c.close();
           db.execute("SELECT 1 FROM scip_defs WHERE symbol LIKE '%OrderController#list()%' AND path LIKE '%OrderController.java'").fetchone() is not None)
     check("scip cross-stack reference indexed",
           db.execute("SELECT 1 FROM scip_refs WHERE symbol LIKE '%list()%' AND path LIKE '%orders.ts'").fetchone() is not None)
+    ref_edge = ("SELECT 1 FROM edges e JOIN files s ON s.id=e.src JOIN files d ON d.id=e.dst "
+                "WHERE e.kind='ref' AND s.path LIKE '%orders.ts' AND d.path LIKE '%OrderController.java'")
+    check("scip ref edge derived (orders.ts -> OrderController)",
+          db.execute(ref_edge).fetchone() is not None)
+    db.close()
+
+    # ---- SCIP ref edges must survive incremental reindexing ----
+    # An unrelated change must not disturb compiler-grade edges: the indexer owns
+    # kind='import' rows only, kind='ref' rows are scip_ingest's to manage.
+    dao = ws / "billing-service" / "src/main/java/com/acme/PaymentDao.java"
+    dao.write_text(dao.read_text() + "// touched after scip\n")
+    git(["add", "-A"], ws / "billing-service")
+    git(["commit", "-qm", "t2"], ws / "billing-service")
+    code, oi = run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("ref edges survive incremental of an unrelated file",
+          db.execute(ref_edge).fetchone() is not None, oi[-200:])
+    # A reindexed file gets a fresh rowid (MAX(id)+1: the previous step just handed the
+    # current max to PaymentDao). Park a ref edge on exactly that id: an indexer that
+    # clears ALL edge kinds for reindexed files destroys it, one that rebuilds only its
+    # own import edges keeps it.
+    next_fid = db.execute("SELECT MAX(id)+1 FROM files").fetchone()[0]
+    ctrl_fid = db.execute("SELECT id FROM files WHERE path LIKE '%OrderController.java'").fetchone()[0]
+    db.execute("INSERT INTO edges(src, dst, kind) VALUES(?,?,'ref')", (next_fid, ctrl_fid))
+    db.commit()
+    db.close()
+    kt = ws / "stream-service" / "src/main/kotlin/com/acme/OrderHandler.kt"
+    kt.write_text(kt.read_text() + "// touched\n")
+    git(["add", "-A"], ws / "stream-service")
+    git(["commit", "-qm", "t3"], ws / "stream-service")
+    code, oi2 = run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("reindex rebuilds only kind='import' edges (ref edge on reindexed file kept)",
+          db.execute("SELECT 1 FROM edges WHERE src=? AND dst=? AND kind='ref'",
+                     (next_fid, ctrl_fid)).fetchone() is not None, oi2[-200:])
+    db.execute("DELETE FROM edges WHERE src=? AND dst=? AND kind='ref'", (next_fid, ctrl_fid))
+    db.commit()
     db.close()
 
     # ---- MCP tool smoke (end-to-end through the protocol / module surface) ----
@@ -736,6 +773,23 @@ await c.close();
           db.execute("SELECT COUNT(*) FROM insights WHERE kind='module'").fetchone()[0] >= 4)
     db.close()
     check("insights.md written", (gen / "insights.md").exists())
+
+    # ---- config: extraExtensions both adds mappings and beats the built-ins ----
+    (ws / ".ariadne" / "config.json").write_text(json.dumps(
+        {"extraExtensions": {".vue": "javascript", ".h": "cpp"}}))
+    w(ws / "web-app" / "src/components/Widget.vue", "export const widget = () => 1;\n")
+    w(ws / "order-service" / "src/main/native/helper.h", "int helper(void);\n")
+    for r in ("web-app", "order-service"):
+        git(["add", "-A"], ws / r)
+        git(["commit", "-qm", "ext"], ws / r)
+    code, ox = run(exe + [idx, "--full"], ws)
+    check("config.json overrides loaded", "config.json overrides" in ox, ox[-200:])
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("extraExtensions adds new mappings (.vue -> javascript)",
+          db.execute("SELECT 1 FROM files WHERE path LIKE '%Widget.vue' AND lang='javascript'").fetchone() is not None)
+    check("extraExtensions overrides built-ins (.h remapped c -> cpp)",
+          db.execute("SELECT 1 FROM files WHERE path LIKE '%helper.h' AND lang='cpp'").fetchone() is not None)
+    db.close()
 
     # ---- setup script (hooks) ----
     setup = str(ar / ("setup.mjs" if rt == "node" else "setup.py"))
