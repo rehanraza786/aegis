@@ -202,6 +202,14 @@ Three properties keep this from becoming a hallucination pipeline. **Provenance 
 
 The `graph-augmentation` skill teaches the discipline, including when *not* to assert: never from naming alone, never without evidence you'd defend in review, and never merely to silence a warning, because an orphan topic is very often a real bug.
 
+## Seeing the graph, and annotating it by hand
+
+*AEGIS: Open Graph View* renders the live graph in VS Code: modules, Kafka topics, and DB tables as an interactive map (rendered locally with a bundled library — nothing leaves your machine), warnings badged on the nodes, test-only usage dimmed, asserted edges dashed. Click anything to jump to its `path:line`.
+
+The part that matters is the **Gaps** panel: every unresolved topic expression, drift table, and orphan is a card with an annotate form. When a human resolves one — reads the code, checks the Spring profile, knows the answer — they type the resolution and the evidence, and it flows through the *same* write paths agents use: notes become insights (served by `explain` and `context_pack`), resolutions become entries in `docs/graph-assertions.json`. Human input gets its own provenance — `asserted:human`, distinct from both parsed facts and model inferences — it is git-versioned and PR-reviewable like every other assertion, and it goes stale honestly when the evidence file changes. Your team's tribal knowledge becomes queryable metadata, and every agent gets smarter the moment someone fills in a card.
+
+The view reads a documented JSON contract (`graph_export`), so an [alternate graph engine](#configuration) that prints the same shape gets the visualization for free. See [EXTENDING.md](EXTENDING.md).
+
 ## Semantic insights
 
 The graph tells you what connects to what. It doesn't tell you what a module is *for*. An enrichment pass summarizes each module and hotspot file and **caches the result against a content hash**, so a target costs tokens exactly once per change:
