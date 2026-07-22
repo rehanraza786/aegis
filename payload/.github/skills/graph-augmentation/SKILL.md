@@ -36,8 +36,8 @@ an honest gap is more useful than a confident wrong edge.
 
 - `unresolved_topic_expressions` — a partial like `orders.created.{?}` means the
   parser resolved the prefix from a constant but could not evaluate the rest.
-- `topics_produced_but_never_consumed` / `consumed_but_never_produced` — a dead
-  topic, a counterpart in a repo that is not indexed, or a dynamic handler.
+- `topics_produced_but_never_consumed` / `topics_consumed_but_never_produced` — a
+  dead topic, a counterpart in a repo that is not indexed, or a dynamic handler.
 - `tables_accessed_but_undefined` — DRIFT. Could be a missing changelog, a table
   from another service, or a genuine bug.
 - `endpoints_with_no_caller` — dead route, an external consumer, or a gateway
