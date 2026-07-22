@@ -12,6 +12,7 @@ Requires: pip install "mcp[cli]"
 """
 
 import functools
+import inspect
 import json
 import hashlib
 import os
@@ -73,6 +74,12 @@ def _budgeted_tool(*a, **k):
     deco = _raw_tool(*a, **k)
 
     def wrap(fn):
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def ainner(*args, **kwargs):
+                return budget(await fn(*args, **kwargs))
+            return deco(ainner)
+
         @functools.wraps(fn)
         def inner(*args, **kwargs):
             return budget(fn(*args, **kwargs))
@@ -87,6 +94,14 @@ def _safe_tool(*d_args, **d_kwargs):
     deco = _orig_tool(*d_args, **d_kwargs)
     def wrapper(fn):
         import functools
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def aguarded(*args, **kwargs):
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as e:  # surface errors to the agent, never crash
+                    return f"Error in {fn.__name__}: {e}"
+            return deco(aguarded)
         @functools.wraps(fn)
         def guarded(*args, **kwargs):
             try:
@@ -123,7 +138,9 @@ def wdb():
 
 
 def fmt(rows):
-    return json.dumps([dict(r) for r in rows], indent=1)
+    # Structured on purpose: the budget() wrapper row-caps lists (warnings first)
+    # and serializes; pre-serializing here would bypass that protection entirely.
+    return [dict(r) for r in rows]
 
 
 @mcp.tool()
@@ -136,9 +153,9 @@ def index_status() -> str:
     sha = con.execute("SELECT value FROM meta WHERE key='last_sha'").fetchone()
     head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=REPO_ROOT).stdout.strip()
     indexed = sha["value"] if sha else None
-    return json.dumps({"files": f, "symbols": s, "edges": e,
-                       "indexed_sha": indexed, "head_sha": head,
-                       "fresh": indexed == head})
+    return {"files": f, "symbols": s, "edges": e,
+            "indexed_sha": indexed, "head_sha": head,
+            "fresh": indexed == head}
 
 
 @mcp.tool()
@@ -160,7 +177,7 @@ def search_code(query: str, limit: int = 8) -> str:
         if e:
             d2["in_symbol"] = (e["parent"] + "." if e["parent"] else "") + e["name"]
         out.append(d2)
-    return json.dumps(out, indent=1) if out else "No matches."
+    return out if out else "No matches."
 
 
 @mcp.tool()
@@ -239,7 +256,7 @@ def context_pack(target: str) -> str:
     except sqlite3.Error:
         pass  # files.is_test / test_cases may predate this index build
 
-    return json.dumps({
+    return {
         "target": (f"{(symbol['parent'] + '.') if symbol and symbol['parent'] else ''}{symbol['name']} ({symbol['kind']})"
                    if symbol else fpath),
         "file": fpath + (f":{symbol['line']}" if symbol else ""),
@@ -255,7 +272,7 @@ def context_pack(target: str) -> str:
         "tests": tests,
         "next": "Focused context for this target. Go deeper only where needed: find_references (certainty), "
                 "blast_radius (full list), message_flow/db_map/http_map (the other side of a seam).",
-    }, indent=1)
+    }
 
 
 @mcp.tool()
@@ -284,10 +301,10 @@ def file_outline(path: str) -> str:
                        (f["id"],)).fetchall()
     dependents = con.execute("SELECT f2.path FROM edges e JOIN files f2 ON f2.id=e.src WHERE e.dst=?",
                              (f["id"],)).fetchall()
-    return json.dumps({"path": path, "lang": f["lang"], "lines": f["lines"],
-                       "symbols": [dict(s) for s in syms],
-                       "imports": [d["path"] for d in deps],
-                       "imported_by": [d["path"] for d in dependents]}, indent=1)
+    return {"path": path, "lang": f["lang"], "lines": f["lines"],
+            "symbols": [dict(s) for s in syms],
+            "imports": [d["path"] for d in deps],
+            "imported_by": [d["path"] for d in dependents]}
 
 
 @mcp.tool()
@@ -321,7 +338,7 @@ def blast_radius(path: str, depth: int = 2) -> str:
     if has_test:
         out["tests_affected"] = sorted(tests_affected)
         out["tests_affected_total"] = len(tests_affected)
-    return json.dumps(out, indent=1)
+    return out
 
 
 @mcp.tool()
@@ -331,7 +348,7 @@ def dependencies(path: str) -> str:
     rows = con.execute(
         "SELECT f2.path FROM files f JOIN edges e ON e.src=f.id JOIN files f2 ON f2.id=e.dst "
         "WHERE f.path=?", (path,)).fetchall()
-    return json.dumps([r["path"] for r in rows]) if rows else "No in-repo dependencies found."
+    return [r["path"] for r in rows] if rows else "No in-repo dependencies found."
 
 
 @mcp.tool()
@@ -347,10 +364,9 @@ def module_map(prefix: str = "") -> str:
         a = agg.setdefault(top, {"files": 0, "langs": {}})
         a["files"] += 1
         a["langs"][r["lang"]] = a["langs"].get(r["lang"], 0) + 1
-    out = [{"dir": (prefix + "/" + k).strip("/") or k, "files": v["files"],
-            "langs": sorted(v["langs"], key=v["langs"].get, reverse=True)[:3]}
-           for k, v in sorted(agg.items())]
-    return json.dumps(out, indent=1)
+    return [{"dir": (prefix + "/" + k).strip("/") or k, "files": v["files"],
+             "langs": sorted(v["langs"], key=v["langs"].get, reverse=True)[:3]}
+            for k, v in sorted(agg.items())]
 
 
 @mcp.tool()
@@ -404,7 +420,7 @@ def find_references(name: str, limit: int = 40) -> str:
                     "doc": (d["docs"] or "")[:150],
                     "reference_count": len(refs),
                     "references": [f"{r['path']}:{r['line']}" for r in refs]})
-    return json.dumps(out, indent=1)
+    return out
 
 
 @mcp.tool()
@@ -466,7 +482,7 @@ def decisions(query: str = "", target: str = "", status: str = "", as_of: str = 
         if r["valid_until"]:
             e["valid_until"], e["superseded_by"] = r["valid_until"], r["superseded_by"]
         out.append(e)
-    return json.dumps(out, indent=1)
+    return out
 
 
 @mcp.tool()
@@ -490,10 +506,10 @@ def decision_trace(id: str) -> str:
     for l in con.execute("SELECT kind, target FROM decision_links WHERE decision_id=?", (rec["id"],)):
         exists = l[1] in topics_all if l[0] == "topic" else l[1] in tables_all if l[0] == "table" else True
         governs.append(f"{l[0]}:{l[1]}" + ("" if exists else "  ⚠️ no longer exists in the graph (decision drift)"))
-    return json.dumps({
+    return {
         "chain": [f"{c['id']} [{c['status']}] {c['decided_at'] or '?'}" +
                   (f" → until {c['valid_until']}" if c["valid_until"] else " → current") + f": {c['title']}" for c in chain],
-        "governs": governs, "summary": rec["summary"], "source": rec["source_path"]}, indent=1)
+        "governs": governs, "summary": rec["summary"], "source": rec["source_path"]}
 
 
 @mcp.tool()
@@ -619,12 +635,12 @@ def graph_gaps(limit: int = 20) -> str:
         if not any(c["method"] == e["method"] and _pm(c["norm"], e["norm"]) for c in calls)][:n]
 
     total = sum(len(v) for v in gaps.values())
-    return json.dumps({
+    return {
         "summary": (f"{total} things static analysis could not resolve. Investigate the code at each "
                     "location; when you work out the answer, record it with assert_edge so the whole "
                     "team's graph improves.") if total else
                    "No gaps found, static analysis resolved everything it looked at.",
-        **gaps}, indent=1)
+        **gaps}
 
 
 @mcp.tool()
@@ -702,7 +718,7 @@ def message_flow(topic: str = "") -> str:
                               "FROM msg_edges GROUP BY topic").fetchall()
             test_only = []
         cap = lambda a: (a[:25] + [f"…and {len(a) - 25} more"]) if len(a) > 25 else a  # noqa: E731
-        return json.dumps({
+        return {
             "summary": f"{len(per)} topics{f' ({len(test_only)} more only in tests)' if test_only else ''}; "
                        f"{sum(r['p'] for r in per)} producer sites, {sum(r['c'] for r in per)} consumer sites.",
             "warnings": {
@@ -716,7 +732,7 @@ def message_flow(topic: str = "") -> str:
             },
             "busiest_topics": [dict(r) for r in sorted(per, key=lambda r: -(r["p"] + r["c"]))[:10]],
             "next": "Full listing: docs/generated/message-flows.md. For sites on one topic: message_flow topic:<name>.",
-        }, indent=1)
+        }
     q = ("SELECT m.topic, m.direction, f.path, m.line, m.resolved, m.via, m.source"
          + (", f.is_test" if has_test else "") + " FROM msg_edges m "
          "JOIN files f ON f.id=m.file_id " + ("WHERE m.topic=? " if topic else "") + "ORDER BY m.topic, m.direction")
@@ -762,7 +778,7 @@ def message_flow(topic: str = "") -> str:
             if t["test_consumers"]:
                 entry["test_usage"]["consumers"] = t["test_consumers"]
         out.append(entry)
-    return json.dumps(out, indent=1)
+    return out
 
 
 @mcp.tool()
@@ -779,7 +795,7 @@ def db_map(table: str = "") -> str:
                     if has_test else "SELECT tbl FROM db_access")
         cap = lambda a: (a[:25] + [f"…and {len(a) - 25} more"]) if len(a) > 25 else a  # noqa: E731
         n_prod = con.execute(f"SELECT COUNT(*) FROM (SELECT tbl FROM db_defs UNION SELECT tbl FROM ({prod_acc}))").fetchone()[0]
-        return json.dumps({
+        return {
             "summary": f"{n_prod} tables{f' ({n_tables - n_prod} more only in tests)' if n_tables > n_prod else ''}; "
                        f"{con.execute('SELECT COUNT(DISTINCT tbl) FROM db_defs').fetchone()[0]} defined by Liquibase, "
                        f"{con.execute(f'SELECT COUNT(DISTINCT tbl) FROM ({prod_acc})').fetchone()[0]} touched by code.",
@@ -795,7 +811,7 @@ def db_map(table: str = "") -> str:
             "most_accessed_tables": [dict(r) for r in con.execute(
                 f"SELECT tbl, COUNT(*) sites FROM ({prod_acc}) GROUP BY tbl ORDER BY sites DESC LIMIT 10")],
             "next": "Full listing: docs/generated/data-map.md. For one table: db_map table:<name>.",
-        }, indent=1)
+        }
     t = table.lower() if table else None
     defs = con.execute(
         "SELECT d.tbl, d.op, f.path, d.line, d.changeset FROM db_defs d LEFT JOIN files f ON f.id=d.file_id "
@@ -834,7 +850,7 @@ def db_map(table: str = "") -> str:
             entry["warning"] = ("defined in changelog but no code access found"
                                 + (" (exercised only by tests)" if e.get("test_sites") else ""))
         out.append(entry)
-    return json.dumps(out, indent=1)
+    return out
 
 
 @mcp.tool()
@@ -863,7 +879,7 @@ def http_map(path: str = "") -> str:
             if not hit:
                 orphans.append(f"{e['method']} {e['path']}")
         cap = lambda a: (a[:25] + [f"…and {len(a) - 25} more"]) if len(a) > 25 else a  # noqa: E731
-        return json.dumps({
+        return {
             "summary": f"{n_ep} endpoints, {len(calls0)} client calls.",
             "warnings": {
                 "endpoints_with_no_caller_in_workspace": cap(orphans),
@@ -871,7 +887,7 @@ def http_map(path: str = "") -> str:
                                                         for i, c in enumerate(calls0) if i not in matched]),
             },
             "next": "Full listing: docs/generated/http-map.md. For one route: http_map path:<fragment>.",
-        }, indent=1)
+        }
     eps = con.execute("SELECT e.method, e.path, e.norm, f.path fp, e.line" + (", f.is_test" if has_test else "")
                       + " FROM http_endpoints e JOIN files f ON f.id=e.file_id ORDER BY e.norm").fetchall()
     calls = con.execute("SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client" + (", f.is_test" if has_test else "")
@@ -912,19 +928,27 @@ def http_map(path: str = "") -> str:
                       if i not in matched and has_test and c["is_test"] and (not path or path in c["norm"])]
     if test_unmatched:
         out.append({"test_unmatched_calls": test_unmatched})
-    return json.dumps(out, indent=1)
+    return out
 
 
 @mcp.tool()
-def reindex(mode: str = "incremental") -> str:
+async def reindex(mode: str = "incremental") -> str:
     """Rebuild the index. mode='incremental' (changed files since last indexed commit) or 'full'. Use when index_status reports fresh=false."""
     flag = "--full" if mode == "full" else "--incremental"
-    try:
-        r = subprocess.run([sys.executable, str(REPO_ROOT / ".ariadne" / "indexer.py"), flag],
-                           capture_output=True, text=True, cwd=REPO_ROOT, timeout=600)
-        return (r.stdout + r.stderr).strip() or "done"
-    except subprocess.TimeoutExpired:
-        return "reindex timed out after 600s; run it manually"
+
+    def _run():
+        try:
+            r = subprocess.run([sys.executable, str(REPO_ROOT / ".ariadne" / "indexer.py"), flag],
+                               capture_output=True, text=True, cwd=REPO_ROOT, timeout=600)
+            return (r.stdout + r.stderr).strip() or "done"
+        except subprocess.TimeoutExpired:
+            return "reindex timed out after 600s; run it manually"
+
+    # A sync def here would block FastMCP's event loop for up to 10 minutes,
+    # stalling pings and every concurrent request until the client gives up
+    # and kills the server. The node edition is async for the same reason.
+    import anyio
+    return await anyio.to_thread.run_sync(_run)
 
 
 def _load_tool_extensions():

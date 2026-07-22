@@ -322,6 +322,19 @@ function connect() {
       kind TEXT DEFAULT 'import', UNIQUE(src, dst, kind));
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
       path, start_line UNINDEXED, content, tokenize='trigram');
+    -- FK indexes: every child table is cascade-deleted per changed file on every
+    -- reindex; without these each DELETE FROM files full-scans each child table,
+    -- making incremental reindex quadratic in changed files. edges(dst) also
+    -- carries blast_radius/hotspots/imported_by, which BFS over reverse deps.
+    CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
+    CREATE INDEX IF NOT EXISTS idx_calls_src ON calls(src_symbol);
+    CREATE INDEX IF NOT EXISTS idx_msg_file ON msg_edges(file_id);
+    CREATE INDEX IF NOT EXISTS idx_dbdefs_file ON db_defs(file_id);
+    CREATE INDEX IF NOT EXISTS idx_dbaccess_file ON db_access(file_id);
+    CREATE INDEX IF NOT EXISTS idx_httpep_file ON http_endpoints(file_id);
+    CREATE INDEX IF NOT EXISTS idx_httpcall_file ON http_calls(file_id);
+    CREATE INDEX IF NOT EXISTS idx_testcases_file ON test_cases(file_id);
+    CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
   `);
   try { db.exec("ALTER TABLE symbols ADD COLUMN parent TEXT"); } catch { /* exists */ }
   try { db.exec("ALTER TABLE files ADD COLUMN size INTEGER"); } catch { /* exists */ }
@@ -473,21 +486,39 @@ async function loadExtractors() {
   for (const f of fs.readdirSync(dir).filter((x) => x.endsWith(".extract.mjs"))) {
     try {
       const mod = await import("file://" + path.join(dir, f));
-      if (mod.extractors) out.push({ name: f, x: mod.extractors });
+      if (mod.extractors) out.push({ name: f, x: normalizeHooks(mod.extractors) });
     } catch (e) { log("WARN", `extractor ${f} failed to load: ${e.message}`); }
   }
   return out;
+}
+
+/** A hook is either a bare function (runs over the default java/kotlin set) or
+ *  { fn, files: /regex/ } — a FILE-SCOPED hook that runs over every tracked file
+ *  its regex matches. This is what lets a Go/Rails/TS-only stack feed the native
+ *  tables through the same extractor contract. */
+function normalizeHooks(extractors) {
+  const norm = {};
+  for (const [hook, v] of Object.entries(extractors)) {
+    if (typeof v === "function") norm[hook] = { fn: v, files: null };
+    else if (v && typeof v.fn === "function") norm[hook] = { fn: v.fn, files: v.files ?? null };
+  }
+  return norm;
 }
 
 async function kafkaPass(db, scopePrefixes = null) {
   const EXTRACTORS = await loadExtractors();
   const runX = (hook, argsArr, insertFn) => {
     for (const { name, x } of EXTRACTORS) {
-      if (typeof x[hook] !== "function") continue;
-      try { for (const row of x[hook](...argsArr) ?? []) insertFn(row); }
+      const h = x[hook];
+      if (!h || h.files) continue; // file-scoped hooks run via runXFiltered instead
+      try { for (const row of h.fn(...argsArr) ?? []) insertFn(row); }
       catch (e) { log("WARN", `extractor ${name}.${hook}: ${e.message}`); }
     }
   };
+  // Files claimed by file-scoped hooks join the extraction candidates below, so
+  // scoping, per-file deletes, and the extract cache all apply to them too.
+  const extFileREs = EXTRACTORS.flatMap(({ x }) => Object.values(x).map((h) => h.files).filter(Boolean));
+  const inExtFiles = (p) => extFileREs.some((re) => re.test(p));
   const tracked = repoFiles();
   const configMap = loadConfigMap(REPO_ROOT, tracked, log);
   const idByPath = new Map(db.prepare("SELECT id, path, hash FROM files").all().map((r) => [r.path, r]));
@@ -546,7 +577,7 @@ async function kafkaPass(db, scopePrefixes = null) {
   // ---- scope: re-extract only the FILES whose content actually changed ----
   // A global change (config value, topic constant, entity mapping) can alter how
   // every other file resolves, so that widens automatically to a full re-extract.
-  const candidates = tracked.filter((p) => /\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs)$/.test(p));
+  const candidates = tracked.filter((p) => /\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs)$/.test(p) || inExtFiles(p));
   const dirty = new Set();
   if (mapsChanged) {
     for (const p of candidates) dirty.add(p);
@@ -577,6 +608,23 @@ async function kafkaPass(db, scopePrefixes = null) {
     const own = getCache.get(rel);
     return new Map([...globalMap, ...Object.entries(JSON.parse(own?.[col] ?? "{}"))]);
   };
+  // file-scoped hooks: run each { fn, files } extractor over every in-scope
+  // tracked file its regex matches — the unlock that makes non-JVM stacks
+  // first-class citizens of message_flow/db_map/http_map and the drift math
+  const runXFiltered = (hook, mkCtx, insertFn) => {
+    for (const { name, x } of EXTRACTORS) {
+      const h = x[hook];
+      if (!h?.files) continue;
+      for (const rel of tracked) {
+        if (!h.files.test(rel) || !inScope(rel)) continue;
+        const text = readText(rel);
+        const fid = idByPath.get(rel)?.id;
+        if (!fid || text == null) continue;
+        try { for (const row of h.fn(text, mkCtx(rel)) ?? []) insertFn(row, fid); }
+        catch (e) { log("WARN", `extractor ${name}.${hook} on ${rel}: ${e.message}`); }
+      }
+    }
+  };
 
   // ---- Kafka ----
   scopedDelete("msg_edges");
@@ -601,6 +649,8 @@ async function kafkaPass(db, scopePrefixes = null) {
     runX("kafka", [text, { configMap, constants, relpath: rel }],
       (e) => { ins.run(fid, e.topic, e.direction, e.line, e.resolved === false ? 0 : 1, e.via ?? null); n++; });
   }
+  runXFiltered("kafka", (rel) => ({ configMap, constants, relpath: rel }),
+    (e, fid) => { ins.run(fid, e.topic, e.direction, e.line, e.resolved === false ? 0 : 1, e.via ?? null); n++; });
   if (n) log("INFO", `Kafka: ${n} message edges`);
 
   // ---- DB definitions (changelogs) + access ----
@@ -633,6 +683,8 @@ async function kafkaPass(db, scopePrefixes = null) {
     runX("dbAccess", [text, { entityTables, constants, relpath: rel }],
       (r) => { insAcc.run(fid, r.table, r.kind ?? "sql", r.mode ?? "rw", r.line, r.detail ?? "extension"); accs++; });
   }
+  runXFiltered("dbAccess", (rel) => ({ entityTables, constants, relpath: rel }),
+    (r, fid) => { insAcc.run(fid, r.table, r.kind ?? "sql", r.mode ?? "rw", r.line, r.detail ?? "extension"); accs++; });
   if (defs || accs) log("INFO", `DB: ${defs} schema ops (Liquibase), ${accs} access sites, ${entityTables.size} entities`);
   if (lombok) log("INFO", `Lombok: ${lombok} generated members synthesized`);
 
@@ -654,6 +706,10 @@ async function kafkaPass(db, scopePrefixes = null) {
     runX("httpCalls", [text, { relpath: rel }],
       (c) => { insCall.run(fid, c.method, c.path, c.norm ?? c.path, c.line, c.client ?? "extension"); hcalls++; });
   }
+  runXFiltered("httpEndpoints", (rel) => ({ relpath: rel }),
+    (e, fid) => { insEp.run(fid, e.method, e.path, e.norm ?? e.path, e.line, e.detail ?? "extension"); eps++; });
+  runXFiltered("httpCalls", (rel) => ({ relpath: rel }),
+    (c, fid) => { insCall.run(fid, c.method, c.path, c.norm ?? c.path, c.line, c.client ?? "extension"); hcalls++; });
   for (const rel of tracked) {
     if (!/\.(ts|tsx|js|jsx|mjs)$/.test(rel) || !inScope(rel)) continue;
     const text = readText(rel);

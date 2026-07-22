@@ -74,7 +74,8 @@ def install_sample_extensions(ws: Path, rt: str):
     ext = ws / ".ariadne" / "extensions"
     ext.mkdir(parents=True, exist_ok=True)
     suffix = ".mjs" if rt == "node" else ".py"
-    for name in (f"todo.pass{suffix}", f"todo.tool{suffix}", f"spring-cloud-stream.extract{suffix}"):
+    for name in (f"todo.pass{suffix}", f"todo.tool{suffix}", f"spring-cloud-stream.extract{suffix}",
+                 f"eventbus.extract{suffix}"):
         shutil.copy(TOOLKIT / "payload" / "extensions-samples" / name, ext / name)
 
 
@@ -154,6 +155,12 @@ export const listOrders = () => axios.get("/api/orders");
 export const getOrder = (id: number) => axios.get(`/api/orders/${id}`);
 export const legacy = () => fetch("/api/v1/reports");
 // TODO: wire retry logic here
+""")
+    # exercised by the FILE-SCOPED extractor sample (eventbus.extract.*): a TS-only
+    # seam that must land in the native msg_edges through the extension hook
+    w(f / "src/bus.ts", """import { bus } from "./lib/bus";
+export const track = () => bus.emit("clicks.raw", { at: Date.now() });
+bus.on("clicks.raw", (e) => console.debug(e));
 """)
 
     # ---- stream-service: Spring Cloud Stream bindings + Kotlin + Gradle ----
@@ -809,6 +816,15 @@ await c.close();
     db = sqlite3.connect(ws / ".ariadne" / "index.db")
     check("extension pass ran (todos table)",
           db.execute("SELECT COUNT(*) FROM todos").fetchone()[0] >= 1)
+    # file-scoped extractor hook: the TS-only event bus (eventbus.extract.*) must
+    # feed native msg_edges even though .ts never enters the java/kotlin loops
+    bus_rows = db.execute(
+        "SELECT m.direction, m.via, m.source FROM msg_edges m JOIN files f ON f.id=m.file_id "
+        "WHERE m.topic='clicks.raw' AND f.path LIKE 'web-app/%' ORDER BY m.direction").fetchall()
+    check("file-scoped extractor hook ran over .ts files",
+          {r[0] for r in bus_rows} == {"consume", "produce"}, str(bus_rows))
+    check("file-scoped extractor rows keep parsed provenance",
+          bus_rows and all((r[2] or "static") == "static" for r in bus_rows), str(bus_rows))
     db.close()
     check("extension pass logged", "extension pass: todo.pass" in out1)
 
@@ -859,30 +875,57 @@ await c.close();
           all((ws / r / ".git" / "hooks" / "post-commit").exists()
               for r in ["order-service", "billing-service", "web-app", "docs-repo"]))
 
-    # ---- skills & agents: frontmatter integrity ----
+    # ---- skills & agents: frontmatter integrity (STRICT YAML, not regex) ----
+    # Regex "linting" is what let unquoted `description: ... : ...` scalars ship and
+    # break every strict Agent Skills reader. Parse with a real YAML parser.
     import re as _re2
+    try:
+        import yaml as _yaml
+    except ImportError:
+        pip_install(["pyyaml"], TOOLKIT)
+        try:
+            import yaml as _yaml
+        except ImportError:
+            _yaml = None
+    check("strict YAML parser available for the prompt-layer lint", _yaml is not None)
+
+    def _fm(path_):
+        text = path_.read_text(encoding="utf-8")
+        m = _re2.match(r"^---\n(.*?)\n---\n", text, _re2.S)
+        if not m or _yaml is None:
+            return None, text
+        try:
+            data = _yaml.safe_load(m.group(1))
+            return (data if isinstance(data, dict) else None), text[m.end():]
+        except _yaml.YAMLError:
+            return None, text[m.end():]
+
     skills_dir = TOOLKIT / "payload" / ".github" / "skills"
-    names, ok = set(), True
+    names, ok, limits_ok = set(), True, True
+    bodies = []
     for sd in sorted(skills_dir.iterdir()):
         md = sd / "SKILL.md"
         if not md.exists():
             ok = False
             print(f"        (missing SKILL.md in {sd.name})")
             continue
-        text = md.read_text(encoding="utf-8")
-        fm = _re2.match(r"^---\n(.*?)\n---\n", text, _re2.S)
-        if not fm:
+        data, body = _fm(md)
+        bodies.append((f"skills/{sd.name}", body))
+        if not data or not isinstance(data.get("name"), str) or not isinstance(data.get("description"), str):
             ok = False
-            print(f"        (no frontmatter: {sd.name})")
+            print(f"        (frontmatter not strict-YAML-valid: {sd.name})")
             continue
-        nm = _re2.search(r"^name:\s*(\S+)", fm.group(1), _re2.M)
-        ds = _re2.search(r"^description:\s*(.+)", fm.group(1), _re2.M)
-        if not nm or not ds or nm.group(1) != sd.name or len(ds.group(1)) < 40:
+        if data["name"] != sd.name or len(data["description"]) < 40:
             ok = False
             print(f"        (bad name/description: {sd.name})")
             continue
-        names.add(nm.group(1))
+        # Agent Skills spec limits: name <= 64 chars, description <= 1024 chars
+        if len(data["name"]) > 64 or len(data["description"]) > 1024:
+            limits_ok = False
+            print(f"        (over spec limits: {sd.name})")
+        names.add(data["name"])
     check("all skills have valid, unique, directory-matching frontmatter", ok and len(names) == len(list(skills_dir.iterdir())))
+    check("skill frontmatter within Agent Skills spec limits", limits_ok)
     check("ergonomics skills present", {"codebase-orientation", "change-impact-analysis", "flow-tracing",
                                         "safe-schema-change", "event-contract-change", "aegis-help",
                                         "graph-augmentation"} <= names)
@@ -890,17 +933,44 @@ await c.close();
     agent_names = set()
     agents_ok = True
     for f in agents_dir.glob("*.agent.md"):
-        text = f.read_text(encoding="utf-8")
-        fm = _re2.match(r"^---\n(.*?)\n---\n", text, _re2.S)
-        nm = _re2.search(r"^name:\s*(\S+)", fm.group(1), _re2.M) if fm else None
-        if not fm or not nm or nm.group(1) != f.name.replace(".agent.md", ""):
+        data, body = _fm(f)
+        bodies.append((f"agents/{f.name}", body))
+        if not data or data.get("name") != f.name.replace(".agent.md", ""):
             agents_ok = False
+            print(f"        (frontmatter not strict-YAML-valid: {f.name})")
         else:
-            agent_names.add(nm.group(1))
+            agent_names.add(data["name"])
     check("agents have valid, name-matching frontmatter", agents_ok)
     check("full agent roster present",
           {"daedalus", "argus", "themis", "hermes", "pythia",
            "asclepius", "hephaestus", "metis"} == agent_names, str(sorted(agent_names)))
+
+    # ---- tool-name cross-check: the prompt layer must reference real tools ----
+    # A renamed/removed MCP tool silently strands every skill that mentions it.
+    node_reg = set(_re2.findall(r'tool\(server, "([a-z][a-z0-9_]*)"',
+                                (TOOLKIT / "payload" / "ariadne-node" / "server.mjs").read_text(encoding="utf-8")))
+    py_reg = set(_re2.findall(r"@mcp\.tool\(\)\s*\n(?:async )?def ([a-z][a-z0-9_]*)",
+                              (TOOLKIT / "payload" / "ariadne-python" / "server.py").read_text(encoding="utf-8")))
+    check("node and python tool registries match (24 tools)",
+          node_reg == py_reg and len(node_reg) == 24, str(sorted(node_reg ^ py_reg)))
+    # backticked snake_case tokens in prompt bodies are tool references unless
+    # they name a known schema/config/result-field concept (allowlist below)
+    ALLOW = {"is_test", "msg_edges", "db_access", "db_defs", "http_endpoints", "http_calls",
+             "source_hash", "decision_links", "extract_cache", "test_cases", "scip_defs", "scip_refs",
+             "graph_export", "annotate_py", "run_tests", "as_of", "valid_until", "decided_at",
+             "superseded_by", "testPathPatterns", "prodPathPatterns", "orders_topic", "payments_topic",
+             # result-schema fields the tools return (message_flow entries/summary, graph_gaps keys)
+             "unresolved_expressions", "unresolved_topic_expressions",
+             "produced_but_never_consumed", "consumed_but_never_produced",
+             "topics_produced_but_never_consumed", "topics_consumed_but_never_produced",
+             "tables_accessed_but_undefined", "endpoints_with_no_caller", "test_usage"}
+    unknown = []
+    for where, body in bodies:
+        for tok in set(_re2.findall(r"`([a-z][a-z0-9]*_[a-z0-9_]+)`", body)):
+            if tok not in node_reg and tok not in ALLOW:
+                unknown.append(f"{where}: `{tok}`")
+    check("every tool referenced by skills/agents exists in the server registry",
+          not unknown, "; ".join(sorted(unknown)[:8]))
 
     print()
     if FAILURES:
