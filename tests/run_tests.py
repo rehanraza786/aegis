@@ -758,6 +758,53 @@ await c.close();
     check("agent-context reports indexed test files",
           "test files indexed" in (gen / "agent-context.md").read_text(encoding="utf-8"))
 
+    # ---- graph export + annotate: the visual-client surface (graph view) ----
+    ge = str(ar / ("graph_export.mjs" if rt == "node" else "graph_export.py"))
+    code, og = run(exe + [ge], ws)
+    check("graph export exits 0", code == 0, og[-300:])
+    try:
+        gx = json.loads(og.strip().splitlines()[-1])
+    except Exception:
+        gx = {}
+        check("graph export prints JSON", False, og[-300:])
+    check("graph export: modules with cross-module deps",
+          any(m.get("deps") for m in gx.get("modules", [])))
+    check("graph export: topic carries producer sites with file:line",
+          any(t["topic"] == "orders.created" and t["producers"]["items"] for t in gx.get("topics", [])))
+    check("graph export: orphan-topic warning survives",
+          any(t.get("warnings", {}).get("orphan_produce") for t in gx.get("topics", [])))
+    check("graph export: drift table flagged",
+          any(t.get("warnings", {}).get("drift_no_changeset") for t in gx.get("tables", [])))
+    check("graph export: unresolved expression lands in gaps worklist",
+          bool(gx.get("gaps", {}).get("unresolved_topic_expressions")))
+
+    an = str(ar / ("annotate.mjs" if rt == "node" else "annotate.py"))
+    code, oan = run(exe + [an, json.dumps({
+        "action": "insight", "target": "order-service", "kind": "module",
+        "summary": "Order intake and lifecycle; publishes orders.created consumed by billing and shipping."})], ws)
+    check("annotate: human note saved", code == 0 and "provenance: human" in oan, oan[-200:])
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    irow = db.execute("SELECT model FROM insights WHERE target='order-service'").fetchone()
+    gap_row = db.execute("SELECT f.path FROM msg_edges m JOIN files f ON f.id=m.file_id "
+                         "WHERE m.resolved=0 LIMIT 1").fetchone() \
+        or db.execute("SELECT path FROM files WHERE path LIKE '%.java' LIMIT 1").fetchone()
+    db.close()
+    check("annotate: note carries human provenance in db",
+          irow is not None and str(irow[0]).startswith("human"), str(irow))
+    code, oas = run(exe + [an, json.dumps({
+        "action": "assert", "kind": "kafka", "file": gap_row[0], "line": 601,
+        "direction": "produce", "topic": "orders.created.manual",
+        "evidence": "PREFIX is a static final 'orders.created'; env resolves to a fixed suffix here.",
+        "confidence": "high"})], ws)
+    check("annotate: assertion recorded without clobbering existing file",
+          code == 0 and (ws / "docs" / "graph-assertions.json").exists(), oas[-200:])
+    code, _oi = run(exe + [idx, "--full"], ws)  # ingest the assertion
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    srow = db.execute("SELECT source FROM msg_edges WHERE topic='orders.created.manual'").fetchone()
+    db.close()
+    check("annotate: asserted edge enters the graph with human provenance",
+          srow is not None and srow[0] == "asserted:human", str(srow))
+
     # ---- plugin hooks: pass extension populated todos table ----
     db = sqlite3.connect(ws / ".ariadne" / "index.db")
     check("extension pass ran (todos table)",
