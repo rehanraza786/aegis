@@ -19,6 +19,7 @@ import re
 import sqlite3
 import sys
 import subprocess
+import time
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -106,6 +107,18 @@ def db():
     con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10)
     con.execute("PRAGMA busy_timeout=5000")
     con.row_factory = sqlite3.Row
+    return con
+
+
+def wdb():
+    """Writer connection for the save_* tools. Refuses to implicitly create a
+    missing index (a bare sqlite3.connect would), and waits out the indexer's
+    write lock like the Node edition (10s) instead of failing instantly with
+    SQLITE_BUSY (sqlite3's default busy timeout is 0)."""
+    if not DB_PATH.exists():
+        raise RuntimeError("Index not found. Run: python3 .ariadne/indexer.py --full (or indexer.mjs for the Node edition)")
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    con.execute("PRAGMA busy_timeout=10000")
     return con
 
 
@@ -505,7 +518,7 @@ def save_decision(title: str, decision: str, rationale: str, alternatives: str =
             + (f"\n## Alternatives considered\n\n{alternatives}\n" if alternatives else "")
             + "\n<!-- captured via AEGIS save_decision -->\n")
     file.write_text(body, encoding="utf-8")
-    wcon = sqlite3.connect(DB_PATH)
+    wcon = wdb()
     try:
         wcon.execute("""CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY, title TEXT, status TEXT,
                         decided_at TEXT, valid_until TEXT, superseded_by TEXT, source_path TEXT, summary TEXT)""")
@@ -526,7 +539,7 @@ def save_insight(target: str, kind: str, summary: str) -> str:
     """Persist a derived insight for a module or file into the graph (served by explain, hash-keyed so it auto-stales when content changes). kind: 'module' or 'file'. Use after synthesizing understanding from the graph tools."""
     if kind not in ("module", "file") or len(summary) < 40:
         return "kind must be module|file and summary at least 40 chars."
-    wcon = sqlite3.connect(DB_PATH)
+    wcon = wdb()
     try:
         wcon.execute("""CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT,
                         hash TEXT, summary TEXT, model TEXT, generated_at REAL)""")
@@ -638,10 +651,18 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
     root = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
                                text=True).stdout.strip() or Path.cwd())
     af = root / "docs" / "graph-assertions.json"
-    try:
-        lst = json.loads(af.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        lst = []
+    lst = []
+    if af.exists():
+        # Never clobber: a malformed file (merge-conflict marker, stray comma) must
+        # not silently erase the team's accumulated assertions.
+        try:
+            lst = json.loads(af.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            return (f"docs/graph-assertions.json exists but is not valid JSON ({e}). "
+                    "Fix or remove it first; refusing to overwrite the team's assertions.")
+        if not isinstance(lst, list):
+            return ("docs/graph-assertions.json is not a JSON array. "
+                    "Fix it first; refusing to overwrite the team's assertions.")
     rec = {"kind": kind, "file": file, "line": line, "evidence": evidence, "confidence": confidence,
            "author": "assistant", "source_hash": row["hash"],
            "asserted_at": __import__("datetime").date.today().isoformat()}
