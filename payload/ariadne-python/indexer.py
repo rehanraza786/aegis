@@ -270,6 +270,19 @@ CREATE TABLE IF NOT EXISTS edges(
   kind TEXT DEFAULT 'import', UNIQUE(src, dst, kind));
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
   path, start_line UNINDEXED, content, tokenize='trigram');
+-- FK indexes: every child table is cascade-deleted per changed file on every
+-- reindex; without these each DELETE FROM files full-scans each child table,
+-- making incremental reindex quadratic in changed files. edges(dst) also
+-- carries blast_radius/hotspots/imported_by, which BFS over reverse deps.
+CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
+CREATE INDEX IF NOT EXISTS idx_calls_src ON calls(src_symbol);
+CREATE INDEX IF NOT EXISTS idx_msg_file ON msg_edges(file_id);
+CREATE INDEX IF NOT EXISTS idx_dbdefs_file ON db_defs(file_id);
+CREATE INDEX IF NOT EXISTS idx_dbaccess_file ON db_access(file_id);
+CREATE INDEX IF NOT EXISTS idx_httpep_file ON http_endpoints(file_id);
+CREATE INDEX IF NOT EXISTS idx_httpcall_file ON http_calls(file_id);
+CREATE INDEX IF NOT EXISTS idx_testcases_file ON test_cases(file_id);
+CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
 """
 
 
@@ -527,10 +540,27 @@ def _load_extractors():
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             if hasattr(mod, "extractors"):
-                out.append((f.name, mod.extractors))
+                out.append((f.name, _normalize_hooks(mod.extractors)))
         except Exception as e:  # noqa: BLE001
             log.warning("extractor %s failed to load: %s", f.name, e)
     return out
+
+
+def _normalize_hooks(extractors):
+    """A hook is a bare callable (runs over the default java/kotlin set), a dict
+    {"fn": fn, "files": r"\\.go$"}, or a tuple (fn, r"\\.go$") — the latter two are
+    FILE-SCOPED and run over every tracked file the regex matches. This is what
+    lets a Go/Rails/TS-only stack feed the native tables through the same
+    extractor contract. Normalized shape: hook -> (fn, compiled_regex_or_None)."""
+    norm = {}
+    for hook, v in extractors.items():
+        if callable(v):
+            norm[hook] = (v, None)
+        elif isinstance(v, dict) and callable(v.get("fn")):
+            norm[hook] = (v["fn"], re.compile(v["files"]) if v.get("files") else None)
+        elif isinstance(v, tuple) and len(v) == 2 and callable(v[0]):
+            norm[hook] = (v[0], re.compile(v[1]) if v[1] else None)
+    return norm
 
 
 def kafka_pass(con, scope_prefixes=None):
@@ -539,14 +569,21 @@ def kafka_pass(con, scope_prefixes=None):
 
     def run_x(hook, args, insert):
         for name, x in EXTRACTORS:
-            fn = x.get(hook)
-            if not callable(fn):
+            fn, files = x.get(hook) or (None, None)
+            if not callable(fn) or files:  # file-scoped hooks run via run_x_filtered
                 continue
             try:
                 for row in fn(*args) or []:
                     insert(row)
             except Exception as e:  # noqa: BLE001
                 log.warning("extractor %s.%s: %s", name, hook, e)
+
+    # Files claimed by file-scoped hooks join the extraction candidates below, so
+    # scoping, per-file deletes, and the extract cache all apply to them too.
+    ext_file_res = [files for _, x in EXTRACTORS for (_fn, files) in x.values() if files]
+
+    def in_ext_files(p):
+        return any(r.search(p) for r in ext_file_res)
     from kafka_extract import load_config_map, load_constants, extract_kafka_edges
     from db_extract import (is_changelog, extract_changelog, extract_entities,
                             extract_db_access, extract_lombok_symbols)
@@ -607,7 +644,8 @@ def kafka_pass(con, scope_prefixes=None):
     for k, v in _cfg.get("tableNameOverrides", {}).items():
         entity_tables[k] = str(v).lower()
 
-    candidates = [p for p in tracked if re.search(r"\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs)$", p)]
+    candidates = [p for p in tracked
+                  if re.search(r"\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs)$", p) or in_ext_files(p)]
     if maps_changed:
         dirty = set(candidates)
     else:
@@ -633,6 +671,27 @@ def kafka_pass(con, scope_prefixes=None):
             return global_map
         own = con.execute(f"SELECT {col} FROM extract_cache WHERE path=?", (rel,)).fetchone()
         return {**global_map, **_json.loads(own[0] if own and own[0] else "{}")}
+
+    # file-scoped hooks: run each (fn, files) extractor over every in-scope
+    # tracked file its regex matches — the unlock that makes non-JVM stacks
+    # first-class citizens of message_flow/db_map/http_map and the drift math
+    def run_x_filtered(hook, mk_ctx, insert):
+        for name, x in EXTRACTORS:
+            fn, files = x.get(hook) or (None, None)
+            if not callable(fn) or not files:
+                continue
+            for rel in tracked:
+                if not files.search(rel) or not in_scope(rel):
+                    continue
+                text = read_text(rel)
+                fid = id_by_path.get(rel)
+                if not fid or text is None:
+                    continue
+                try:
+                    for row in fn(text, mk_ctx(rel)) or []:
+                        insert(row, fid)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("extractor %s.%s on %s: %s", name, hook, rel, e)
 
     scoped_delete("msg_edges")
     n = 0
@@ -661,6 +720,14 @@ def kafka_pass(con, scope_prefixes=None):
                          0 if e.get("resolved") is False else 1, e.get("via")))
             n += 1
         run_x("kafka", (text, {"config": cfg, "constants": constants, "relpath": rel}), _ins_kafka)
+
+    def _ins_kafka_f(e, fid):
+        nonlocal n
+        con.execute("INSERT INTO msg_edges(file_id, topic, direction, line, resolved, via) VALUES(?,?,?,?,?,?)",
+                    (fid, e["topic"], e["direction"], e["line"],
+                     0 if e.get("resolved") is False else 1, e.get("via")))
+        n += 1
+    run_x_filtered("kafka", lambda rel: {"config": cfg, "constants": constants, "relpath": rel}, _ins_kafka_f)
     if n:
         log.info("Kafka: %d message edges", n)
 
@@ -702,6 +769,13 @@ def kafka_pass(con, scope_prefixes=None):
                         (fid, r["table"], r.get("kind", "sql"), r.get("mode", "rw"), r["line"], r.get("detail", "extension")))
             accs += 1
         run_x("dbAccess", (text, {"entity_tables": entity_tables, "constants": constants, "relpath": rel}), _ins_acc)
+
+    def _ins_acc_f(r, fid):
+        nonlocal accs
+        con.execute("INSERT INTO db_access(file_id, tbl, kind, mode, line, detail) VALUES(?,?,?,?,?,?)",
+                    (fid, r["table"], r.get("kind", "sql"), r.get("mode", "rw"), r["line"], r.get("detail", "extension")))
+        accs += 1
+    run_x_filtered("dbAccess", lambda rel: {"entity_tables": entity_tables, "constants": constants, "relpath": rel}, _ins_acc_f)
     if defs or accs:
         log.info("DB: %d schema ops, %d access sites, %d entities", defs, accs, len(entity_tables))
     if lombok:
@@ -738,6 +812,20 @@ def kafka_pass(con, scope_prefixes=None):
             hcalls += 1
         run_x("httpEndpoints", (text, {"relpath": rel}), _ins_ep)
         run_x("httpCalls", (text, {"relpath": rel}), _ins_call)
+
+    def _ins_ep_f(e2, fid):
+        nonlocal eps
+        con.execute("INSERT INTO http_endpoints(file_id, method, path, norm, line, detail) VALUES(?,?,?,?,?,?)",
+                    (fid, e2["method"], e2["path"], e2.get("norm", e2["path"]), e2["line"], e2.get("detail", "extension")))
+        eps += 1
+
+    def _ins_call_f(c2, fid):
+        nonlocal hcalls
+        con.execute("INSERT INTO http_calls(file_id, method, path, norm, line, client) VALUES(?,?,?,?,?,?)",
+                    (fid, c2["method"], c2["path"], c2.get("norm", c2["path"]), c2["line"], c2.get("client", "extension")))
+        hcalls += 1
+    run_x_filtered("httpEndpoints", lambda rel: {"relpath": rel}, _ins_ep_f)
+    run_x_filtered("httpCalls", lambda rel: {"relpath": rel}, _ins_call_f)
     for rel in tracked:
         if not re.search(r"\.(ts|tsx|js|jsx|mjs)$", rel) or not in_scope(rel):
             continue
