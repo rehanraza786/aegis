@@ -15,13 +15,15 @@ import fs from "node:fs";
 import path from "node:path";
 
 const CONFIG_FILE_RE = /(^|\/)(application|bootstrap)[^/]*\.(ya?ml|properties)$/;
-const CONST_RE = /(?:static\s+final|final\s+static)\s+String\s+(\w+)\s*=\s*"([^"]+)"/g;
+// Java `static final String X = "…"` and Kotlin `const val X[: String] = "…"`
+const CONST_RE = /(?:(?:static\s+final|final\s+static)\s+String\s+(\w+)|const\s+val\s+(\w+)(?:\s*:\s*String)?)\s*=\s*"([^"]+)"/g;
 const LISTENER_RE = /@(?:Kafka|Jms|Rabbit)?KafkaListener\s*\(([^)]*)\)|@KafkaListener\s*\(([^)]*)\)/gs;
 const LISTENER_SIMPLE_RE = /@KafkaListener\s*\(([\s\S]*?)\)\s*(?:public|protected|private|void|[\w<>]+\s+\w+\s*\()/g;
 const SUBSCRIBE_RE = /\.subscribe\s*\(\s*(?:List\.of|Arrays\.asList|Collections\.singletonList|Set\.of)?\s*\(?\s*([^;)]+)/g;
 const SEND_RE = /(?:[Tt]emplate|[Pp]roducer)\w*\s*\.\s*send\s*\(\s*([^,)]+)/g;
 const PRODUCER_RECORD_RE = /new\s+ProducerRecord\s*<[^>]*>\s*\(\s*([^,)]+)/g;
-const TOPICS_ATTR_RE = /topics\s*=\s*(\{(?:[^{}]|\$\{[^}]*\})*\}|(?:[^,)]|\$\{[^}]*\})+)/;
+// value forms: Java array {"a","b"}, Kotlin array ["a","b"], or a bare expression
+const TOPICS_ATTR_RE = /topics\s*=\s*(\{(?:[^{}]|\$\{[^}]*\})*\}|\[(?:[^\[\]]|\$\{[^}]*\})*\]|(?:[^,)]|\$\{[^}]*\})+)/;
 
 /** Flatten application.yaml/.properties files into { "a.b.c": "value" }. */
 export function loadConfigMap(repoRoot, trackedFiles, log = () => {}) {
@@ -65,7 +67,8 @@ export function loadConstants(texts) {
   for (const { text } of texts) {
     CONST_RE.lastIndex = 0;
     for (const m of text.matchAll(CONST_RE)) {
-      if (!map.has(m[1])) map.set(m[1], m[2]);
+      const name = m[1] ?? m[2];
+      if (!map.has(name)) map.set(name, m[3]);
     }
   }
   return map;

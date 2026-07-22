@@ -5,8 +5,10 @@ import re
 from pathlib import Path
 
 CONFIG_FILE_RE = re.compile(r"(^|/)(application|bootstrap)[^/]*\.(ya?ml|properties)$")
-CONST_RE = re.compile(r'(?:static\s+final|final\s+static)\s+String\s+(\w+)\s*=\s*"([^"]+)"')
-TOPICS_ATTR_RE = re.compile(r"topics\s*=\s*(\{(?:[^{}]|\$\{[^}]*\})*\}|(?:[^,)]|\$\{[^}]*\})+)")
+# Java `static final String X = "…"` and Kotlin `const val X[: String] = "…"`
+CONST_RE = re.compile(r'(?:(?:static\s+final|final\s+static)\s+String\s+(\w+)|const\s+val\s+(\w+)(?:\s*:\s*String)?)\s*=\s*"([^"]+)"')
+# value forms: Java array {"a","b"}, Kotlin array ["a","b"], or a bare expression
+TOPICS_ATTR_RE = re.compile(r"topics\s*=\s*(\{(?:[^{}]|\$\{[^}]*\})*\}|\[(?:[^\[\]]|\$\{[^}]*\})*\]|(?:[^,)]|\$\{[^}]*\})+)")
 LISTENER_RE = re.compile(r"@KafkaListener\s*\(([\s\S]*?)\)")
 SUBSCRIBE_RE = re.compile(r"\.subscribe\s*\(\s*(?:List\.of|Arrays\.asList|Collections\.singletonList|Set\.of)?\s*\(?\s*([^;)]+)")
 SEND_RE = re.compile(r"[Tt]emplate\w*\s*\.\s*send\s*\(\s*([^,)]+)|[Pp]roducer\w*\s*\.\s*send\s*\(\s*([^,)]+)")
@@ -55,7 +57,7 @@ def load_constants(texts):
     const = {}
     for _, text in texts:
         for m in CONST_RE.finditer(text):
-            const.setdefault(m.group(1), m.group(2))
+            const.setdefault(m.group(1) or m.group(2), m.group(3))
     return const
 
 

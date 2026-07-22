@@ -100,6 +100,16 @@ export function extractTsHttp(text) {
 
 /** Does a call's normalized path match an endpoint's? Exact, or prefix when the call ends dynamic. */
 export function pathsMatch(callNorm, epNorm) {
+  if (segsMatch(callNorm, epNorm)) return true;
+  // fetch(`${API_BASE}/api/orders`) normalizes to /{}/api/orders: that leading
+  // placeholder is a base-URL/origin variable, not a path segment, and env-based
+  // base URLs are the dominant frontend pattern. Retry with it stripped, call
+  // side only, so those calls still correlate with /api/orders endpoints.
+  if (callNorm.startsWith("/{}/")) return segsMatch(callNorm.slice(3), epNorm);
+  return false;
+}
+
+function segsMatch(callNorm, epNorm) {
   if (callNorm === epNorm) return true;
   const seg = (s) => s.split("/");
   let c = seg(callNorm);

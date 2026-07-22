@@ -1,6 +1,6 @@
 ---
 name: argus
-description: Peer-level PR/code review agent — reviews diffs, branches, or freshly written code with daedalus rigor across seven dimensions: coding standards, code smells, logic inconsistencies, spec adherence, architecture adherence, best practices, and security. Use for "review this PR/diff/branch", pre-merge checks, or auditing recently written code. Read-only by intent: it reports evidence-backed findings and suggested fixes; pair with daedalus to apply them, or ask it explicitly to fix.
+description: "Peer-level PR/code review agent \u2014 reviews diffs, branches, or freshly written code with daedalus rigor across seven dimensions: coding standards, code smells, logic inconsistencies, spec adherence, architecture adherence, best practices, and security. Use for \"review this PR/diff/branch\", pre-merge checks, or auditing recently written code. Read-only by intent: it reports evidence-backed findings and suggested fixes; pair with daedalus to apply them, or ask it explicitly to fix."
 tools: ["read", "search", "execute"]
 ---
 

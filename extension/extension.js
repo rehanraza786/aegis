@@ -211,13 +211,92 @@ async function enrichViaCopilot(context) {
   finally { try { fs.unlinkSync(tmp); } catch { /* ignore */ } }
 }
 
+/** Interactive graph view: renders graph_export JSON in a webview (cytoscape
+ *  bundled in the vsix, no CDN, zero egress) and writes annotations back through
+ *  annotate.mjs/.py, the same provenance-preserving paths agents use, so a
+ *  human's note or assertion is labeled as human, git-versioned, and consumable
+ *  by every agent via explain/context_pack/message_flow. */
+function runtimeExec(root, runtime, script, args = []) {
+  const cp = require("child_process");
+  const exe = runtime === "node" ? "node" : (process.platform === "win32" ? "python" : "python3");
+  return cp.execFileSync(exe, [path.join(root, ".ariadne", script), ...args],
+    { cwd: root, env: { ...process.env, ...workspaceEnv() }, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+}
+
+function openGraphPanel(context) {
+  const root = workspaceRoot();
+  const runtime = root && detectRuntime(root);
+  if (!runtime) { vscode.window.showWarningMessage("AEGIS: Ariadne not installed here. Run 'AEGIS: Install into Workspace' first."); return; }
+  const suffix = runtime === "node" ? "mjs" : "py";
+  if (!exists(path.join(root, ".ariadne", `graph_export.${suffix}`))) {
+    vscode.window.showWarningMessage("AEGIS: this workspace's payload predates the graph view. Run 'AEGIS: Update Workspace Payload' first.");
+    return;
+  }
+  const panel = vscode.window.createWebviewPanel("aegisGraph", "AEGIS Graph", vscode.ViewColumn.Active, {
+    enableScripts: true,
+    localResourceRoots: [vscode.Uri.file(path.join(context.extensionPath, "media"))],
+    retainContextWhenHidden: true,
+  });
+  const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const cytoUri = panel.webview.asWebviewUri(vscode.Uri.file(path.join(context.extensionPath, "media", "cytoscape.min.js")));
+  panel.webview.html = fs.readFileSync(path.join(context.extensionPath, "graph-view.html"), "utf8")
+    .replaceAll("__NONCE__", nonce).replaceAll("__CYTOSCAPE__", String(cytoUri));
+
+  const send = (keepPositions) => {
+    try {
+      const graph = JSON.parse(runtimeExec(root, runtime, `graph_export.${suffix}`));
+      panel.webview.postMessage({ type: "data", graph, keepPositions: !!keepPositions });
+    } catch (e) {
+      panel.webview.postMessage({ type: "toast", message: `Graph export failed: ${String(e.stderr || e.message).trim()}`, isError: true });
+    }
+  };
+  // multi-root workspaces index repo-prefixed paths; resolve the prefix back to a folder
+  const absOf = (rel) => {
+    const seg = rel.split("/")[0];
+    const hit = (vscode.workspace.workspaceFolders ?? []).find((f) => path.basename(f.uri.fsPath) === seg);
+    return hit ? path.join(path.dirname(hit.uri.fsPath), rel) : path.join(root, rel);
+  };
+  panel.webview.onDidReceiveMessage(async (m) => {
+    if (m.type === "ready" || m.type === "refresh") {
+      send(m.type === "refresh");
+    } else if (m.type === "openFile") {
+      try {
+        const doc = await vscode.workspace.openTextDocument(absOf(m.path));
+        const ed = await vscode.window.showTextDocument(doc, { preview: true });
+        const pos = new vscode.Position(Math.max(0, (m.line || 1) - 1), 0);
+        ed.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+        ed.selection = new vscode.Selection(pos, pos);
+      } catch { vscode.window.showWarningMessage(`AEGIS: cannot open ${m.path}`); }
+    } else if (m.type === "annotate") {
+      try {
+        const res = runtimeExec(root, runtime, `annotate.${suffix}`, [JSON.stringify(m.payload)]);
+        panel.webview.postMessage({ type: "toast", message: res.trim() });
+        if (m.payload.action === "assert") {
+          const pick = await vscode.window.showInformationMessage(
+            "AEGIS: assertion recorded in docs/graph-assertions.json. Reindex now so it enters the graph?", "Reindex", "Later");
+          if (pick === "Reindex") {
+            const cp = require("child_process");
+            const exe = runtime === "node" ? "node" : (process.platform === "win32" ? "python" : "python3");
+            cp.execFile(exe, [indexerPath(root, runtime), "--full"],
+              { cwd: root, env: { ...process.env, ...workspaceEnv() } }, () => send(true));
+          }
+        } else {
+          send(true);
+        }
+      } catch (e) {
+        panel.webview.postMessage({ type: "toast", message: String(e.stderr || e.message).trim(), isError: true });
+      }
+    }
+  }, undefined, context.subscriptions);
+}
+
 /** Update AEGIS-managed files from the bundled payload (preserves user config, index, extensions, knowledge). */
 function updateWorkspace(context) {
   const root = workspaceRoot();
   if (!root) { vscode.window.showErrorMessage("AEGIS: open a workspace first."); return; }
   const payload = path.join(context.extensionPath, "payload");
   const runtime = detectRuntime(root) ?? runtimeConfig();
-  const PRESERVE = new Set(["config.json", "index.db", "index.db-wal", "index.db-shm", "index.log", "index.lock", "extensions", "node_modules"]);
+  const PRESERVE = new Set(["config.json", "index.db", "index.db-wal", "index.db-shm", "index.log", ".index.lock", "extensions", "node_modules"]);
   let updated = 0;
   const overwriteDir = (src, dst) => {
     if (!fs.existsSync(src)) return;
@@ -249,6 +328,7 @@ function activate(context) {
     vscode.commands.registerCommand("aegis.pullIndex", ariadneCommand("pull")),
     vscode.commands.registerCommand("aegis.enrichCopilot", () => enrichViaCopilot(context)),
     vscode.commands.registerCommand("aegis.update", () => updateWorkspace(context)),
+    vscode.commands.registerCommand("aegis.graph", () => openGraphPanel(context)),
     vscode.commands.registerCommand("aegis.docgen", () => {
       const root = workspaceRoot();
       const runtime = root && detectRuntime(root);

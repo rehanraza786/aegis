@@ -97,7 +97,7 @@ const LANG_BY_EXT = {
   ".ts": "typescript", ".tsx": "typescript", ".mts": "typescript", ".java": "java", ".cs": "csharp",
   ".go": "go", ".rs": "rust", ".rb": "ruby", ".php": "php", ".c": "c", ".h": "c",
   ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp", ".kt": "kotlin", ".kts": "kotlin", ".gradle": "config", ".swift": "swift",
-  ".scala": "scala", ".sql": "sql", ".sh": "shell", ".yaml": "config", ".yml": "config",
+  ".scala": "scala", ".sql": "sql", ".sh": "shell", ".yaml": "config", ".yml": "config", ".properties": "config",
   ".toml": "config", ".json": "config", ".xml": "config", ".md": "docs", ".pdf": "docs", ...config.extraExtensions,
 };
 
@@ -679,7 +679,10 @@ async function kafkaPass(db, scopePrefixes = null) {
     db.exec("DELETE FROM http_calls WHERE source LIKE 'asserted%'");
     const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
     let list = [];
-    try { list = JSON.parse(fs.readFileSync(af, "utf8")); } catch { /* none yet */ }
+    if (fs.existsSync(af)) {
+      try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
+      catch (e) { log("WARN", `docs/graph-assertions.json is not valid JSON (${e.message}); assertions stay out of the graph until it is fixed`); }
+    }
     if (Array.isArray(list) && list.length) {
       const insA = db.prepare(`INSERT INTO assertions(kind, payload, file_path, line, evidence, confidence, author, source_hash, created_at)
                                VALUES(?,?,?,?,?,?,?,?,?)`);
@@ -793,6 +796,16 @@ async function inTx(db, body) {
 async function fullIndex(db, rebuild = false) {
   const t0 = Date.now();
   const files = repoFiles();
+  // A transient git failure (held index.lock, timeout, git missing) makes
+  // repoFiles() return [] — without this guard the prune loop below would then
+  // silently delete every row in the index. --rebuild still forces through.
+  if (!files.length && !rebuild) {
+    const existing = db.prepare("SELECT COUNT(*) c FROM files").get().c;
+    if (existing > 0) {
+      log("WARN", `git returned 0 tracked files but the index holds ${existing}; refusing to prune (transient git failure?). Run --rebuild to force.`);
+      return;
+    }
+  }
   return inTx(db, async () => {
   if (rebuild) {
     // Deleting files cascade-wipes every correlation row, so the extraction cache

@@ -28,7 +28,14 @@ Pin this. It is the whole thing.
 ## Commands (Command Palette → "AEGIS")
 
 Install into Workspace · Rebuild Index · Index Status · Pull Team Index ·
-Generate Flow Docs & Progress Report · Enrich Insights via Copilot · Update Workspace Payload
+Open Graph View (visualize & annotate) · Generate Flow Docs & Progress Report ·
+Enrich Insights via Copilot · Update Workspace Payload
+
+**Graph View**: the map, live. Warnings are badged, test usage is dimmed, asserted
+edges are dashed. The *Gaps* panel is a worklist: every card is a place the graph
+needs a human — fill one in (with evidence) and every agent gets smarter, with
+your answer recorded as `asserted:human`, PR-reviewable, and auto-staled if the
+code changes.
 
 ## Two rules worth remembering
 

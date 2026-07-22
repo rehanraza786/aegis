@@ -1,5 +1,10 @@
 mcp[cli]>=1.2.0
 protobuf>=7.35
 tree-sitter>=0.23
-tree-sitter-language-pack>=0.7
+# <1 is load-bearing: the language pack's 1.x line stopped vendoring grammars in
+# the wheel and fetches parsers from GitHub AT RUNTIME. That (a) silently breaks
+# the AST engine in offline/locked-down environments (regex fallback, degraded
+# graph) and (b) adds a network call PRIVACY.md promises this project never
+# makes. The 0.x line ships every grammar inside the wheel.
+tree-sitter-language-pack>=0.7,<1
 pypdf>=4

@@ -95,6 +95,18 @@ def extract_ts_http(text):
 
 
 def paths_match(call_norm, ep_norm):
+    if _segs_match(call_norm, ep_norm):
+        return True
+    # fetch(`${API_BASE}/api/orders`) normalizes to /{}/api/orders: that leading
+    # placeholder is a base-URL/origin variable, not a path segment, and env-based
+    # base URLs are the dominant frontend pattern. Retry with it stripped, call
+    # side only, so those calls still correlate with /api/orders endpoints.
+    if call_norm.startswith("/{}/"):
+        return _segs_match(call_norm[3:], ep_norm)
+    return False
+
+
+def _segs_match(call_norm, ep_norm):
     if call_norm == ep_norm:
         return True
     c, e = call_norm.split("/"), ep_norm.split("/")

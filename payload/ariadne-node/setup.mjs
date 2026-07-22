@@ -50,7 +50,7 @@ for (const repo of gitRepos()) {
     hooks++;
   }
   const gi = path.join(repo, ".gitignore");
-  const entries = "\n# AEGIS\n.ariadne/index.db*\n.ariadne/index.log\n.ariadne/index.lock\n.ariadne/node_modules/\ndocs/generated/\n";
+  const entries = "\n# AEGIS\n.ariadne/index.db*\n.ariadne/index.log\n.ariadne/.index.lock\n.ariadne/node_modules/\ndocs/generated/\n";
   if (!fs.existsSync(gi) || !fs.readFileSync(gi, "utf8").includes(".ariadne/index.db")) fs.appendFileSync(gi, entries);
 }
 console.log(`Hooks installed: ${hooks}`);
