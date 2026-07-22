@@ -50,7 +50,7 @@ for repo in git_repos():
             pass
         hooks += 1
     gi = repo / ".gitignore"
-    entries = "\n# AEGIS\n.ariadne/index.db*\n.ariadne/index.log\n.ariadne/index.lock\n.ariadne/node_modules/\ndocs/generated/\n"
+    entries = "\n# AEGIS\n.ariadne/index.db*\n.ariadne/index.log\n.ariadne/.index.lock\n.ariadne/node_modules/\ndocs/generated/\n"
     if not gi.exists() or ".ariadne/index.db" not in gi.read_text(encoding="utf-8", errors="replace"):
         with gi.open("a", encoding="utf-8") as fh:
             fh.write(entries)

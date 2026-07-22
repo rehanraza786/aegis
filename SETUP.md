@@ -178,7 +178,7 @@ Rebuild it: `node .ariadne/indexer.mjs --rebuild`, or the palette command.
 environment is blocking native code. Reinstall with `--runtime=python`, which has none.
 
 **`database is locked`.** Two indexers raced. The lock clears itself after ten
-minutes; delete `.ariadne/index.lock` if you are impatient.
+minutes; delete `.ariadne/.index.lock` if you are impatient.
 
 **A Kafka topic does not correlate.** Run `graph_gaps`. If it appears under
 `unresolved_topic_expressions`, the name is assembled at runtime and static analysis

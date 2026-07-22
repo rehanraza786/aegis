@@ -217,7 +217,7 @@ function updateWorkspace(context) {
   if (!root) { vscode.window.showErrorMessage("AEGIS: open a workspace first."); return; }
   const payload = path.join(context.extensionPath, "payload");
   const runtime = detectRuntime(root) ?? runtimeConfig();
-  const PRESERVE = new Set(["config.json", "index.db", "index.db-wal", "index.db-shm", "index.log", "index.lock", "extensions", "node_modules"]);
+  const PRESERVE = new Set(["config.json", "index.db", "index.db-wal", "index.db-shm", "index.log", ".index.lock", "extensions", "node_modules"]);
   let updated = 0;
   const overwriteDir = (src, dst) => {
     if (!fs.existsSync(src)) return;
