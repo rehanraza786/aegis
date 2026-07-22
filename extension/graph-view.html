@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'nonce-__NONCE__';">
+<title>AEGIS Graph</title>
+<style>
+  :root { color-scheme: light dark; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: var(--vscode-font-family); font-size: var(--vscode-font-size, 13px);
+    color: var(--vscode-foreground); background: var(--vscode-editor-background);
+    display: grid; grid-template-rows: auto 1fr; grid-template-columns: 1fr 340px;
+    grid-template-areas: "bar bar" "graph side"; overflow: hidden;
+  }
+  #bar { grid-area: bar; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+         padding: 6px 10px; border-bottom: 1px solid var(--vscode-panel-border); }
+  #bar .title { font-weight: 600; margin-right: 6px; }
+  #bar label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; opacity: .9; white-space: nowrap; }
+  #bar .spacer { flex: 1; }
+  #bar .meta { opacity: .7; font-size: .92em; }
+  button {
+    font-family: inherit; font-size: inherit; cursor: pointer;
+    color: var(--vscode-button-foreground); background: var(--vscode-button-background);
+    border: 1px solid transparent; border-radius: 3px; padding: 3px 10px;
+  }
+  button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
+  button:hover { filter: brightness(1.1); }
+  #cy { grid-area: graph; min-width: 0; min-height: 0; }
+  #side { grid-area: side; border-left: 1px solid var(--vscode-panel-border); overflow-y: auto; padding: 10px 12px; }
+  #side h3 { margin: 4px 0 8px; font-size: 1em; }
+  #side h4 { margin: 12px 0 4px; font-size: .95em; opacity: .85; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: .9em; opacity: .85; margin: 2px 0 8px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .sw { width: 11px; height: 11px; display: inline-block; border-radius: 3px; }
+  .sw.diamond { transform: rotate(45deg) scale(.85); border-radius: 2px; }
+  .sw.round { border-radius: 50%; }
+  .site { display: flex; gap: 6px; align-items: baseline; margin: 2px 0; }
+  .site a { color: var(--vscode-textLink-foreground); cursor: pointer; text-decoration: none;
+            font-family: var(--vscode-editor-font-family, monospace); font-size: .92em; word-break: break-all; }
+  .site a:hover { text-decoration: underline; }
+  .tag { font-size: .78em; border: 1px solid var(--vscode-panel-border); border-radius: 3px; padding: 0 4px; opacity: .8; }
+  .warn { color: var(--vscode-editorWarning-foreground, #cca700); }
+  .err  { color: var(--vscode-editorError-foreground, #f14c4c); }
+  .muted { opacity: .65; }
+  .gap-item { border: 1px solid var(--vscode-panel-border); border-radius: 4px; padding: 6px 8px; margin: 6px 0; }
+  .gap-item .actions { margin-top: 4px; display: flex; gap: 6px; }
+  form.annotate { margin-top: 8px; display: grid; gap: 6px; }
+  textarea, input, select {
+    font-family: inherit; font-size: inherit; color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, transparent);
+    border-radius: 3px; padding: 4px 6px; width: 100%; box-sizing: border-box;
+  }
+  textarea { resize: vertical; min-height: 54px; }
+  .hint { font-size: .85em; opacity: .7; }
+  .toast { position: fixed; bottom: 12px; left: 12px; right: 372px; padding: 8px 12px; border-radius: 4px;
+           background: var(--vscode-notifications-background, #333); border: 1px solid var(--vscode-panel-border);
+           box-shadow: 0 2px 8px rgba(0,0,0,.35); display: none; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <span class="title">AEGIS Graph</span>
+    <label><input type="checkbox" id="tTopics" checked> Topics</label>
+    <label><input type="checkbox" id="tTables" checked> Tables</label>
+    <label><input type="checkbox" id="tTests"> Test-only items</label>
+    <span class="spacer"></span>
+    <span class="meta" id="meta"></span>
+    <button class="secondary" id="fit">Fit</button>
+    <button id="refresh">Refresh</button>
+  </div>
+  <div id="cy"></div>
+  <div id="side">
+    <div class="legend" id="legend"></div>
+    <div id="details"><h3>Details</h3><p class="muted">Click a node. Modules are rectangles, Kafka topics are
+      diamonds, DB tables are barrels. Dashed border = asserted (derived, not parsed). ⚠ = warning.
+      Right side lists <b>gaps</b>: places the graph needs a human.</p></div>
+    <div id="gaps"></div>
+  </div>
+  <div class="toast" id="toast"></div>
+
+<script nonce="__NONCE__" src="__CYTOSCAPE__"></script>
+<script nonce="__NONCE__">
+const vscode = acquireVsCodeApi();
+let G = null, cy = null, selected = null;
+
+/* VS Code's own chart palette adapts to the active theme (light AND dark).
+   Identity is never color-alone: node SHAPE + text label carry the type. */
+const cssVar = (n, fb) => (getComputedStyle(document.body).getPropertyValue(n) || fb).trim() || fb;
+const C = () => ({
+  module: cssVar("--vscode-charts-blue", "#3794ff"),
+  topic:  cssVar("--vscode-charts-yellow", "#cca700"),
+  table:  cssVar("--vscode-charts-purple", "#b180d7"),
+  warn:   cssVar("--vscode-editorWarning-foreground", "#cca700"),
+  err:    cssVar("--vscode-editorError-foreground", "#f14c4c"),
+  ink:    cssVar("--vscode-foreground", "#ccc"),
+  line:   cssVar("--vscode-panel-border", "#555"),
+  bg:     cssVar("--vscode-editor-background", "#1e1e1e"),
+});
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const toast = (msg, isErr) => {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.style.display = "block";
+  t.style.borderColor = isErr ? C().err : C().line;
+  clearTimeout(t._h); t._h = setTimeout(() => { t.style.display = "none"; }, 6000);
+};
+
+function elements() {
+  const showTopics = tTopics.checked, showTables = tTables.checked, showTests = tTests.checked;
+  const els = [], modIds = new Set(G.modules.map((m) => m.id));
+  const modOf = (p) => p.split("/")[0];
+  for (const m of G.modules) {
+    els.push({ data: { id: "m:" + m.id, label: m.id, type: "module", ref: m } });
+  }
+  for (const m of G.modules) for (const d of m.deps) {
+    if (modIds.has(d)) els.push({ data: { id: `dep:${m.id}:${d}`, source: "m:" + m.id, target: "m:" + d, type: "dep" } });
+  }
+  if (showTopics) for (const t of G.topics) {
+    const warn = Object.keys(t.warnings || {}).length > 0;
+    const testOnly = t.warnings && t.warnings.test_only;
+    if (testOnly && !showTests) continue;
+    els.push({ data: { id: "t:" + t.topic, label: (warn ? "⚠ " : "") + t.topic, type: "topic", warn, testOnly, ref: t } });
+    const seen = new Set();
+    const link = (sites, dir) => (sites.items || []).forEach((s) => {
+      const mod = modOf(s.path); if (!modIds.has(mod)) return;
+      const id = `${dir}:${t.topic}:${mod}`; if (seen.has(id)) return; seen.add(id);
+      els.push({ data: { id, type: dir, asserted: !!s.asserted,
+        source: dir === "produce" ? "m:" + mod : "t:" + t.topic,
+        target: dir === "produce" ? "t:" + t.topic : "m:" + mod, label: dir === "produce" ? "publish" : "consume" } });
+    });
+    link(t.producers, "produce"); link(t.consumers, "consume");
+    if (showTests && t.test_sites) (t.test_sites.items || []).forEach((s) => {
+      const mod = modOf(s.path); if (!modIds.has(mod)) return;
+      const id = `test:${t.topic}:${mod}:${s.line}`;
+      els.push({ data: { id, type: "testedge", source: "m:" + mod, target: "t:" + t.topic, label: "[TEST]" } });
+    });
+  }
+  if (showTables) for (const t of G.tables) {
+    const warn = Object.keys(t.warnings || {}).length > 0;
+    els.push({ data: { id: "d:" + t.table, label: (warn ? "⚠ " : "") + t.table, type: "table", warn, ref: t } });
+    const seen = new Set();
+    (t.access.items || []).forEach((s) => {
+      const mod = modOf(s.path); if (!modIds.has(mod)) return;
+      const id = `acc:${t.table}:${mod}:${s.mode}`; if (seen.has(id)) return; seen.add(id);
+      els.push({ data: { id, source: "m:" + mod, target: "d:" + t.table, type: "access", asserted: !!s.asserted, label: s.mode } });
+    });
+  }
+  return els;
+}
+
+function style() {
+  const c = C();
+  return [
+    { selector: "node", style: { label: "data(label)", color: c.ink, "font-size": 11,
+        "text-valign": "center", "text-halign": "center", "text-wrap": "wrap", "text-max-width": 110,
+        "border-width": 1.5, "border-color": c.line } },
+    { selector: 'node[type="module"]', style: { shape: "round-rectangle", width: 120, height: 34,
+        "background-color": c.module, "background-opacity": .22, "border-color": c.module } },
+    { selector: 'node[type="topic"]', style: { shape: "diamond", width: 96, height: 52,
+        "background-color": c.topic, "background-opacity": .2, "border-color": c.topic, "font-size": 10 } },
+    { selector: 'node[type="table"]', style: { shape: "barrel", width: 96, height: 40,
+        "background-color": c.table, "background-opacity": .2, "border-color": c.table, "font-size": 10 } },
+    { selector: "node[?warn]", style: { "border-color": c.warn, "border-width": 2.5 } },
+    { selector: "node[?testOnly]", style: { opacity: .45 } },
+    { selector: "node:selected", style: { "border-width": 3, "overlay-opacity": .08 } },
+    { selector: "edge", style: { width: 1.4, "line-color": c.line, "target-arrow-color": c.line,
+        "target-arrow-shape": "triangle", "arrow-scale": .8, "curve-style": "bezier",
+        label: "data(label)", "font-size": 8.5, color: c.ink, "text-opacity": .75,
+        "text-background-color": c.bg, "text-background-opacity": .85, "text-background-padding": 1 } },
+    { selector: 'edge[type="produce"], edge[type="consume"]', style: { "line-color": c.topic, "target-arrow-color": c.topic, "line-opacity": .7 } },
+    { selector: 'edge[type="access"]', style: { "line-color": c.table, "target-arrow-color": c.table, "line-opacity": .7 } },
+    { selector: 'edge[type="testedge"]', style: { "line-style": "dotted", opacity: .4 } },
+    { selector: "edge[?asserted]", style: { "line-style": "dashed" } },
+  ];
+}
+
+function render(keepPositions) {
+  const positions = keepPositions && cy ? Object.fromEntries(cy.nodes().map((n) => [n.id(), n.position()])) : null;
+  if (cy) cy.destroy();
+  cy = cytoscape({ container: document.getElementById("cy"), elements: elements(), style: style(),
+    layout: positions ? { name: "preset", positions: (n) => positions[n.id()] || { x: 0, y: 0 } }
+                      : { name: "cose", animate: false, nodeRepulsion: 90000, idealEdgeLength: 110, padding: 24,
+                          nodeDimensionsIncludeLabels: true, nodeOverlap: 24, componentSpacing: 120 },
+    wheelSensitivity: .2 });
+  window._cy = cy; // debug/test hook (the container div already owns window.cy)
+  cy.on("tap", "node", (ev) => { selected = ev.target.data(); showDetails(selected); });
+  cy.on("tap", (ev) => { if (ev.target === cy) { selected = null; resetDetails(); } });
+  const c = C();
+  document.getElementById("legend").innerHTML =
+    `<span><span class="sw" style="background:${c.module}"></span>module</span>` +
+    `<span><span class="sw diamond" style="background:${c.topic}"></span>Kafka topic</span>` +
+    `<span><span class="sw round" style="background:${c.table}"></span>DB table</span>` +
+    `<span><span class="warn">⚠ warning</span></span><span class="muted">dashed = asserted</span>`;
+  document.getElementById("meta").textContent =
+    `${G.modules.length}${G.generated_from.modules_truncated_to ? "/" + G.generated_from.modules_total : ""} modules · ` +
+    `${G.topics.length} topics · ${G.tables.length} tables · ${G.endpoints.length} endpoints · ${G.generated_from.symbols} symbols`;
+}
+
+const siteRow = (s, extra = "") =>
+  `<div class="site"><a data-open="${esc(s.path)}:${s.line}">${esc(s.path)}:${s.line}</a>` +
+  (s.via ? `<span class="tag">via ${esc(s.via)}</span>` : "") +
+  (s.test ? `<span class="tag">TEST</span>` : "") +
+  (s.asserted ? `<span class="tag">${esc(s.asserted)}</span>` : "") + extra + "</div>";
+const moreRow = (l) => l.more ? `<div class="muted">…and ${l.more} more (query the tool)</div>` : "";
+
+function noteForm(target, kind) {
+  return `<form class="annotate" data-note="${esc(target)}" data-kind="${kind}">
+    <textarea name="summary" placeholder="What should agents know about ${esc(target)}? (≥40 chars — served via explain/context_pack, provenance: human)"></textarea>
+    <button type="submit">Save note to graph</button></form>`;
+}
+
+function showDetails(d) {
+  const el = document.getElementById("details");
+  if (d.type === "module") {
+    const m = d.ref;
+    const notes = (G.annotations.insights || []).filter((i) => i.target === m.id);
+    el.innerHTML = `<h3>${esc(m.id)} <span class="tag">module</span></h3>
+      <div>${m.files} files · ${esc((m.langs || []).join(", "))}</div>
+      ${m.deps.length ? `<h4>Depends on</h4>${m.deps.map((x) => `<div class="site">${esc(x)}</div>`).join("")}` : ""}
+      ${notes.length ? `<h4>Notes in graph</h4>${notes.map((n) => `<div class="site">${esc(n.kind)} note <span class="tag">${esc(n.by || "")}</span></div>`).join("")}` : ""}
+      <h4>Annotate</h4>${noteForm(m.id, "module")}`;
+  } else if (d.type === "topic") {
+    const t = d.ref;
+    const w = t.warnings || {};
+    el.innerHTML = `<h3>${esc(t.topic)} <span class="tag">topic</span></h3>
+      ${w.orphan_produce ? `<div class="warn">⚠ produced but no consumer found</div>` : ""}
+      ${w.orphan_consume ? `<div class="warn">⚠ consumed but no producer found</div>` : ""}
+      ${w.test_only ? `<div class="warn">⚠ only exercised by tests</div>` : ""}
+      ${w.unresolved_expression ? `<div class="err">⚠ contains an unresolved runtime expression (see Gaps)</div>` : ""}
+      <h4>Producers</h4>${(t.producers.items || []).map((s) => siteRow(s)).join("") || '<div class="muted">none</div>'}${moreRow(t.producers)}
+      <h4>Consumers</h4>${(t.consumers.items || []).map((s) => siteRow(s)).join("") || '<div class="muted">none</div>'}${moreRow(t.consumers)}
+      ${t.test_sites ? `<h4>Test usage</h4>${(t.test_sites.items || []).map((s) => siteRow(s)).join("")}` : ""}`;
+  } else if (d.type === "table") {
+    const t = d.ref;
+    const w = t.warnings || {};
+    const first = (t.access.items || [])[0];
+    el.innerHTML = `<h3>${esc(t.table)} <span class="tag">table</span></h3>
+      ${w.drift_no_changeset ? `<div class="err">⚠ DRIFT: accessed by code but no changeset defines it</div>` : ""}
+      ${w.defined_but_unused ? `<div class="warn">⚠ defined in changelog but no code access found</div>` : ""}
+      ${t.changesets.length ? `<h4>Schema history</h4><div>${t.changesets.map(esc).join(" → ")}</div>` : ""}
+      <h4>Access</h4>${(t.access.items || []).map((s) => siteRow(s, ` <span class="tag">${esc(s.mode || "")}</span>`)).join("") || '<div class="muted">none</div>'}${moreRow(t.access)}
+      ${w.drift_no_changeset && first ? `<h4>Assert (close this gap with evidence)</h4>
+        <form class="annotate" data-assert='${esc(JSON.stringify({ kind: "db", table: t.table, file: first.path, line: first.line, mode: first.mode || "rw" }))}'>
+          <textarea name="evidence" placeholder="Evidence (≥20 chars): quote the code/changelog that convinced you"></textarea>
+          <select name="confidence"><option>high</option><option selected>medium</option><option>low</option></select>
+          <button type="submit">Assert into graph</button>
+          <div class="hint">Writes docs/graph-assertions.json — git-versioned, PR-reviewed, provenance “human”.</div>
+        </form>` : ""}`;
+  }
+  bindDetailHandlers(el);
+}
+
+function resetDetails() {
+  document.getElementById("details").innerHTML = `<h3>Details</h3><p class="muted">Click a node.</p>`;
+}
+
+function renderGaps() {
+  const g = document.getElementById("gaps");
+  const items = (G.gaps.unresolved_topic_expressions || []);
+  const orphans = G.topics.filter((t) => t.warnings && (t.warnings.orphan_produce || t.warnings.orphan_consume));
+  const drift = G.tables.filter((t) => t.warnings && t.warnings.drift_no_changeset);
+  const uncalled = G.endpoints.filter((e) => e.warnings && e.warnings.no_caller);
+  g.innerHTML = `<h3>Gaps — the graph needs a human (${items.length + drift.length})</h3>
+    ${items.map((it, i) => `<div class="gap-item">
+      <div class="err">unresolved: <b>${esc(it.expression)}</b> (${esc(it.direction)})</div>
+      <div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div>
+      <form class="annotate" data-assert='${esc(JSON.stringify({ kind: "kafka", file: it.path, line: it.line, direction: it.direction }))}'>
+        <input name="topic" placeholder="Resolved topic name" value="${esc(it.expression.replace(/\{\?\}/g, ""))}">
+        <textarea name="evidence" placeholder="Evidence (≥20 chars): how did you resolve it? Quote the constant/config/profile."></textarea>
+        <select name="confidence"><option>high</option><option selected>medium</option><option>low</option></select>
+        <button type="submit">Assert resolved topic</button></form></div>`).join("")}
+    ${drift.length ? `<h4 class="err">Drift tables</h4>` + drift.map((t) => `<div class="gap-item"><span class="err">⚠</span> <b>${esc(t.table)}</b> — no changeset. Click its node to assert.</div>`).join("") : ""}
+    ${orphans.length ? `<h4 class="warn">Orphan topics</h4>` + orphans.map((t) => `<div class="gap-item"><span class="warn">⚠</span> <b>${esc(t.topic)}</b> — ${t.warnings.orphan_produce ? "no consumer" : "no producer"} found. Often a real bug: investigate before silencing.</div>`).join("") : ""}
+    ${uncalled.length ? `<h4 class="warn">Endpoints with no caller</h4>` + uncalled.slice(0, 10).map((e) => `<div class="gap-item"><span class="warn">⚠</span> ${esc(e.method)} <b>${esc(e.path)}</b><div class="site"><a data-open="${esc(e.file)}:${e.line}">${esc(e.file)}:${e.line}</a></div></div>`).join("") : ""}`;
+  bindDetailHandlers(g);
+}
+
+function bindDetailHandlers(root) {
+  root.querySelectorAll("a[data-open]").forEach((a) => a.addEventListener("click", () => {
+    const [p, l] = a.dataset.open.split(/:(?=\d+$)/);
+    vscode.postMessage({ type: "openFile", path: p, line: Number(l) || 1 });
+  }));
+  root.querySelectorAll("form.annotate").forEach((f) => f.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const fd = new FormData(f);
+    if (f.dataset.note) {
+      const summary = (fd.get("summary") || "").toString().trim();
+      if (summary.length < 40) { toast("Note must be at least 40 characters, write something an agent can use.", true); return; }
+      vscode.postMessage({ type: "annotate", payload: { action: "insight", target: f.dataset.note, kind: f.dataset.kind, summary } });
+    } else if (f.dataset.assert) {
+      const base = JSON.parse(f.dataset.assert);
+      const evidence = (fd.get("evidence") || "").toString().trim();
+      if (evidence.length < 20) { toast("Evidence must be at least 20 characters, quote the code that convinced you.", true); return; }
+      const payload = { action: "assert", ...base, evidence, confidence: (fd.get("confidence") || "medium").toString() };
+      if (fd.get("topic")) payload.topic = fd.get("topic").toString().trim();
+      vscode.postMessage({ type: "annotate", payload });
+    }
+  }));
+}
+
+window.addEventListener("message", (ev) => {
+  const m = ev.data;
+  if (m.type === "data") { G = m.graph; render(m.keepPositions); renderGaps(); if (selected) resetDetails(); }
+  if (m.type === "toast") toast(m.message, m.isError);
+});
+document.getElementById("refresh").addEventListener("click", () => vscode.postMessage({ type: "refresh" }));
+document.getElementById("fit").addEventListener("click", () => cy && cy.fit(undefined, 30));
+for (const id of ["tTopics", "tTables", "tTests"]) {
+  document.getElementById(id).addEventListener("change", () => { render(false); renderGaps(); });
+}
+vscode.postMessage({ type: "ready" });
+</script>
+</body>
+</html>

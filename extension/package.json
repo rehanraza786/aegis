@@ -53,6 +53,14 @@
       {
         "command": "aegis.update",
         "title": "AEGIS: Update Workspace Payload (preserves config & index)"
+      },
+      {
+        "command": "aegis.graph",
+        "title": "AEGIS: Open Graph View (visualize & annotate)"
+      },
+      {
+        "command": "aegis.docgen",
+        "title": "AEGIS: Generate Flow Docs & Progress Report"
       }
     ],
     "mcpServerDefinitionProviders": [
