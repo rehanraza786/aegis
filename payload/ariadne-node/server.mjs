@@ -561,7 +561,13 @@ tool(server, "assert_edge",
 
     const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
     let list = [];
-    try { list = JSON.parse(fs.readFileSync(af, "utf8")); } catch { /* first one */ }
+    if (fs.existsSync(af)) {
+      // Never clobber: a malformed file (merge-conflict marker, stray comma) must
+      // not silently erase the team's accumulated assertions.
+      try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
+      catch (e) { return `docs/graph-assertions.json exists but is not valid JSON (${e.message}). Fix or remove it first; refusing to overwrite the team's assertions.`; }
+      if (!Array.isArray(list)) return "docs/graph-assertions.json is not a JSON array. Fix it first; refusing to overwrite the team's assertions.";
+    }
     const rec = { ...a, author: "assistant", source_hash: hash, asserted_at: new Date().toISOString().slice(0, 10) };
     // replace an identical prior assertion rather than duplicating
     list = list.filter((x) => !(x.kind === a.kind && x.file === a.file && x.line === a.line
