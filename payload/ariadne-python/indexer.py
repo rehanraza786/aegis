@@ -81,7 +81,7 @@ LANG_BY_EXT = {
     ".ts": "typescript", ".tsx": "typescript", ".java": "java", ".cs": "csharp",
     ".go": "go", ".rs": "rust", ".rb": "ruby", ".php": "php", ".c": "c", ".h": "c",
     ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp", ".kt": "kotlin", ".kts": "kotlin", ".gradle": "config", ".swift": "swift",
-    ".scala": "scala", ".sql": "sql", ".sh": "shell", ".yaml": "config", ".yml": "config",
+    ".scala": "scala", ".sql": "sql", ".sh": "shell", ".yaml": "config", ".yml": "config", ".properties": "config",
     ".toml": "config", ".json": "config", ".xml": "config", ".md": "docs", ".pdf": "docs",
 }
 LANG_BY_EXT.update(_cfg.get("extraExtensions", {}))  # user mappings override built-ins
@@ -767,10 +767,12 @@ def kafka_pass(con, scope_prefixes=None):
     for t in ("msg_edges", "db_access", "http_endpoints", "http_calls"):
         con.execute(f"DELETE FROM {t} WHERE source LIKE 'asserted%'")
     af = REPO_ROOT / "docs" / "graph-assertions.json"
-    try:
-        alist = json.loads(af.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        alist = []
+    alist = []
+    if af.exists():
+        try:
+            alist = json.loads(af.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            log.warning("docs/graph-assertions.json is not valid JSON (%s); assertions stay out of the graph until it is fixed", e)
     if isinstance(alist, list) and alist:
         loaded = stale = 0
         for a in alist:
@@ -899,6 +901,15 @@ def full_index(con, rebuild=False):
         except sqlite3.OperationalError:
             pass
     files = list(repo_files())
+    # A transient git failure (held index.lock, timeout, git missing) makes
+    # repo_files() yield nothing — without this guard the prune loop below would
+    # silently delete every row in the index. --rebuild still forces through.
+    if not files and not rebuild:
+        existing = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        if existing:
+            log.warning("git returned 0 tracked files but the index holds %d; "
+                        "refusing to prune (transient git failure?). Run --rebuild to force.", existing)
+            return
     tracked = set(files)
     removed = 0
     for (p,) in con.execute("SELECT path FROM files").fetchall():
