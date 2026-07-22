@@ -730,7 +730,7 @@ await c.close();
             "import sys, os, json; os.chdir(r'" + str(ws) + "'); sys.path.insert(0, r'" + str(ar) + "'); "
             "import server; r = json.loads(server.decisions(target='orders.created')); "
             "assert any(x['id'] == 'ADR-012' for x in r), r; "
-            "assert 'lineage' or server.decision_trace('ADR-007'); print('MCP_SMOKE_OK')"], ws)
+            "t = server.decision_trace('ADR-007'); assert 'ADR-012' in t, t; print('MCP_SMOKE_OK')"], ws)
         check("MCP smoke (module surface)", code == 0 and "MCP_SMOKE_OK" in om, om[-300:])
 
     # ---- docgen ----
