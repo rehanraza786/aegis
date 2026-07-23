@@ -124,7 +124,8 @@ public class PaymentEntity {
   </changeSet>
 </databaseChangeLog>
 """)
-    w(o / "src/main/resources/application.yaml", "app:\n  kafka:\n    payments-topic: payments.completed\n")
+    w(o / "src/main/resources/application.yaml",
+      "app:\n  kafka:\n    payments-topic: payments.completed\n    orders-topic: orders.created\n")
 
     # ---- billing-service: listener + placeholder producer + dao + SQL changelog ----
     b = ws / "billing-service"
@@ -146,7 +147,14 @@ public class PaymentDao {
 --changeset carol:010
 CREATE TABLE payments (id BIGINT PRIMARY KEY, order_id BIGINT);
 """)
-    w(b / "src/main/resources/application.yaml", "app:\n  kafka:\n    payments-topic: payments.completed\n")
+    w(b / "src/main/resources/application.yaml",
+      "app:\n  kafka:\n    payments-topic: payments.completed\n    refunds-topic: refunds.requested\n")
+    w(b / "src/main/java/com/acme/AuditForwarder.java", """package com.acme;
+public class AuditForwarder {
+  private final JmsTemplate jmsTemplate;
+  public void forward(Object evt) { jmsTemplate.convertAndSend("audit.q", evt); }
+}
+""")
 
     # ---- web-app: axios/fetch clients ----
     f = ws / "web-app"
@@ -162,6 +170,77 @@ export const legacy = () => fetch("/api/v1/reports");
 export const track = () => bus.emit("clicks.raw", { at: Date.now() });
 bus.on("clicks.raw", (e) => console.debug(e));
 """)
+    # ---- non-JVM seams (built in, not extension): Express/Nest endpoints,
+    # amqplib, FastAPI + requests, SQLAlchemy + driver SQL + pika, and
+    # Prisma/Rails/Flyway/Alembic schema definitions
+    w(f / "server/app.ts", """import express from "express";
+const app = express();
+app.get("/api/cart", (req, res) => res.json(cart));
+app.post("/api/cart/checkout", (req, res) => res.json(checkout(req)));
+""")
+    w(f / "server/items.controller.ts", """import { Controller, Get } from "@nestjs/common";
+@Controller("v2")
+export class ItemsController {
+  @Get("items")
+  list() { return this.svc.all(); }
+}
+""")
+    w(f / "server/queue.ts", """import amqplib from "amqplib";
+export async function wire(ch) {
+  await ch.assertQueue("emails.outbound");
+  ch.consume("emails.outbound", (m) => deliver(m));
+  ch.sendToQueue("emails.outbound", Buffer.from("hi"));
+}
+""")
+    w(f / "api-py/main.py", '''import requests
+from fastapi import FastAPI
+app = FastAPI()
+
+
+@app.get("/api/py/health")
+def health():
+    return {"ok": True}
+
+
+def forward_checkout(payload):
+    return requests.post("http://gateway/api/cart/checkout", json=payload)
+''')
+    w(f / "api-py/etl.py", '''import pika
+from sqlalchemy import create_engine
+
+
+class CartItem:
+    __tablename__ = "cart_items"
+
+
+def publish_digest(ch, engine):
+    engine.execute("SELECT id, qty FROM cart_items WHERE qty > 0")
+    ch.basic_publish(exchange="", routing_key="emails.outbound", body=b"digest")
+''')
+    w(f / "prisma/schema.prisma", """model CartItem {
+  id  Int @id
+  qty Int
+  @@map("cart_items")
+}
+
+model AbandonedCart {
+  id Int @id
+}
+""")
+    w(f / "db/migrate/20240101_add_carts.rb", """class AddCarts < ActiveRecord::Migration[7.0]
+  def change
+    create_table "carts" do |t|
+      t.integer :user_id
+    end
+  end
+end
+""")
+    w(f / "db/migration/V2__add_sessions.sql", "CREATE TABLE sessions (id bigint primary key, token text);\n")
+    w(f / "api-py/migrations/versions/001_py_audit.py", '''revision = "a1b2c3"
+
+def upgrade(op):
+    op.create_table("py_audit")
+''')
 
     # ---- stream-service: Spring Cloud Stream bindings + Kotlin + Gradle ----
     s = ws / "stream-service"
@@ -791,6 +870,10 @@ await c.close();
           any(t.get("warnings", {}).get("drift_no_changeset") for t in gx.get("tables", [])))
     check("graph export: unresolved expression lands in gaps worklist",
           bool(gx.get("gaps", {}).get("unresolved_topic_expressions")))
+    check("graph export: config declarations link topics and flag unused ones",
+          any(t.get("config_keys") for t in gx.get("topics", []))
+          and any(g.get("topic") == "refunds.requested"
+                  for g in gx.get("gaps", {}).get("topics_declared_in_config_but_unused", [])))
 
     an = str(ar / ("annotate.mjs" if rt == "node" else "annotate.py"))
     code, oan = run(exe + [an, json.dumps({
@@ -818,6 +901,44 @@ await c.close();
     db.close()
     check("annotate: asserted edge enters the graph with human provenance",
           srow is not None and srow[0] == "asserted:human", str(srow))
+
+    # ---- non-JVM seams: endpoints, migrations, brokers, config-declared topics ----
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    db.row_factory = sqlite3.Row
+    q3 = lambda sql, *a: db.execute(sql, a).fetchall()  # noqa: E731
+    check("express endpoint extracted",
+          q3("SELECT 1 FROM http_endpoints WHERE detail LIKE 'Express%' AND norm='/api/cart'") != [])
+    check("nest endpoint gets its controller prefix",
+          q3("SELECT 1 FROM http_endpoints WHERE detail LIKE 'Nest%' AND norm='/v2/items'") != [])
+    check("fastapi endpoint extracted",
+          q3("SELECT 1 FROM http_endpoints WHERE detail LIKE 'FastAPI%' AND norm='/api/py/health'") != [])
+    check("cross-language http correlation (python requests -> express endpoint)",
+          q3("SELECT 1 FROM http_calls WHERE client='requests' AND norm='/api/cart/checkout'") != []
+          and q3("SELECT 1 FROM http_endpoints WHERE norm='/api/cart/checkout'") != [])
+    check("prisma model defines its @@map table",
+          q3("SELECT 1 FROM db_defs WHERE tbl='cart_items' AND changeset LIKE 'prisma:%'") != [])
+    check("rails migration defines table",
+          q3("SELECT 1 FROM db_defs WHERE tbl='carts' AND changeset LIKE 'rails:%'") != [])
+    check("alembic revision defines table",
+          q3("SELECT 1 FROM db_defs WHERE tbl='py_audit' AND changeset LIKE 'alembic:%'") != [])
+    check("flyway sql tagged with its migration filename",
+          q3("SELECT 1 FROM db_defs WHERE tbl='sessions' AND changeset LIKE 'V2__%'") != [])
+    check("sqlalchemy model is an entity access site",
+          q3("SELECT 1 FROM db_access WHERE tbl='cart_items' AND kind='entity' AND detail LIKE 'SQLAlchemy%'") != [])
+    check("literal driver SQL is an access site",
+          q3("SELECT 1 FROM db_access WHERE tbl='cart_items' AND detail='driver SQL'") != [])
+    check("rabbit queue crosses languages with its system label",
+          {r[0] for r in q3("SELECT DISTINCT direction FROM msg_edges WHERE topic='emails.outbound' AND system='rabbit'")}
+          == {"produce", "consume"})
+    check("jmsTemplate no longer masquerades as kafka",
+          q3("SELECT 1 FROM msg_edges WHERE topic='audit.q' AND system='jms' AND direction='produce'") != []
+          and q3("SELECT 1 FROM msg_edges WHERE topic='audit.q' AND system='kafka'") == [])
+    check("config-declared topics recorded with their keys",
+          q3("SELECT 1 FROM msg_topics WHERE topic='orders.created' AND config_key LIKE '%orders-topic'") != [])
+    check("declared-but-unused topic detectable (refunds.requested)",
+          q3("SELECT 1 FROM msg_topics WHERE topic='refunds.requested'") != []
+          and q3("SELECT 1 FROM msg_edges WHERE topic='refunds.requested'") == [])
+    db.close()
 
     # ---- plugin hooks: pass extension populated todos table ----
     db = sqlite3.connect(ws / ".ariadne" / "index.db")

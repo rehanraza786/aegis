@@ -25,6 +25,18 @@ The post-review release. Highlights, roughly in the order they landed:
 - **Extensibility:** extractor hooks accept a file scope (`{ fn, files: /\.go$/ }`)
   and run over any tracked file, making non-JVM stacks first-class; sample
   file-scoped extractor included.
+- **Non-JVM seams built in:** endpoints from Express/Fastify/Router, Nest,
+  Flask, and FastAPI; Python `requests`/`httpx` callers (cross-language HTTP
+  correlation); Flyway/Prisma/Rails/Alembic schema definitions; SQLAlchemy and
+  literal driver SQL access; RabbitMQ (amqplib/pika/`@RabbitListener`), JMS,
+  SQS, and NATS edges labeled by `system` — and `rabbitTemplate`/`jmsTemplate`
+  no longer masquerade as Kafka producers.
+- **Config-validated messaging seam:** topic-ish keys in `application*` config
+  are recorded as declarations; topics declared but never used are flagged
+  (the messaging twin of table drift), topics link to the config keys that
+  declare them, and hardcoded literals for declared topics get a
+  hoist-to-config note — in `message_flow`, `graph_gaps`, the graph export,
+  and the graph view's worklist.
 - **Security:** `.ariadne/extensions/` is gated by explicit, committed,
   PR-reviewed approval (`--approve-extensions` → `extensions.lock`); the VS Code
   extension spawns with argument arrays (no shell interpolation); dependency

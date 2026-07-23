@@ -11,9 +11,9 @@ import Database from "better-sqlite3";
 import { initAst, extractAst } from "./ast.mjs";
 const AST_LANGS = new Set(["java", "kotlin", "typescript", "javascript", "python"]);
 let astReady = false;
-import { loadConfigMap, loadConstants, extractKafkaEdges } from "./kafka.mjs";
-import { isChangelog, extractChangelog, extractEntities, extractDbAccess, extractLombokSymbols } from "./db.mjs";
-import { extractJavaHttp, extractTsHttp, normalizePath as normalizeAssertedPath } from "./http.mjs";
+import { loadConfigMap, loadConstants, extractKafkaEdges, extractBrokerEdges } from "./kafka.mjs";
+import { isChangelog, extractChangelog, isSchemaFile, extractSchemaDefs, extractEntities, extractDbAccess, extractGenericDbAccess, extractLombokSymbols } from "./db.mjs";
+import { extractJavaHttp, extractTsHttp, extractTsEndpoints, extractPyHttp, normalizePath as normalizeAssertedPath } from "./http.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -100,7 +100,7 @@ const LANG_BY_EXT = {
   ".go": "go", ".rs": "rust", ".rb": "ruby", ".php": "php", ".c": "c", ".h": "c",
   ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp", ".kt": "kotlin", ".kts": "kotlin", ".gradle": "config", ".swift": "swift",
   ".scala": "scala", ".sql": "sql", ".sh": "shell", ".yaml": "config", ".yml": "config", ".properties": "config",
-  ".toml": "config", ".json": "config", ".xml": "config", ".md": "docs", ".pdf": "docs", ...config.extraExtensions,
+  ".toml": "config", ".json": "config", ".xml": "config", ".prisma": "config", ".md": "docs", ".pdf": "docs", ...config.extraExtensions,
 };
 
 // classifies WHERE a file lives (test vs production), decided once at index time;
@@ -288,6 +288,13 @@ function connect() {
       system TEXT DEFAULT 'kafka', topic TEXT, direction TEXT,
       line INTEGER, resolved INTEGER, via TEXT);
     CREATE INDEX IF NOT EXISTS idx_msg_topic ON msg_edges(topic);
+    -- topics DECLARED in application config: the seam's source of truth, so the
+    -- graph can validate code against it (declared-but-unused, hardcoded-literal)
+    CREATE TABLE IF NOT EXISTS msg_topics(
+      file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+      topic TEXT, config_key TEXT, line INTEGER);
+    CREATE INDEX IF NOT EXISTS idx_msgtopics_topic ON msg_topics(topic);
+    CREATE INDEX IF NOT EXISTS idx_msgtopics_file ON msg_topics(file_id);
     CREATE TABLE IF NOT EXISTS db_defs(
       file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
       tbl TEXT, op TEXT, line INTEGER, changeset TEXT);
@@ -581,7 +588,7 @@ async function kafkaPass(db, scopePrefixes = null) {
   // ---- scope: re-extract only the FILES whose content actually changed ----
   // A global change (config value, topic constant, entity mapping) can alter how
   // every other file resolves, so that widens automatically to a full re-extract.
-  const candidates = tracked.filter((p) => /\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs)$/.test(p) || inExtFiles(p));
+  const candidates = tracked.filter((p) => /\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs|py|rb|prisma)$/.test(p) || inExtFiles(p));
   const dirty = new Set();
   if (mapsChanged) {
     for (const p of candidates) dirty.add(p);
@@ -630,17 +637,46 @@ async function kafkaPass(db, scopePrefixes = null) {
     }
   };
 
-  // ---- Kafka ----
+  // ---- Messaging (Kafka + Rabbit/JMS/SQS/NATS via the same table) ----
   scopedDelete("msg_edges");
-  const ins = db.prepare("INSERT INTO msg_edges(file_id, topic, direction, line, resolved, via) VALUES(?,?,?,?,?,?)");
+  // config-DECLARED topics: application config is the seam's source of truth;
+  // recording declarations lets tools flag topics declared but never used and
+  // code that hardcodes a name its config already declares
+  scopedDelete("msg_topics");
+  const insDecl = db.prepare("INSERT INTO msg_topics(file_id, topic, config_key, line) VALUES(?,?,?,?)");
+  for (const rel of cfgPaths) {
+    if (!inScope(rel)) continue;
+    const fid = idByPath.get(rel)?.id;
+    const text = readText(rel);
+    if (!fid || text == null) continue;
+    for (const [key, value] of loadConfigMap(REPO_ROOT, [rel], () => {})) {
+      if (!/topic|queue|destination|subject/i.test(key) || !value) continue;
+      const tail = key.split(".").pop().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const lm = text.match(new RegExp(`(?:^|\\n)[^\\n]*${tail}\\s*[:=][^\\n]*`));
+      const line = lm ? text.slice(0, lm.index + 1).split("\n").length : 1;
+      insDecl.run(fid, String(value), key, line);
+    }
+  }
+  const ins = db.prepare("INSERT INTO msg_edges(file_id, topic, direction, line, resolved, via, system) VALUES(?,?,?,?,?,?,?)");
   let n = 0;
   for (const rel of javaish) {
     if (!inScope(rel)) continue;
     const text = readText(rel);
     const fid = idByPath.get(rel)?.id;
-    if (!fid || text == null || !/Kafka|ProducerRecord|\.send\s*\(|subscribe/.test(text)) continue;
+    if (!fid || text == null || !/Kafka|ProducerRecord|\.send\s*\(|subscribe|convertAndSend|RabbitListener|JmsListener/.test(text)) continue;
     for (const e of extractKafkaEdges(text, configMap, overlay(constants, rel, "constants"))) {
-      ins.run(fid, e.topic, e.direction, e.line, e.resolved ? 1 : 0, e.via);
+      ins.run(fid, e.topic, e.direction, e.line, e.resolved ? 1 : 0, e.via, e.system ?? "kafka");
+      n++;
+    }
+  }
+  // broker clients outside the JVM: amqplib/pika/boto3/nats in TS/JS/Python
+  for (const rel of tracked) {
+    if (!/\.(ts|tsx|js|jsx|mjs|py)$/.test(rel) || !inScope(rel)) continue;
+    const text = readText(rel);
+    const fid = idByPath.get(rel)?.id;
+    if (!fid || text == null || !/sendToQueue|assertQueue|basic_publish|basic_consume|QueueUrl|amqplib|amqp:\/\/|\bnats\b|import\s+pika/.test(text)) continue;
+    for (const e of extractBrokerEdges(text)) {
+      ins.run(fid, e.topic, e.direction, e.line, 1, e.via, e.system);
       n++;
     }
   }
@@ -651,11 +687,11 @@ async function kafkaPass(db, scopePrefixes = null) {
     const fid = idByPath.get(rel)?.id;
     if (!fid || text == null) continue;
     runX("kafka", [text, { configMap, constants, relpath: rel }],
-      (e) => { ins.run(fid, e.topic, e.direction, e.line, e.resolved === false ? 0 : 1, e.via ?? null); n++; });
+      (e) => { ins.run(fid, e.topic, e.direction, e.line, e.resolved === false ? 0 : 1, e.via ?? null, e.system ?? "kafka"); n++; });
   }
   runXFiltered("kafka", (rel) => ({ configMap, constants, relpath: rel }),
-    (e, fid) => { ins.run(fid, e.topic, e.direction, e.line, e.resolved === false ? 0 : 1, e.via ?? null); n++; });
-  if (n) log("INFO", `Kafka: ${n} message edges`);
+    (e, fid) => { ins.run(fid, e.topic, e.direction, e.line, e.resolved === false ? 0 : 1, e.via ?? null, e.system ?? "kafka"); n++; });
+  if (n) log("INFO", `Messaging: ${n} edges`);
 
   // ---- DB definitions (changelogs) + access ----
   scopedDelete("db_defs"); scopedDelete("db_access");
@@ -668,6 +704,22 @@ async function kafkaPass(db, scopePrefixes = null) {
     if (text == null || !isChangelog(rel, text)) continue;
     const fid = idByPath.get(rel)?.id;
     for (const d of extractChangelog(rel, text)) { insDef.run(fid ?? null, d.table, d.op, d.line, d.changeset); defs++; }
+  }
+  // schema definitions beyond Liquibase/Flyway: Prisma, Rails, Alembic
+  for (const rel of tracked) {
+    if (!/\.(prisma|rb|py)$/.test(rel) || !inScope(rel)) continue;
+    const text = readText(rel);
+    if (text == null || !isSchemaFile(rel, text)) continue;
+    const fid = idByPath.get(rel)?.id;
+    for (const d of extractSchemaDefs(rel, text)) { insDef.run(fid ?? null, d.table, d.op, d.line, d.changeset); defs++; }
+  }
+  // DB access beyond the JVM: SQLAlchemy models + literal driver SQL
+  for (const rel of tracked) {
+    if (!/\.(py|ts|tsx|js|jsx|mjs|rb)$/.test(rel) || !inScope(rel)) continue;
+    const text = readText(rel);
+    const fid = idByPath.get(rel)?.id;
+    if (!fid || text == null || !/__tablename__|\bTable\s*\(|execute|exec_driver_sql|\.query\s*\(|\.raw\s*\(/.test(text)) continue;
+    for (const a of extractGenericDbAccess(text)) { insAcc.run(fid, a.table, a.kind, a.mode, a.line, a.detail); accs++; }
   }
   const delSynth = db.prepare("DELETE FROM symbols WHERE file_id=? AND signature LIKE '%Lombok-generated%'");
   const insSynth = db.prepare("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,?)");
@@ -719,8 +771,23 @@ async function kafkaPass(db, scopePrefixes = null) {
     const text = readText(rel);
     const fid = idByPath.get(rel)?.id;
     if (!fid || text == null) continue;
-    if (!/fetch\s*\(|axios|\.(get|post|put|delete|patch)\s*(<[^>]*>)?\s*\(\s*[\x60"']/.test(text)) continue;
-    for (const c of extractTsHttp(text)) { insCall.run(fid, c.method, c.path, c.norm, c.line, c.client); hcalls++; }
+    if (/fetch\s*\(|axios|\.(get|post|put|delete|patch)\s*(<[^>]*>)?\s*\(\s*[\x60"']/.test(text)) {
+      for (const c of extractTsHttp(text)) { insCall.run(fid, c.method, c.path, c.norm, c.line, c.client); hcalls++; }
+    }
+    // Express/Fastify/Router registrations + Nest controllers as ENDPOINTS
+    if (/\b(?:app|router|server|fastify)\s*\.\s*(?:get|post|put|delete|patch|head|all)\s*\(|@Controller/.test(text)) {
+      for (const e of extractTsEndpoints(text)) { insEp.run(fid, e.method, e.path, e.norm, e.line, e.detail); eps++; }
+    }
+  }
+  // Python HTTP seam: Flask/FastAPI endpoints + requests/httpx calls
+  for (const rel of tracked) {
+    if (!rel.endsWith(".py") || !inScope(rel)) continue;
+    const text = readText(rel);
+    const fid = idByPath.get(rel)?.id;
+    if (!fid || text == null || !/@\w+\.(?:route|get|post|put|delete|patch|head)\s*\(|requests\.|httpx/.test(text)) continue;
+    const r = extractPyHttp(text);
+    for (const e of r.endpoints) { insEp.run(fid, e.method, e.path, e.norm, e.line, e.detail); eps++; }
+    for (const c of r.calls) { insCall.run(fid, c.method, c.path, c.norm, c.line, c.client); hcalls++; }
   }
   if (eps || hcalls) log("INFO", `HTTP: ${eps} endpoints, ${hcalls} client calls`);
   for (const p of dirty) {

@@ -97,11 +97,17 @@ modules = [{"id": name,
            for name, s in sorted(services.items(), key=lambda kv: -kv[1]["files"])[:MAX_MODULES]]
 
 # ---- topics ----
-mrows = q(f"SELECT m.topic, m.direction, m.line, m.via, m.resolved, m.source, f.path{T} "
+mrows = q(f"SELECT m.topic, m.direction, m.line, m.via, m.resolved, m.source, m.system, f.path{T} "
           "FROM msg_edges m JOIN files f ON f.id=m.file_id ORDER BY m.topic, m.line") if has("msg_edges") else []
 by_topic = {}
 for r in mrows:
     by_topic.setdefault(r["topic"], []).append(r)
+# config-declared topics: the seam's source of truth (validation + linkage)
+decl_rows = q("SELECT t.topic, t.config_key, f.path, t.line FROM msg_topics t "
+              "JOIN files f ON f.id=t.file_id ORDER BY t.topic") if has("msg_topics") else []
+decl_by_topic = {}
+for r in decl_rows:
+    decl_by_topic.setdefault(r["topic"], []).append(r["config_key"])
 topics = []
 for topic, rows in by_topic.items():
     prod = [r for r in rows if r["direction"] == "produce" and not (HAS_TEST and r["is_test"])]
@@ -116,7 +122,10 @@ for topic, rows in by_topic.items():
         warnings["test_only"] = True
     if any(not r["resolved"] for r in rows):
         warnings["unresolved_expression"] = True
+    systems = sorted({(r["system"] if "system" in r.keys() else None) or "kafka" for r in rows})
     t = {"topic": topic,
+         **({} if systems == ["kafka"] else {"system": "+".join(systems)}),
+         **({"config_keys": sorted(set(decl_by_topic[topic]))} if topic in decl_by_topic else {}),
          "producers": capped([site(r) for r in prod], MAX_SITES),
          "consumers": capped([site(r) for r in cons], MAX_SITES),
          "warnings": warnings}
@@ -171,9 +180,14 @@ for e in [e for e in eps if not (HAS_TEST and e["is_test"])]:
 endpoints = warn_first(endpoints, MAX_ITEMS, lambda e: n_sites(e["callers"]))
 
 # ---- gaps ----
-gaps = {"unresolved_topic_expressions": [
-    {"expression": r["topic"], "direction": r["direction"], "path": r["path"], "line": r["line"]}
-    for r in mrows if not r["resolved"] and not (HAS_TEST and r["is_test"])][:MAX_ITEMS]}
+gaps = {
+    "unresolved_topic_expressions": [
+        {"expression": r["topic"], "direction": r["direction"], "path": r["path"], "line": r["line"]}
+        for r in mrows if not r["resolved"] and not (HAS_TEST and r["is_test"])][:MAX_ITEMS],
+    "topics_declared_in_config_but_unused": [
+        {"topic": r["topic"], "config_key": r["config_key"], "path": r["path"], "line": r["line"]}
+        for r in decl_rows if r["topic"] not in by_topic][:MAX_ITEMS],
+}
 
 # ---- annotations ----
 file_hash = {r["path"]: r["hash"] for r in q("SELECT path, hash FROM files")}

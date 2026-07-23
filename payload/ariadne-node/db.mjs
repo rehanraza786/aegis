@@ -36,6 +36,53 @@ export function isChangelog(relpath, text) {
   return /databaseChangeLog|--\s*liquibase formatted sql/i.test(text);
 }
 
+// ---------- Migrations beyond Liquibase: Prisma, Rails, Alembic ----------
+const PRISMA_MODEL_RE = /\bmodel\s+(\w+)\s*\{([^}]*)\}/g;
+const PRISMA_MAP_RE = /@@map\s*\(\s*"([^"]+)"\s*\)/;
+const RAILS_OPS = [
+  [/\bcreate_table\s+["':]([\w]+)/g, "create"],
+  [/\b(?:add_column|change_column|add_index|remove_column|rename_column|add_reference)\s+["':]([\w]+)/g, "alter"],
+  [/\bdrop_table\s+["':]([\w]+)/g, "drop"],
+];
+const ALEMBIC_OPS = [
+  [/\bop\.create_table\s*\(\s*["']([\w]+)/g, "create"],
+  [/\bop\.(?:add_column|alter_column|create_index|drop_column|create_foreign_key)\s*\(\s*["']([\w]+)/g, "alter"],
+  [/\bop\.drop_table\s*\(\s*["']([\w]+)/g, "drop"],
+];
+const ALEMBIC_REV_RE = /^revision\s*=\s*["']([\w]+)["']/m;
+
+/** Schema-defining files in non-Liquibase formats. */
+export function isSchemaFile(relpath, text) {
+  if (relpath.endsWith(".prisma")) return /\bmodel\s+\w+\s*\{/.test(text);
+  if (relpath.endsWith(".rb")) return (/(^|\/)db\/(schema\.rb$|migrate\/)/.test(relpath)) && /create_table|add_column|drop_table/.test(text);
+  if (relpath.endsWith(".py")) return /\bop\.(create_table|add_column|alter_column|drop_table)/.test(text) && /(migrations?|alembic|versions)\//.test(relpath);
+  return false;
+}
+
+/** [{table, op, line, changeset}] from Prisma schema / Rails schema+migrations / Alembic revisions. */
+export function extractSchemaDefs(relpath, text) {
+  const out = [];
+  const lineAt = (i) => text.slice(0, i).split("\n").length;
+  const stem = relpath.split("/").pop().replace(/\.\w+$/, "");
+  if (relpath.endsWith(".prisma")) {
+    for (const m of text.matchAll(PRISMA_MODEL_RE)) {
+      // Prisma tables are the model name verbatim unless @@map overrides
+      const table = (m[2].match(PRISMA_MAP_RE)?.[1] ?? m[1]).toLowerCase();
+      out.push({ table, op: "create", line: lineAt(m.index), changeset: `prisma:${m[1]}` });
+    }
+    return out;
+  }
+  const opsets = relpath.endsWith(".rb") ? RAILS_OPS : ALEMBIC_OPS;
+  const tag = relpath.endsWith(".rb")
+    ? (relpath.endsWith("schema.rb") ? "rails:schema" : `rails:${stem}`)
+    : `alembic:${text.match(ALEMBIC_REV_RE)?.[1] ?? stem}`;
+  for (const [re, op] of opsets) {
+    re.lastIndex = 0;
+    for (const m of text.matchAll(re)) out.push({ table: m[1].toLowerCase(), op, line: lineAt(m.index), changeset: tag });
+  }
+  return out;
+}
+
 /** Returns [{table, op, line, changeset}] from one changelog file. */
 export function extractChangelog(relpath, text) {
   const out = [];
@@ -48,6 +95,9 @@ export function extractChangelog(relpath, text) {
   changesets.sort((a, b) => a.idx - b.idx);
   const csAt = (i) => { let last = null; for (const c of changesets) { if (c.idx <= i) last = c.id; else break; } return last; };
 
+  // Flyway-style versioned SQL (V2__add_x.sql) carries no liquibase changeset
+  // comment; tag its ops with the migration filename so history stays legible
+  const fileTag = relpath.match(/(^|\/)((?:[VUR]\d*|R)__[^/]+)\.sql$/i)?.[2] ?? null;
   const opsets = relpath.endsWith(".xml") ? XML_OPS : relpath.endsWith(".sql") ? [] : YAML_OPS;
   for (const [re, op] of opsets) {
     re.lastIndex = 0;
@@ -58,7 +108,7 @@ export function extractChangelog(relpath, text) {
   // raw SQL in .sql files and <sql> blocks
   for (const m of text.matchAll(SQL_DDL_RE)) {
     const op = /^CREATE/i.test(m[1]) ? "create" : /^DROP/i.test(m[1]) ? "drop" : "alter";
-    out.push({ table: m[2].split(".").pop().toLowerCase(), op, line: lineAt(m.index), changeset: csAt(m.index) });
+    out.push({ table: m[2].split(".").pop().toLowerCase(), op, line: lineAt(m.index), changeset: csAt(m.index) ?? fileTag });
   }
   return out;
 }
@@ -131,6 +181,37 @@ export function extractLombokSymbols(text) {
     }
   }
   return out;
+}
+
+// ---------- Generic access beyond the JVM: SQLAlchemy + literal driver SQL ----------
+const SA_TABLENAME_RE = /__tablename__\s*=\s*["']([\w]+)["']/g;
+const SA_TABLE_RE = /\bTable\s*\(\s*["']([\w]+)["']/g;
+const EXEC_SQL_RE = /\b(?:execute(?:many)?|query|raw|exec_driver_sql)\s*\(\s*(?:text\s*\(\s*)?(["'`])([\s\S]{0,400}?)\1/g;
+
+/** DB access in non-JVM code: SQLAlchemy models/tables and any driver call
+ *  with a literal SQL string (psycopg/sqlite3/knex/pg/generic execute/query). */
+export function extractGenericDbAccess(text) {
+  const out = [];
+  const lineAt = (i) => text.slice(0, i).split("\n").length;
+  for (const m of text.matchAll(SA_TABLENAME_RE)) {
+    out.push({ table: m[1].toLowerCase(), kind: "entity", mode: "rw", line: lineAt(m.index), detail: "SQLAlchemy __tablename__" });
+  }
+  for (const m of text.matchAll(SA_TABLE_RE)) {
+    out.push({ table: m[1].toLowerCase(), kind: "entity", mode: "rw", line: lineAt(m.index), detail: "SQLAlchemy Table" });
+  }
+  for (const m of text.matchAll(EXEC_SQL_RE)) {
+    const sql = m[2];
+    if (!/\b(FROM|JOIN|INTO|UPDATE|DELETE\s+FROM|MERGE\s+INTO)\b/i.test(sql)) continue;
+    const { tables, mode } = tablesFromSql(sql);
+    for (const t of tables) out.push({ table: t, kind: "sql", mode, line: lineAt(m.index), detail: "driver SQL" });
+  }
+  const seen = new Set();
+  return out.filter((e) => {
+    const k = `${e.table}|${e.kind}|${e.line}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 }
 
 export function extractDbAccess(text, entityTables, constants) {
