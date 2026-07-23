@@ -82,7 +82,7 @@ LANG_BY_EXT = {
     ".go": "go", ".rs": "rust", ".rb": "ruby", ".php": "php", ".c": "c", ".h": "c",
     ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp", ".kt": "kotlin", ".kts": "kotlin", ".gradle": "config", ".swift": "swift",
     ".scala": "scala", ".sql": "sql", ".sh": "shell", ".yaml": "config", ".yml": "config", ".properties": "config",
-    ".toml": "config", ".json": "config", ".xml": "config", ".md": "docs", ".pdf": "docs",
+    ".toml": "config", ".json": "config", ".xml": "config", ".prisma": "config", ".md": "docs", ".pdf": "docs",
 }
 LANG_BY_EXT.update(_cfg.get("extraExtensions", {}))  # user mappings override built-ins
 SKIP_DIRS = {".git", ".ariadne", "node_modules", "vendor", "dist", "build", "target",
@@ -235,6 +235,13 @@ CREATE TABLE IF NOT EXISTS msg_edges(
   system TEXT DEFAULT 'kafka', topic TEXT, direction TEXT,
   line INTEGER, resolved INTEGER, via TEXT);
 CREATE INDEX IF NOT EXISTS idx_msg_topic ON msg_edges(topic);
+-- topics DECLARED in application config: the seam's source of truth, so the
+-- graph can validate code against it (declared-but-unused, hardcoded-literal)
+CREATE TABLE IF NOT EXISTS msg_topics(
+  file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+  topic TEXT, config_key TEXT, line INTEGER);
+CREATE INDEX IF NOT EXISTS idx_msgtopics_topic ON msg_topics(topic);
+CREATE INDEX IF NOT EXISTS idx_msgtopics_file ON msg_topics(file_id);
 CREATE TABLE IF NOT EXISTS db_defs(
   file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
   tbl TEXT, op TEXT, line INTEGER, changeset TEXT);
@@ -586,10 +593,11 @@ def kafka_pass(con, scope_prefixes=None):
 
     def in_ext_files(p):
         return any(r.search(p) for r in ext_file_res)
-    from kafka_extract import load_config_map, load_constants, extract_kafka_edges
-    from db_extract import (is_changelog, extract_changelog, extract_entities,
-                            extract_db_access, extract_lombok_symbols)
-    from http_extract import extract_java_http, extract_ts_http
+    from kafka_extract import load_config_map, load_constants, extract_kafka_edges, extract_broker_edges
+    from db_extract import (is_changelog, extract_changelog, is_schema_file, extract_schema_defs,
+                            extract_entities, extract_db_access, extract_generic_db_access,
+                            extract_lombok_symbols)
+    from http_extract import extract_java_http, extract_ts_http, extract_ts_endpoints, extract_py_http
     tracked = list(repo_files())
     cfg = load_config_map(REPO_ROOT, tracked, log)
     rows = con.execute("SELECT id, path, hash FROM files").fetchall()
@@ -647,7 +655,7 @@ def kafka_pass(con, scope_prefixes=None):
         entity_tables[k] = str(v).lower()
 
     candidates = [p for p in tracked
-                  if re.search(r"\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs)$", p) or in_ext_files(p)]
+                  if re.search(r"\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs|py|rb|prisma)$", p) or in_ext_files(p)]
     if maps_changed:
         dirty = set(candidates)
     else:
@@ -696,17 +704,52 @@ def kafka_pass(con, scope_prefixes=None):
                     log.warning("extractor %s.%s on %s: %s", name, hook, rel, e)
 
     scoped_delete("msg_edges")
+    # config-DECLARED topics: application config is the seam's source of truth;
+    # recording declarations lets tools flag topics declared but never used and
+    # code that hardcodes a name its config already declares
+    scoped_delete("msg_topics")
+    for rel in cfg_paths:
+        if not in_scope(rel):
+            continue
+        fid = id_by_path.get(rel)
+        text = read_text(rel)
+        if not fid or text is None:
+            continue
+        for key, value in load_config_map(REPO_ROOT, [rel], log).items():
+            if not re.search(r"topic|queue|destination|subject", key, re.I) or not value:
+                continue
+            tail = re.escape(key.split(".")[-1])
+            lm = re.search(rf"(?:^|\n)[^\n]*{tail}\s*[:=][^\n]*", text)
+            line = text.count("\n", 0, lm.start() + 1) + 1 if lm else 1
+            con.execute("INSERT INTO msg_topics(file_id, topic, config_key, line) VALUES(?,?,?,?)",
+                        (fid, str(value), key, line))
     n = 0
     for rel in javaish:
         if not in_scope(rel):
             continue
         text = read_text(rel)
         fid = id_by_path.get(rel)
-        if not fid or text is None or not any(k in text for k in ("Kafka", "ProducerRecord", ".send(", "subscribe")):
+        if not fid or text is None or not any(k in text for k in
+                                              ("Kafka", "ProducerRecord", ".send(", "subscribe",
+                                               "convertAndSend", "RabbitListener", "JmsListener")):
             continue
         for e in extract_kafka_edges(text, cfg, overlay(constants, rel, "constants")):
-            con.execute("INSERT INTO msg_edges(file_id, topic, direction, line, resolved, via) VALUES(?,?,?,?,?,?)",
-                        (fid, e["topic"], e["direction"], e["line"], 1 if e["resolved"] else 0, e["via"]))
+            con.execute("INSERT INTO msg_edges(file_id, topic, direction, line, resolved, via, system) VALUES(?,?,?,?,?,?,?)",
+                        (fid, e["topic"], e["direction"], e["line"], 1 if e["resolved"] else 0, e["via"],
+                         e.get("system", "kafka")))
+            n += 1
+    # broker clients outside the JVM: amqplib/pika/boto3/nats in TS/JS/Python
+    for rel in tracked:
+        if not re.search(r"\.(ts|tsx|js|jsx|mjs|py)$", rel) or not in_scope(rel):
+            continue
+        text = read_text(rel)
+        fid = id_by_path.get(rel)
+        if not fid or text is None or not re.search(
+                r"sendToQueue|assertQueue|basic_publish|basic_consume|QueueUrl|amqplib|amqp://|\bnats\b|import\s+pika", text):
+            continue
+        for e in extract_broker_edges(text):
+            con.execute("INSERT INTO msg_edges(file_id, topic, direction, line, resolved, via, system) VALUES(?,?,?,?,?,?,?)",
+                        (fid, e["topic"], e["direction"], e["line"], 1, e["via"], e["system"]))
             n += 1
     for rel in javaish:
         if not in_scope(rel):
@@ -717,21 +760,21 @@ def kafka_pass(con, scope_prefixes=None):
             continue
         def _ins_kafka(e, fid=fid):
             nonlocal n
-            con.execute("INSERT INTO msg_edges(file_id, topic, direction, line, resolved, via) VALUES(?,?,?,?,?,?)",
+            con.execute("INSERT INTO msg_edges(file_id, topic, direction, line, resolved, via, system) VALUES(?,?,?,?,?,?,?)",
                         (fid, e["topic"], e["direction"], e["line"],
-                         0 if e.get("resolved") is False else 1, e.get("via")))
+                         0 if e.get("resolved") is False else 1, e.get("via"), e.get("system", "kafka")))
             n += 1
         run_x("kafka", (text, {"config": cfg, "constants": constants, "relpath": rel}), _ins_kafka)
 
     def _ins_kafka_f(e, fid):
         nonlocal n
-        con.execute("INSERT INTO msg_edges(file_id, topic, direction, line, resolved, via) VALUES(?,?,?,?,?,?)",
+        con.execute("INSERT INTO msg_edges(file_id, topic, direction, line, resolved, via, system) VALUES(?,?,?,?,?,?,?)",
                     (fid, e["topic"], e["direction"], e["line"],
-                     0 if e.get("resolved") is False else 1, e.get("via")))
+                     0 if e.get("resolved") is False else 1, e.get("via"), e.get("system", "kafka")))
         n += 1
     run_x_filtered("kafka", lambda rel: {"config": cfg, "constants": constants, "relpath": rel}, _ins_kafka_f)
     if n:
-        log.info("Kafka: %d message edges", n)
+        log.info("Messaging: %d edges", n)
 
     scoped_delete("db_defs")
     scoped_delete("db_access")
@@ -747,6 +790,31 @@ def kafka_pass(con, scope_prefixes=None):
             con.execute("INSERT INTO db_defs(file_id, tbl, op, line, changeset) VALUES(?,?,?,?,?)",
                         (fid, d["table"], d["op"], d["line"], d["changeset"]))
             defs += 1
+    # schema definitions beyond Liquibase/Flyway: Prisma, Rails, Alembic
+    for rel in tracked:
+        if not rel.endswith((".prisma", ".rb", ".py")) or not in_scope(rel):
+            continue
+        text = read_text(rel)
+        if text is None or not is_schema_file(rel, text):
+            continue
+        fid = id_by_path.get(rel)
+        for d in extract_schema_defs(rel, text):
+            con.execute("INSERT INTO db_defs(file_id, tbl, op, line, changeset) VALUES(?,?,?,?,?)",
+                        (fid, d["table"], d["op"], d["line"], d["changeset"]))
+            defs += 1
+    # DB access beyond the JVM: SQLAlchemy models + literal driver SQL
+    for rel in tracked:
+        if not re.search(r"\.(py|ts|tsx|js|jsx|mjs|rb)$", rel) or not in_scope(rel):
+            continue
+        text = read_text(rel)
+        fid = id_by_path.get(rel)
+        if not fid or text is None or not re.search(
+                r"__tablename__|\bTable\s*\(|execute|exec_driver_sql|\.query\s*\(|\.raw\s*\(", text):
+            continue
+        for a in extract_generic_db_access(text):
+            con.execute("INSERT INTO db_access(file_id, tbl, kind, mode, line, detail) VALUES(?,?,?,?,?,?)",
+                        (fid, a["table"], a["kind"], a["mode"], a["line"], a["detail"]))
+            accs += 1
     for rel in javaish:
         if not in_scope(rel):
             continue
@@ -835,9 +903,32 @@ def kafka_pass(con, scope_prefixes=None):
         fid = id_by_path.get(rel)
         if not fid or text is None:
             continue
-        if not re.search(r"fetch\s*\(|axios|\.(get|post|put|delete|patch)\s*(<[^>]*>)?\s*\(\s*[\x60'\"]", text):
+        if re.search(r"fetch\s*\(|axios|\.(get|post|put|delete|patch)\s*(<[^>]*>)?\s*\(\s*[\x60'\"]", text):
+            for c in extract_ts_http(text):
+                con.execute("INSERT INTO http_calls(file_id, method, path, norm, line, client) VALUES(?,?,?,?,?,?)",
+                            (fid, c["method"], c["path"], c["norm"], c["line"], c["client"]))
+                hcalls += 1
+        # Express/Fastify/Router registrations + Nest controllers as ENDPOINTS
+        if re.search(r"\b(?:app|router|server|fastify)\s*\.\s*(?:get|post|put|delete|patch|head|all)\s*\(|@Controller", text):
+            for e in extract_ts_endpoints(text):
+                con.execute("INSERT INTO http_endpoints(file_id, method, path, norm, line, detail) VALUES(?,?,?,?,?,?)",
+                            (fid, e["method"], e["path"], e["norm"], e["line"], e["detail"]))
+                eps += 1
+    # Python HTTP seam: Flask/FastAPI endpoints + requests/httpx calls
+    for rel in tracked:
+        if not rel.endswith(".py") or not in_scope(rel):
             continue
-        for c in extract_ts_http(text):
+        text = read_text(rel)
+        fid = id_by_path.get(rel)
+        if not fid or text is None or not re.search(
+                r"@\w+\.(?:route|get|post|put|delete|patch|head)\s*\(|requests\.|httpx", text):
+            continue
+        py_eps, py_calls = extract_py_http(text)
+        for e in py_eps:
+            con.execute("INSERT INTO http_endpoints(file_id, method, path, norm, line, detail) VALUES(?,?,?,?,?,?)",
+                        (fid, e["method"], e["path"], e["norm"], e["line"], e["detail"]))
+            eps += 1
+        for c in py_calls:
             con.execute("INSERT INTO http_calls(file_id, method, path, norm, line, client) VALUES(?,?,?,?,?,?)",
                         (fid, c["method"], c["path"], c["norm"], c["line"], c["client"]))
             hcalls += 1

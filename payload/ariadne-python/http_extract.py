@@ -73,6 +73,63 @@ def extract_java_http(text):
     return endpoints, calls
 
 
+# ---------- Endpoints beyond Spring: Express/Fastify/Router + Nest, Flask/FastAPI ----------
+EXPRESS_EP_RE = re.compile(r"\b(?:app|router|server|fastify)\s*\.\s*(get|post|put|delete|patch|head|all)\s*\(\s*([\"'`])((?:\\.|(?!\2).)*)\2")
+NEST_CTRL_RE = re.compile(r"@Controller\s*\(\s*(?:[\"'`]([^\"'`]*)[\"'`])?\s*\)")
+NEST_EP_RE = re.compile(r"@(Get|Post|Put|Delete|Patch|Head|All)\s*\(\s*(?:[\"'`]([^\"'`]*)[\"'`])?\s*\)")
+FLASK_EP_RE = re.compile(r"@\w+\.route\s*\(\s*([\"'])([^\"']*)\1([^)]*)\)")
+FASTAPI_EP_RE = re.compile(r"@\w+\.(get|post|put|delete|patch|head)\s*\(\s*([\"'])([^\"']*)\2")
+PY_CALL_RE = re.compile(r"\b(requests|httpx|session|client)\s*\.\s*(get|post|put|delete|patch|head)\s*\(\s*f?([\"'])((?:\\.|(?!\3).)*)\3")
+
+
+def extract_ts_endpoints(text):
+    """TS/JS: Express/Fastify/Router registrations and Nest controllers as endpoints."""
+    endpoints = []
+    for m in EXPRESS_EP_RE.finditer(text):
+        if not m.group(3).startswith("/"):
+            continue  # event names etc., not routes
+        method = "GET" if m.group(1) == "all" else m.group(1).upper()
+        endpoints.append({"method": method, "path": m.group(3), "norm": normalize_path(m.group(3)),
+                          "line": _line(text, m.start()), "detail": f"Express {m.group(1)}"})
+    prefixes = [(m.start(), m.group(1) or "") for m in NEST_CTRL_RE.finditer(text)]
+    if prefixes:
+        def prefix_at(i):
+            p = ""
+            for idx, pref in prefixes:
+                if idx <= i:
+                    p = pref
+                else:
+                    break
+            return p
+        for m in NEST_EP_RE.finditer(text):
+            path = re.sub(r"/{2,}", "/", "/" + prefix_at(m.start()) + "/" + (m.group(2) or ""))
+            method = "GET" if m.group(1) == "All" else m.group(1).upper()
+            endpoints.append({"method": method, "path": path, "norm": normalize_path(path),
+                              "line": _line(text, m.start()), "detail": f"Nest @{m.group(1)}"})
+    return endpoints
+
+
+def extract_py_http(text):
+    """Python: Flask/FastAPI endpoints + requests/httpx/aiohttp-session calls."""
+    endpoints, calls = [], []
+    for m in FLASK_EP_RE.finditer(text):
+        methods = [x.upper() for x in re.findall(r"[\"'](GET|POST|PUT|DELETE|PATCH|HEAD)[\"']", m.group(3) or "", re.I)]
+        for method in (methods or ["GET"]):
+            endpoints.append({"method": method, "path": m.group(2), "norm": normalize_path(m.group(2)),
+                              "line": _line(text, m.start()), "detail": "Flask route"})
+    for m in FASTAPI_EP_RE.finditer(text):
+        endpoints.append({"method": m.group(1).upper(), "path": m.group(3), "norm": normalize_path(m.group(3)),
+                          "line": _line(text, m.start()), "detail": f"FastAPI {m.group(1)}"})
+    for m in PY_CALL_RE.finditer(text):
+        url = m.group(4)
+        if re.match(r"^[a-z]+:[^/]", url) and not re.match(r"^https?:", url):
+            continue  # mailto: etc.
+        # f-string {expr} placeholders normalize to {} exactly like template literals
+        calls.append({"method": m.group(2).upper(), "path": url, "norm": normalize_path(url),
+                      "line": _line(text, m.start()), "client": m.group(1)})
+    return endpoints, calls
+
+
 def extract_ts_http(text):
     calls = []
 

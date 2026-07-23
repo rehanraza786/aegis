@@ -536,6 +536,13 @@ tool(server, "graph_gaps",
       .map((e) => ({ endpoint: `${e.method} ${e.path}`, why: "nobody in the workspace calls it, dead route, an external consumer, or a gateway rewrite the parser cannot see",
         ...(testCalls.some((c) => c.method === e.method && pathsMatch(c.norm, e.norm)) ? { note: "exercised only by tests" } : {}) }));
 
+    if (d.prepare("SELECT name FROM sqlite_master WHERE name='msg_topics'").get()) {
+      gaps.topics_declared_in_config_but_unused = d.prepare(
+        `SELECT t.topic, t.config_key, f.path, t.line FROM msg_topics t JOIN files f ON f.id=t.file_id
+         WHERE t.topic NOT IN (SELECT topic FROM msg_edges) LIMIT ?`).all(n)
+        .map((r) => ({ topic: r.topic, config_key: r.config_key,
+          why: `declared at ${r.path}:${r.line} but no producer or consumer references it` }));
+    }
     const total = Object.values(gaps).reduce((a, b) => a + b.length, 0);
     return {
       summary: total
@@ -590,7 +597,7 @@ tool(server, "assert_edge",
   });
 
 tool(server, "message_flow",
-  "Kafka topology: correlate inbound/outbound message handling across modules. No args = full topic map (each topic's producers and consumers with file:line, plus orphans, topics produced but never consumed or vice versa). Pass topic for one topic's flow. Topics resolved from literals, constants, and application.yaml placeholders.",
+  "Messaging topology (Kafka, plus RabbitMQ/JMS/SQS/NATS labeled by system): correlate inbound/outbound message handling across modules. No args = full topic map (each topic's producers and consumers with file:line, plus orphans, topics produced but never consumed or vice versa). Pass topic for one topic's flow. Topics resolved from literals, constants, and application.yaml placeholders.",
   { topic: z.string().max(200).optional() },
   ({ topic }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='msg_edges'").get()) {
@@ -599,6 +606,7 @@ tool(server, "message_flow",
     // Large system, no filter: a full dump is useless AND huge. Return the signal instead.
     const nTopics = d.prepare("SELECT COUNT(DISTINCT topic) c FROM msg_edges").get().c;
     const hasTest = d.prepare("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'").get().c;
+    const hasDecl = !!d.prepare("SELECT name FROM sqlite_master WHERE name='msg_topics'").get();
     if (!topic && nTopics > SUMMARY_THRESHOLD) {
       // topology is production-only; a topic touched only by tests is a warning, not topology
       const per = hasTest
@@ -621,6 +629,10 @@ tool(server, "message_flow",
           unresolved_topic_expressions: hasTest
             ? d.prepare("SELECT COUNT(*) c FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE m.resolved=0 AND f.is_test=0").get().c
             : d.prepare("SELECT COUNT(*) c FROM msg_edges WHERE resolved=0").get().c,
+          // config is the seam's source of truth: a topic declared there that no
+          // code touches is drift, exactly like a table defined but never accessed
+          ...(hasDecl ? { declared_in_config_but_unused: cap(d.prepare(
+            "SELECT DISTINCT topic FROM msg_topics WHERE topic NOT IN (SELECT topic FROM msg_edges)").all().map((r) => r.topic)) } : {}),
         },
         busiest_topics: per.sort((a, b) => (b.producers + b.consumers) - (a.producers + a.consumers)).slice(0, 10),
         next: "Full listing: docs/generated/message-flows.md. For the sites on one topic: message_flow topic:<name>.",
@@ -629,7 +641,7 @@ tool(server, "message_flow",
     const where = topic ? "WHERE m.topic = ?" : "";
     const hasSrc = d.prepare("SELECT COUNT(*) c FROM pragma_table_info('msg_edges') WHERE name='source'").get().c;
     const rows = d.prepare(
-      `SELECT m.topic, m.direction, f.path, m.line, m.resolved, m.via${hasSrc ? ", m.source" : ""}${hasTest ? ", f.is_test" : ""} FROM msg_edges m
+      `SELECT m.topic, m.direction, f.path, m.line, m.resolved, m.via, m.system${hasSrc ? ", m.source" : ""}${hasTest ? ", f.is_test" : ""} FROM msg_edges m
        JOIN files f ON f.id=m.file_id ${where} ORDER BY m.topic, m.direction`
 ).all(...(topic ? [topic] : []));
     if (!rows.length) return topic ? `No handlers found for topic '${topic}'.` : "No Kafka producers/consumers detected.";
@@ -638,6 +650,7 @@ tool(server, "message_flow",
       const t = (topics[r.topic] ??= { producers: [], consumers: [], unresolved: [], test_producers: [], test_consumers: [] });
       const asserted = r.source && r.source !== "static";
       const site = `${r.path}:${r.line}` + (r.via && !asserted ? ` (via ${r.via})` : "")
+        + (r.system && r.system !== "kafka" ? `  [${r.system}]` : "")
         + (asserted ? `  [ASSERTED by ${r.source.split(":")[1]}, derived, not parsed]` : "");
       if (r.is_test) {
         (r.direction === "produce" ? t.test_producers : t.test_consumers)
@@ -661,6 +674,20 @@ tool(server, "message_flow",
         ...(v.test_consumers.length ? { consumers: v.test_consumers } : {}),
       } } : {}),
     }));
+    // validate the seam against config declarations: link each topic to the
+    // config key(s) that declare it, and flag sites that hardcode a declared name
+    if (hasDecl) {
+      const declStmt = d.prepare("SELECT DISTINCT config_key FROM msg_topics WHERE topic=?");
+      for (const e of out) {
+        const keys = declStmt.all(e.topic).map((r) => r.config_key);
+        if (!keys.length) continue;
+        e.config_keys = keys;
+        const hard = [...e.producers, ...e.consumers].filter((s) => !s.includes("(via ") && !s.includes("[ASSERTED"));
+        if (hard.length) {
+          e.note = `config declares this topic (${keys.join(", ")}), but ${hard.length} site(s) hardcode the name; hoist to the config key so the seam stays tight`;
+        }
+      }
+    }
     return out;
   }));
 

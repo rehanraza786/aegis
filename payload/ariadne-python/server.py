@@ -646,6 +646,13 @@ def graph_gaps(limit: int = 20) -> str:
         for e in eps
         if not any(c["method"] == e["method"] and _pm(c["norm"], e["norm"]) for c in calls)][:n]
 
+    if con.execute("SELECT name FROM sqlite_master WHERE name='msg_topics'").fetchone():
+        gaps["topics_declared_in_config_but_unused"] = [
+            {"topic": r["topic"], "config_key": r["config_key"],
+             "why": f"declared at {r['path']}:{r['line']} but no producer or consumer references it"}
+            for r in q("SELECT t.topic, t.config_key, f.path, t.line FROM msg_topics t "
+                       "JOIN files f ON f.id=t.file_id "
+                       "WHERE t.topic NOT IN (SELECT topic FROM msg_edges) LIMIT ?", n)]
     total = sum(len(v) for v in gaps.values())
     return {
         "summary": (f"{total} things static analysis could not resolve. Investigate the code at each "
@@ -711,12 +718,13 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
 
 @mcp.tool()
 def message_flow(topic: str = "") -> str:
-    """Kafka topology: correlate inbound/outbound message handling across modules. No args = full topic map (producers/consumers per topic with file:line, plus orphan warnings). Topics resolved from literals, constants, and application.yaml placeholders."""
+    """Messaging topology (Kafka, plus RabbitMQ/JMS/SQS/NATS labeled by system): correlate inbound/outbound message handling across modules. No args = full topic map (producers/consumers per topic with file:line, plus orphan warnings). Topics resolved from literals, constants, and application.yaml placeholders."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='msg_edges'").fetchone():
         return "No message-edge data; reindex with the current Ariadne"
     n_topics = con.execute("SELECT COUNT(DISTINCT topic) FROM msg_edges").fetchone()[0]
     has_test = con.execute("SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='is_test'").fetchone()[0]
+    has_decl = bool(con.execute("SELECT name FROM sqlite_master WHERE name='msg_topics'").fetchone())
     if not topic and n_topics > SUMMARY_THRESHOLD:
         # topology is production-only; a topic touched only by tests is a warning, not topology
         if has_test:
@@ -741,11 +749,16 @@ def message_flow(topic: str = "") -> str:
                     "SELECT COUNT(*) FROM msg_edges m JOIN files f ON f.id=m.file_id "
                     "WHERE m.resolved=0 AND f.is_test=0").fetchone()[0] if has_test
                 else con.execute("SELECT COUNT(*) FROM msg_edges WHERE resolved=0").fetchone()[0],
+                # config is the seam's source of truth: a topic declared there that
+                # no code touches is drift, like a table defined but never accessed
+                **({"declared_in_config_but_unused": cap([r[0] for r in con.execute(
+                    "SELECT DISTINCT topic FROM msg_topics WHERE topic NOT IN (SELECT topic FROM msg_edges)")])}
+                   if has_decl else {}),
             },
             "busiest_topics": [dict(r) for r in sorted(per, key=lambda r: -(r["p"] + r["c"]))[:10]],
             "next": "Full listing: docs/generated/message-flows.md. For sites on one topic: message_flow topic:<name>.",
         }
-    q = ("SELECT m.topic, m.direction, f.path, m.line, m.resolved, m.via, m.source"
+    q = ("SELECT m.topic, m.direction, f.path, m.line, m.resolved, m.via, m.system, m.source"
          + (", f.is_test" if has_test else "") + " FROM msg_edges m "
          "JOIN files f ON f.id=m.file_id " + ("WHERE m.topic=? " if topic else "") + "ORDER BY m.topic, m.direction")
     rows = con.execute(q, (topic,) if topic else ()).fetchall()
@@ -757,8 +770,10 @@ def message_flow(topic: str = "") -> str:
                                            "test_producers": [], "test_consumers": []})
         src = r["source"] if "source" in r.keys() else "static"
         asserted = bool(src) and src != "static"
+        sys_ = r["system"] if "system" in r.keys() else "kafka"
         site = (f"{r['path']}:{r['line']}"
                 + (f" (via {r['via']})" if r["via"] and not asserted else "")
+                + (f"  [{sys_}]" if sys_ and sys_ != "kafka" else "")
                 + (f"  [ASSERTED by {src.split(':')[1]}, derived, not parsed]" if asserted else ""))
         if has_test and r["is_test"]:
             t["test_producers" if r["direction"] == "produce" else "test_consumers"].append(
@@ -790,6 +805,20 @@ def message_flow(topic: str = "") -> str:
             if t["test_consumers"]:
                 entry["test_usage"]["consumers"] = t["test_consumers"]
         out.append(entry)
+    # validate the seam against config declarations: link each topic to the
+    # config key(s) that declare it, and flag sites that hardcode a declared name
+    if has_decl:
+        for e in out:
+            keys = [r[0] for r in con.execute(
+                "SELECT DISTINCT config_key FROM msg_topics WHERE topic=?", (e["topic"],))]
+            if not keys:
+                continue
+            e["config_keys"] = keys
+            hard = [s for s in e["producers"] + e["consumers"]
+                    if "(via " not in s and "[ASSERTED" not in s]
+            if hard:
+                e["note"] = (f"config declares this topic ({', '.join(keys)}), but {len(hard)} site(s) "
+                             "hardcode the name; hoist to the config key so the seam stays tight")
     return out
 
 

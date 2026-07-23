@@ -42,6 +42,60 @@ def is_changelog(relpath, text):
     return bool(re.search(r"databaseChangeLog|--\s*liquibase formatted sql", text, re.I))
 
 
+# ---------- Migrations beyond Liquibase: Prisma, Rails, Alembic ----------
+PRISMA_MODEL_RE = re.compile(r"\bmodel\s+(\w+)\s*\{([^}]*)\}")
+PRISMA_MAP_RE = re.compile(r'@@map\s*\(\s*"([^"]+)"\s*\)')
+RAILS_OPS = [
+    (re.compile(r"\bcreate_table\s+[\"':]([\w]+)"), "create"),
+    (re.compile(r"\b(?:add_column|change_column|add_index|remove_column|rename_column|add_reference)\s+[\"':]([\w]+)"), "alter"),
+    (re.compile(r"\bdrop_table\s+[\"':]([\w]+)"), "drop"),
+]
+ALEMBIC_OPS = [
+    (re.compile(r"\bop\.create_table\s*\(\s*[\"']([\w]+)"), "create"),
+    (re.compile(r"\bop\.(?:add_column|alter_column|create_index|drop_column|create_foreign_key)\s*\(\s*[\"']([\w]+)"), "alter"),
+    (re.compile(r"\bop\.drop_table\s*\(\s*[\"']([\w]+)"), "drop"),
+]
+ALEMBIC_REV_RE = re.compile(r"^revision\s*=\s*[\"']([\w]+)[\"']", re.M)
+
+
+def is_schema_file(relpath, text):
+    """Schema-defining files in non-Liquibase formats."""
+    if relpath.endswith(".prisma"):
+        return bool(re.search(r"\bmodel\s+\w+\s*\{", text))
+    if relpath.endswith(".rb"):
+        return bool(re.search(r"(^|/)db/(schema\.rb$|migrate/)", relpath)) \
+            and bool(re.search(r"create_table|add_column|drop_table", text))
+    if relpath.endswith(".py"):
+        return bool(re.search(r"\bop\.(create_table|add_column|alter_column|drop_table)", text)) \
+            and bool(re.search(r"(migrations?|alembic|versions)/", relpath))
+    return False
+
+
+def extract_schema_defs(relpath, text):
+    """[{table, op, line, changeset}] from Prisma / Rails / Alembic files."""
+    out = []
+    stem = re.sub(r"\.\w+$", "", relpath.split("/")[-1])
+    if relpath.endswith(".prisma"):
+        for m in PRISMA_MODEL_RE.finditer(text):
+            # Prisma tables are the model name verbatim unless @@map overrides
+            mp = PRISMA_MAP_RE.search(m.group(2))
+            table = (mp.group(1) if mp else m.group(1)).lower()
+            out.append({"table": table, "op": "create", "line": _line(text, m.start()),
+                        "changeset": f"prisma:{m.group(1)}"})
+        return out
+    opsets = RAILS_OPS if relpath.endswith(".rb") else ALEMBIC_OPS
+    if relpath.endswith(".rb"):
+        tag = "rails:schema" if relpath.endswith("schema.rb") else f"rails:{stem}"
+    else:
+        rev = ALEMBIC_REV_RE.search(text)
+        tag = f"alembic:{rev.group(1) if rev else stem}"
+    for rx, op in opsets:
+        for m in rx.finditer(text):
+            out.append({"table": m.group(1).lower(), "op": op,
+                        "line": _line(text, m.start()), "changeset": tag})
+    return out
+
+
 def _line(text, idx):
     return text.count("\n", 0, idx) + 1
 
@@ -66,6 +120,10 @@ def extract_changelog(relpath, text):
                 break
         return last
 
+    # Flyway-style versioned SQL (V2__add_x.sql) carries no liquibase changeset
+    # comment; tag its ops with the migration filename so history stays legible
+    ft = re.search(r"(^|/)((?:[VUR]\d*|R)__[^/]+)\.sql$", relpath, re.I)
+    file_tag = ft.group(2) if ft else None
     ops = XML_OPS if relpath.endswith(".xml") else ([] if relpath.endswith(".sql") else YAML_OPS)
     for rx, op in ops:
         for m in rx.finditer(text):
@@ -75,7 +133,7 @@ def extract_changelog(relpath, text):
         kw = m.group(1).upper()
         op = "create" if kw.startswith("CREATE") else "drop" if kw.startswith("DROP") else "alter"
         out.append({"table": m.group(2).split(".")[-1].lower(), "op": op,
-                    "line": _line(text, m.start()), "changeset": cs_at(m.start())})
+                    "line": _line(text, m.start()), "changeset": cs_at(m.start()) or file_tag})
     return out
 
 
@@ -127,6 +185,38 @@ def extract_lombok_symbols(text):
             if setter:
                 out.append({"name": "set" + name[0].upper() + name[1:], "kind": "method",
                             "line": fline, "sig": f"({typ} {name}) [Lombok-generated]", "parent": cls})
+    return out
+
+
+# ---------- Generic access beyond the JVM: SQLAlchemy + literal driver SQL ----------
+SA_TABLENAME_RE = re.compile(r"__tablename__\s*=\s*[\"']([\w]+)[\"']")
+SA_TABLE_RE = re.compile(r"\bTable\s*\(\s*[\"']([\w]+)[\"']")
+EXEC_SQL_RE = re.compile(r"\b(?:execute(?:many)?|query|raw|exec_driver_sql)\s*\(\s*(?:text\s*\(\s*)?([\"'`])([\s\S]{0,400}?)\1")
+
+
+def extract_generic_db_access(text):
+    """DB access in non-JVM code: SQLAlchemy models/tables and any driver call
+    with a literal SQL string (psycopg/sqlite3/knex/pg/generic execute/query)."""
+    out, seen = [], set()
+
+    def push(table, kind, mode, idx, detail):
+        key = (table, kind, _line(text, idx))
+        if key not in seen:
+            seen.add(key)
+            out.append({"table": table, "kind": kind, "mode": mode,
+                        "line": _line(text, idx), "detail": detail})
+
+    for m in SA_TABLENAME_RE.finditer(text):
+        push(m.group(1).lower(), "entity", "rw", m.start(), "SQLAlchemy __tablename__")
+    for m in SA_TABLE_RE.finditer(text):
+        push(m.group(1).lower(), "entity", "rw", m.start(), "SQLAlchemy Table")
+    for m in EXEC_SQL_RE.finditer(text):
+        sql = m.group(2)
+        if not re.search(r"\b(FROM|JOIN|INTO|UPDATE|DELETE\s+FROM|MERGE\s+INTO)\b", sql, re.I):
+            continue
+        tables, mode = _tables_from_sql(sql)
+        for t in tables:
+            push(t, "sql", mode, m.start(), "driver SQL")
     return out
 
 

@@ -78,6 +78,58 @@ export function extractJavaHttp(text) {
   return { endpoints, calls };
 }
 
+// ---------- Endpoints beyond Spring: Express/Fastify/Router + Nest, Flask/FastAPI ----------
+const EXPRESS_EP_RE = /\b(?:app|router|server|fastify)\s*\.\s*(get|post|put|delete|patch|head|all)\s*\(\s*(["'`])((?:\\.|(?!\2).)*)\2/g;
+const NEST_CTRL_RE = /@Controller\s*\(\s*(?:["'`]([^"'`]*)["'`])?\s*\)/g;
+const NEST_EP_RE = /@(Get|Post|Put|Delete|Patch|Head|All)\s*\(\s*(?:["'`]([^"'`]*)["'`])?\s*\)/g;
+
+/** TS/JS: Express/Fastify/Router registrations and Nest controllers as endpoints. */
+export function extractTsEndpoints(text) {
+  const endpoints = [];
+  for (const m of text.matchAll(EXPRESS_EP_RE)) {
+    if (!m[3].startsWith("/")) continue; // event names etc., not routes
+    const method = m[1] === "all" ? "GET" : m[1].toUpperCase();
+    endpoints.push({ method, path: m[3], norm: normalizePath(m[3]), line: lineAt(text, m.index), detail: `Express ${m[1]}` });
+  }
+  // Nest: class-level @Controller prefix + method decorators, Spring-style
+  const prefixes = [];
+  NEST_CTRL_RE.lastIndex = 0;
+  for (const m of text.matchAll(NEST_CTRL_RE)) prefixes.push({ idx: m.index, prefix: m[1] ?? "" });
+  if (prefixes.length) {
+    const prefixAt = (i) => { let p = ""; for (const x of prefixes) { if (x.idx <= i) p = x.prefix; else break; } return p; };
+    for (const m of text.matchAll(NEST_EP_RE)) {
+      const path = ("/" + prefixAt(m.index) + "/" + (m[2] ?? "")).replace(/\/{2,}/g, "/");
+      endpoints.push({ method: m[1] === "All" ? "GET" : m[1].toUpperCase(), path, norm: normalizePath(path), line: lineAt(text, m.index), detail: `Nest @${m[1]}` });
+    }
+  }
+  return endpoints;
+}
+
+const FLASK_EP_RE = /@\w+\.route\s*\(\s*(["'])([^"']*)\1([^)]*)\)/g;
+const FASTAPI_EP_RE = /@\w+\.(get|post|put|delete|patch|head)\s*\(\s*(["'])([^"']*)\2/g;
+const PY_CALL_RE = /\b(requests|httpx|session|client)\s*\.\s*(get|post|put|delete|patch|head)\s*\(\s*f?(["'])((?:\\.|(?!\3).)*)\3/g;
+
+/** Python: Flask/FastAPI endpoints + requests/httpx/aiohttp-session calls. */
+export function extractPyHttp(text) {
+  const endpoints = [];
+  const calls = [];
+  for (const m of text.matchAll(FLASK_EP_RE)) {
+    const methods = [...(m[3] ?? "").matchAll(/["'](GET|POST|PUT|DELETE|PATCH|HEAD)["']/gi)].map((x) => x[1].toUpperCase());
+    for (const method of methods.length ? methods : ["GET"]) {
+      endpoints.push({ method, path: m[2], norm: normalizePath(m[2]), line: lineAt(text, m.index), detail: "Flask route" });
+    }
+  }
+  for (const m of text.matchAll(FASTAPI_EP_RE)) {
+    endpoints.push({ method: m[1].toUpperCase(), path: m[3], norm: normalizePath(m[3]), line: lineAt(text, m.index), detail: `FastAPI ${m[1]}` });
+  }
+  for (const m of text.matchAll(PY_CALL_RE)) {
+    if (/^[a-z]+:[^/]/.test(m[4]) && !/^https?:/.test(m[4])) continue; // mailto: etc.
+    // f-string {expr} placeholders normalize to {} exactly like template literals
+    calls.push({ method: m[2].toUpperCase(), path: m[4], norm: normalizePath(m[4]), line: lineAt(text, m.index), client: m[1] });
+  }
+  return { endpoints, calls };
+}
+
 /** TS/JS: extract outbound HTTP calls from one file. */
 export function extractTsHttp(text) {
   const calls = [];
