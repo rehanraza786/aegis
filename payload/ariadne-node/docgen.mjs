@@ -9,7 +9,7 @@
  *   message-flows.md. Kafka topology per topic (Mermaid) + orphan warnings
  *   data-map.md, tables ↔ services ↔ changesets (Mermaid + history)
  *   PROGRESS.md, manager/PO report from docs/features/(spec|tasks|review).md
- *   agent-context.md, compact orientation pack for AI agents (< ~150 lines)
+ *   agent-context.md, compact orientation pack for AI agents (bounded under ~60 lines)
  *
  * Usage: node docgen.mjs   (run from the workspace/repo root, after indexing)
  */
@@ -305,6 +305,24 @@ const write = (name, body) => {
   const topMods = [...services].slice(0, 15);
   const nTest = hasTest ? q("SELECT COUNT(*) c FROM files WHERE is_test=1")[0].c : 0;
   const more = (all, shownN, doc) => all.length > shownN ? ` (+${all.length - shownN} more, see ${doc})` : "";
+  // Standing rules are DERIVED from what the graph actually found, never stated
+  // as universal truths: a Rails shop must not be told "Liquibase first, always".
+  const msgSystems = q("SELECT DISTINCT COALESCE(system,'kafka') s FROM msg_edges").map((r) => r.s);
+  const migTools = [...new Set(q("SELECT DISTINCT changeset t FROM db_defs WHERE changeset IS NOT NULL")
+    .map((r) => r.t)
+    .map((t) => t.startsWith("prisma:") ? "the Prisma schema"
+      : t.startsWith("rails:") ? "Rails migrations"
+      : t.startsWith("alembic:") ? "Alembic revisions"
+      : /^[VUR]\d*__/i.test(t) ? "Flyway migrations"
+      : "Liquibase changesets"))];
+  const ruleLines = [
+    "- Follow the codebase's existing patterns over textbook patterns; when they conflict, match the codebase and note the tension.",
+    ...(topics.length ? [
+      `- ${msgSystems.some((s) => s !== "kafka") ? "Topic/queue" : "Topic"} names come from application config or constants, never hardcode a new literal (hardcoding a config-declared name gets flagged).`] : []),
+    ...(migTools.length ? [
+      `- Every table change goes through your migration layer (detected: ${migTools.join(", ")}); \`db_map\` shows the history and will flag drift.`] : []),
+    "- Run the feature-delivery-loop (test → implement → build → verify → review → document) per increment; update `docs/features/<id>/tasks.md` as you go. PROGRESS.md is generated from it.",
+  ];
   let md = `# Agent Context Pack (generated, read this FIRST, then use Ariadne tools)\n
 This file plus one or two tool calls should orient you completely. Do not
 re-derive anything listed here by reading source files. This pack is deliberately
@@ -325,10 +343,7 @@ Tests: ${nTest} test files indexed. Test-derived facts are labeled [TEST] in too
 ## High-risk files (largest blast radius, check dependents before touching)
 ${hot.map((h) => `- \`${h.path}\` (${h.n} dependents)`).join("\n")}\n
 ## Standing rules for implementation work
-- Follow the codebase's existing patterns over textbook patterns; when they conflict, match the codebase and note the tension.
-- Kafka topic names come from application.yaml or constants, never hardcode a new literal topic.
-- Every table change goes through a Liquibase changeset; \`db_map\` shows the history and will flag drift.
-- Run the feature-delivery-loop (test → implement → build → verify → review → document) per increment; update \`docs/features/<id>/tasks.md\` as you go. PROGRESS.md is generated from it.
+${ruleLines.join("\n")}
 `;
   write("agent-context.md", md);
 }

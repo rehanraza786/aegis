@@ -5,15 +5,17 @@
 
 ## Codebase knowledge base
 
-Read `docs/generated/agent-context.md` FIRST for any coding task, it orients you in ~100 lines (modules, topics, tables, high-risk files, lookup order). This repo also has a knowledge map at `.github/knowledge/`. Before exploring
-source files for any task, read `.github/knowledge/INDEX.md` and the relevant
-`modules/<module>.md` file, they answer most "where is X / how does Y work"
-questions in a few hundred tokens. Open source files only to edit them or when
-the knowledge base points you to a specific location. Check
-`.github/knowledge/graph.md` for blast radius before changing shared modules.
-After changing a module's public surface or dependencies, update its knowledge
-file (see the codebase-orientation skill for the format). If the knowledge base
-is missing or stale, suggest running the pythia agent.
+Read `docs/generated/agent-context.md` FIRST for any coding task; it orients you
+in under ~60 lines (modules, topics, tables, high-risk files, lookup order). The
+lookup ladder, cheapest first, matches the codebase-orientation skill exactly:
+(1) that pack and the generated docs, (2) graph tools for structure
+(`find_symbol`, `blast_radius`, `message_flow`, `db_map`, …), (3) the knowledge
+map at `.github/knowledge/` — `INDEX.md`, then `modules/<module>.md` — for
+module *intent* and gotchas, (4) source files, only to edit or when the layers
+above point somewhere specific. After changing a module's public surface or
+dependencies, update its knowledge file (see the codebase-orientation skill for
+the format). If the knowledge base is missing or stale, suggest running the
+pythia agent.
 
 ## Which AEGIS skill to use
 
@@ -26,18 +28,22 @@ instead of improvising a tool order:
   I change X?" Covers code, Kafka, DB, HTTP, and standing decisions in one pass.
 - **flow-tracing**: follow a request or event end to end; or debug "X happened
   but Y never did".
-- **safe-schema-change**: any new table, column, entity, or migration. Liquibase
-  first, always; verify with `db_map` afterwards (no DRIFT = done).
-- **event-contract-change**: publishing, consuming, or altering a Kafka event.
-  Never hardcode a topic literal; verify producer and consumer correlate with
-  `message_flow` afterwards.
+- **safe-schema-change**: any new table, column, entity, or migration. Your
+  repo's migration layer first, always (`db_map` shows which one this repo
+  uses); verify with `db_map` afterwards (no DRIFT = done).
+- **event-contract-change**: publishing, consuming, or altering an event — Kafka
+  or any broker the graph labels (rabbit, jms, sqs, nats). Never hardcode a
+  topic literal; verify producer and consumer correlate with `message_flow`
+  afterwards.
 - **aegis-help**: which tool answers this question, or the toolkit itself is
   misbehaving.
 
 Standing rules for this repo: topic names come from config or constants, never
-literals. Every schema change goes through a Liquibase changeset. Check
-`decisions` before contradicting an architectural choice, a design that looks
-wrong is often one that was made deliberately and recorded.
+literals (the graph flags hardcoded names its config declares). Every schema
+change goes through the repo's migration layer — `agent-context.md` names the
+detected one(s). Check `decisions` before contradicting an architectural
+choice, a design that looks wrong is often one that was made deliberately and
+recorded.
 
 ## Which AEGIS agent to hand off to
 

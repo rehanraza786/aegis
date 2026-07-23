@@ -171,7 +171,7 @@ Two are worth knowing by name:
 
 A script (not an agent, not a model) reads the graph and writes `docs/generated/`. Zero tokens, deterministic, safe to run on every merge and every commit.
 
-`architecture.md` (module map, dependency diagram, hotspots) · `message-flows.md` (Kafka topology, orphan warnings) · `data-map.md` (tables ↔ services ↔ changesets, drift) · `http-map.md` (endpoints ↔ callers) · `decisions.md` (active and superseded ADRs) · **`PROGRESS.md`** (the stakeholder report: overall percentage, a pie chart, and a per-feature table, computed from the `docs/features/` artifacts the delivery loop already maintains) · **`agent-context.md`** (the ~30-line orientation pack agents read *first*).
+`architecture.md` (module map, dependency diagram, hotspots) · `message-flows.md` (Kafka topology, orphan warnings) · `data-map.md` (tables ↔ services ↔ changesets, drift) · `http-map.md` (endpoints ↔ callers) · `decisions.md` (active and superseded ADRs) · **`PROGRESS.md`** (the stakeholder report: overall percentage, a pie chart, and a per-feature table, computed from the `docs/features/` artifacts the delivery loop already maintains) · **`agent-context.md`** (the orientation pack agents read *first*, bounded under ~60 lines).
 
 `PROGRESS.md` is exactly as honest as your task hygiene. The system makes truth cheap; it can't make it automatic.
 
@@ -258,7 +258,7 @@ http_map      →   0.7 KB   (raw dump ~14.2 KB)
 
 You get counts, the *complete* orphan and drift lists, and the busiest items, with a pointer to query one at a time. **Warnings are kept first and never dropped by truncation**, a truncated result that silently discarded the drift warning would be worse than no result at all. Scoped queries (`message_flow topic:orders.created`) still return everything, as they always did.
 
-Every result is capped anyway (50 rows, 24 KB, reporting `showing X of Y`). `agent-context.md` stays ~30 lines regardless of workspace size. Generated docs past 60 items carry a banner telling agents to query the tool rather than read the file. Tune it all in `.ariadne/config.json`.
+Every result is capped anyway (50 rows, 24 KB, reporting `showing X of Y`). `agent-context.md` stays under ~60 lines regardless of workspace size. Generated docs past 60 items carry a banner telling agents to query the tool rather than read the file. Tune it all in `.ariadne/config.json`.
 
 ## Performance
 
