@@ -33,6 +33,30 @@ echo "graph engine: $ENGINE (override with --engine=ariadne|codebase-memory|code
 case "$ENGINE" in ariadne|codebase-memory|code-graph|custom) ;; *) echo "Unknown engine '$ENGINE'"; exit 1 ;; esac
 [ "$ENGINE" = ariadne ] && echo "ariadne runtime: $RUNTIME (override with --runtime=python|node)"
 
+# JSON helper: use whichever runtime exists. The old hard python3 dependency
+# broke node-only machines (and killed the install mid-way with set -e after
+# `> aegis.json` had already created an empty file); python-only Windows boxes
+# ship `python`, not `python3`.
+JSON_BIN=""
+for c in node python3 python; do command -v "$c" >/dev/null 2>&1 && { JSON_BIN=$c; break; }; done
+[ -n "$JSON_BIN" ] || { echo "Error: need node or python on PATH."; exit 1; }
+json_engine_field() {  # $1=field -> engines.json[$ENGINE][$1], "" if absent
+  case "$JSON_BIN" in
+    node) node -e 'const v=(require(process.argv[1])[process.argv[2]]||{})[process.argv[3]];if(v!=null)process.stdout.write(typeof v==="string"?v:JSON.stringify(v))' "$PAYLOAD/engines.json" "$ENGINE" "$1" ;;
+    *) "$JSON_BIN" -c 'import json,sys
+v=json.load(open(sys.argv[1])).get(sys.argv[2],{}).get(sys.argv[3])
+sys.stdout.write("" if v is None else v if isinstance(v,str) else json.dumps(v))' "$PAYLOAD/engines.json" "$ENGINE" "$1" ;;
+  esac
+}
+json_aegis_mcp() {  # $1=command|args -> from ./aegis.json .mcp, tolerating missing keys
+  case "$JSON_BIN" in
+    node) node -e 'const m=require(process.argv[1]).mcp||{};process.stdout.write(process.argv[2]==="command"?(m.command||"REPLACE_ME"):(m.args||[]).map(a=>JSON.stringify(a)).join(", "))' "$PWD/aegis.json" "$1" ;;
+    *) "$JSON_BIN" -c 'import json,sys
+m=json.load(open("aegis.json")).get("mcp") or {}
+sys.stdout.write(m.get("command","REPLACE_ME") if sys.argv[1]=="command" else ", ".join(json.dumps(a) for a in m.get("args") or []))' "$1" ;;
+  esac
+}
+
 copy_if_absent () {  # $1=src $2=dst
   if [ -e "$2" ]; then
     echo "  skip (exists): $2"
@@ -59,7 +83,7 @@ copy_if_absent "$PAYLOAD/constitution-template.md" "docs/constitution.md"
 echo "-- Copilot instructions routing"
 append_engine_hints() {
   local hints
-  hints=$(python3 -c "import json; print(json.load(open('$PAYLOAD/engines.json'))['$ENGINE']['toolHints'])")
+  hints=$(json_engine_field toolHints)
   if ! grep -q "## Codebase graph engine" .github/copilot-instructions.md 2>/dev/null; then
     mkdir -p .github
     printf '\n## Codebase graph engine\nThis repo uses the %s graph engine (see aegis.json). %s\n' "$ENGINE" "$hints" >> .github/copilot-instructions.md
@@ -81,15 +105,18 @@ fi
 if [ "$WITH_GRAPHRAG" = 1 ]; then
   echo "-- Graph engine config (aegis.json)"
   if [ ! -f aegis.json ]; then
-    python3 - "$ENGINE" "$PAYLOAD/engines.json" > aegis.json <<'PYEOF'
-import json, sys
-engine, registry_path = sys.argv[1], sys.argv[2]
-reg = json.load(open(registry_path))[engine]
-cfg = {"graphEngine": engine}
-if not reg.get("managed"):
-    cfg["mcp"] = {"command": reg.get("command", "REPLACE_ME"), "args": reg.get("args", [])}
-print(json.dumps(cfg, indent=2))
-PYEOF
+    # write to a temp file then mv: a failure mid-generation must never leave a
+    # truncated aegis.json behind (re-runs used to skip it as "exists" and wedge)
+    TMP_JSON="$(mktemp)"
+    if [ "$(json_engine_field managed)" = "true" ]; then
+      printf '{\n  "graphEngine": "%s"\n}\n' "$ENGINE" > "$TMP_JSON"
+    else
+      MCP_CMD="$(json_engine_field command)"; [ -n "$MCP_CMD" ] || MCP_CMD=REPLACE_ME
+      MCP_ARGS="$(json_engine_field args)"; [ -n "$MCP_ARGS" ] || MCP_ARGS='[]'
+      printf '{\n  "graphEngine": "%s",\n  "mcp": { "command": "%s", "args": %s }\n}\n' \
+        "$ENGINE" "$MCP_CMD" "$MCP_ARGS" > "$TMP_JSON"
+    fi
+    mv "$TMP_JSON" aegis.json
     echo "  + aegis.json (engine: $ENGINE)"
   else
     echo "  skip (exists): aegis.json, edit graphEngine there to switch"
@@ -103,7 +130,8 @@ PYEOF
     copy_if_absent "$PAYLOAD/gitlab-ci-aegis.yml" "gitlab-ci-aegis.yml"
   else
     echo "-- External graph engine '$ENGINE' selected: skipping .ariadne install, git hooks, and CI job (the engine manages its own index)."
-    grep -o '"installHint":[^,}]*' "$PAYLOAD/engines.json" >/dev/null 2>&1 &&       python3 -c "import json,sys; print('  NOTE:', json.load(open('$PAYLOAD/engines.json'))['$ENGINE'].get('installHint','see the engine README'))"
+    HINT="$(json_engine_field installHint)"
+    [ -n "$HINT" ] && echo "  NOTE: $HINT"
     WITH_HOOKS=0
   fi
 
@@ -116,8 +144,8 @@ PYEOF
       if [ "$RUNTIME" = node ]; then CMD=node; ARGS='"${workspaceFolder}/.ariadne/server.mjs"'
       else CMD=python3; ARGS='"${workspaceFolder}/.ariadne/server.py"'; fi
     else
-      CMD=$(python3 -c "import json; print(json.load(open('aegis.json'))['mcp']['command'])")
-      ARGS=$(python3 -c "import json; print(', '.join(json.dumps(a) for a in json.load(open('aegis.json'))['mcp']['args']))")
+      CMD=$(json_aegis_mcp command)
+      ARGS=$(json_aegis_mcp args)
     fi
     cat > .vscode/mcp.json <<JSON
 {

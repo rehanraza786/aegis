@@ -24,28 +24,56 @@ function gitRepos() {
     .map((d) => path.join(CWD, d.name));
 }
 
-const HOOK_BODY = `#!/bin/sh
-# AEGIS: refresh the codebase graph in the background (never blocks git)
-AR="${CWD.replaceAll("\\", "/")}/.ariadne"
-[ -f "$AR/indexer.mjs" ] && IDX="node \\"$AR/indexer.mjs\\"" || IDX="\${PYTHON:-python3} \\"$AR/indexer.py\\""
-command -v python3 >/dev/null 2>&1 || PYTHON=python
-(eval "$IDX --incremental" >> "$AR/index.log" 2>&1
-  if [ -f "$AR/docgen.mjs" ]; then node "$AR/docgen.mjs" >> "$AR/index.log" 2>&1; \\
-  elif [ -f "$AR/docgen.py" ]; then \${PYTHON:-python3} "$AR/docgen.py" >> "$AR/index.log" 2>&1; fi) &
-exit 0
+// Escape a baked path for use inside the hook's single-quoted bash -c script:
+// a double-quoted shell literal with \ ` $ " escaped keeps spaces intact.
+const dq = (s) => `"${String(s).replaceAll("\\", "/").replace(/([`$"])/g, "\\$1")}"`;
+const REPOS = gitRepos();
+const MULTI = REPOS.length > 1 || !!process.env.ARIADNE_ROOTS;
+// Single repo: the hook resolves everything at RUN time (survives repo moves).
+// Multi-repo workspace: the workspace root cannot be derived from inside one
+// member repo, so it is baked here — along with ARIADNE_ROOTS/ARIADNE_HOME so
+// the incremental index actually runs in workspace mode with the shared DB.
+const arBlock = MULTI
+  ? `  AR=${dq(CWD + "/.ariadne")}\n  export ARIADNE_HOME=${dq(CWD)}\n  export ARIADNE_ROOTS=${dq(REPOS.join(","))}`
+  : `  AR="$(git rev-parse --show-toplevel)/.ariadne"`;
+const HOOK_BLOCK = `
+# aegis-index-hook: keep the codebase graph fresh (background; never blocks git; lockfile prevents overlap)
+(nohup bash -c '
+${arBlock}
+  [ -d "$AR" ] || exit 0
+  {
+    if [ -f "$AR/indexer.mjs" ]; then
+      node "$AR/indexer.mjs" --incremental && node "$AR/docgen.mjs"
+    elif [ -f "$AR/indexer.py" ]; then
+      PY="$(command -v python3 || command -v python)"
+      "$PY" "$AR/indexer.py" --incremental && "$PY" "$AR/docgen.py"
+    fi
+  } >> "$AR/index.log" 2>&1' >/dev/null 2>&1 &) || true
 `;
 
 let hooks = 0;
-for (const repo of gitRepos()) {
-  const hookDir = path.join(repo, ".git", "hooks");
-  if (!fs.existsSync(hookDir)) continue;
+for (const repo of REPOS) {
+  // git resolves the real hooks dir (worktrees, submodules, core.hooksPath);
+  // .git/hooks was wrong for all three, silently skipping them
+  let hookDir;
+  try {
+    hookDir = path.resolve(repo, execFileSync("git", ["rev-parse", "--git-path", "hooks"],
+      { encoding: "utf8", cwd: repo }).trim());
+  } catch { continue; /* not a git repo */ }
+  fs.mkdirSync(hookDir, { recursive: true });
   for (const h of ["post-commit", "post-merge", "post-checkout"]) {
     const f = path.join(hookDir, h);
-    if (fs.existsSync(f) && !fs.readFileSync(f, "utf8").includes("AEGIS")) {
-      console.log(`  skip ${h} in ${path.basename(repo)} (existing non-AEGIS hook, append manually)`);
-      continue;
+    const existing = fs.existsSync(f) ? fs.readFileSync(f, "utf8") : null;
+    if (existing?.includes("aegis-index-hook")) { continue; }
+    if (existing && /# AEGIS: refresh the codebase graph/.test(existing)) {
+      // migrate a hook written by the previous installer (whole file was ours)
+      fs.writeFileSync(f, "#!/bin/sh" + HOOK_BLOCK);
+    } else if (existing) {
+      // chain onto an existing hook instead of refusing (matches install-hooks.sh)
+      fs.appendFileSync(f, HOOK_BLOCK);
+    } else {
+      fs.writeFileSync(f, "#!/bin/sh" + HOOK_BLOCK);
     }
-    fs.writeFileSync(f, HOOK_BODY);
     try { fs.chmodSync(f, 0o755); } catch { /* windows: mode ignored */ }
     hooks++;
   }
