@@ -26,6 +26,12 @@ The post-review release. Highlights, roughly in the order they landed:
   multi-repo workspaces), the selected node survives refreshes, capped lists
   read "showing N of M" instead of truncating silently, and submitting an
   assertion auto-ingests it via incremental reindex — no modal, no `--full`.
+  The editing pass: an **Assertions panel** renders the whole human knowledge
+  layer (kind, subject, confidence, author, evidence, file:line) with STALE
+  entries floating to the top as a re-verification worklist, backed by two new
+  annotate actions — `retract` and `reaffirm` (source_hash moves to the
+  evidence file's current hash) — in both editions, suite-pinned; module
+  notes show their text in details.
   Then the viewing pass: search over every node (`/`, arrows, Enter jumps and
   focuses), click-to-focus dims everything outside the neighborhood (Esc
   restores), the HTTP-endpoint layer finally renders (green tags, serves/calls
