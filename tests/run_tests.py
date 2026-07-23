@@ -799,6 +799,32 @@ await c.close();
           code == 0 and db.execute(ref_edge).fetchone() is not None, ose[-300:])
     db.close()
 
+    # ---- FTS chunk deletes: the trigram-LIKE fast path must stay EXACT ----
+    # `_` in a path is a LIKE wildcard; the delete is `path LIKE ? AND path=?`
+    # (index for speed, equality for exactness). If the AND is ever dropped,
+    # reindexing wild_x.md also eats wildAx.md's chunks (the pattern matches
+    # both paths) — this pins that, plus general no-duplicate chunk hygiene.
+    w(ws / "web-app" / "docs" / "wild_x.md", "# wildcard underscore fixture\n" + "shared body text\n" * 3)
+    w(ws / "web-app" / "docs" / "wildAx.md", "# wildcard sibling fixture\n" + "other body text\n" * 3)
+    git(["add", "-A"], ws / "web-app")
+    git(["commit", "-qm", "wildcard fixtures"], ws / "web-app")
+    run(exe + [idx, "--incremental"], ws)
+    wx = ws / "web-app" / "docs" / "wild_x.md"
+    wx.write_text(wx.read_text(encoding="utf-8") + "touched\n", encoding="utf-8")
+    git(["add", "-A"], ws / "web-app")
+    git(["commit", "-qm", "touch wildcard file"], ws / "web-app")
+    code, ow = run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("chunk delete stays exact under LIKE wildcards in paths",
+          code == 0
+          and db.execute("SELECT COUNT(*) FROM chunks WHERE path LIKE '%wildAx.md'").fetchone()[0] > 0
+          and db.execute("SELECT COUNT(*) FROM chunks WHERE path LIKE '%wild#_x.md' ESCAPE '#'").fetchone()[0] > 0,
+          ow[-200:])
+    check("reindex leaves no duplicate chunks",
+          db.execute("SELECT COUNT(*) FROM (SELECT path, start_line, COUNT(*) c FROM chunks "
+                     "GROUP BY path, start_line HAVING c > 1)").fetchone()[0] == 0)
+    db.close()
+
     # ---- MCP tool smoke (end-to-end through the protocol / module surface) ----
     if rt == "node":
         client = ws / ".ariadne" / "_smoke.mjs"
@@ -878,6 +904,15 @@ await c.close();
           any(t.get("config_keys") for t in gx.get("topics", []))
           and any(g.get("topic") == "refunds.requested"
                   for g in gx.get("gaps", {}).get("topics_declared_in_config_but_unused", [])))
+    gf = gx.get("generated_from", {})
+    check("graph export: freshness verified per root (fresh=True right after indexing)",
+          gf.get("fresh") is True and bool(gf.get("indexed_sha")),
+          str({k: gf.get(k) for k in ("fresh", "indexed_sha")}))
+    check("graph export: pre-cap totals let a UI say 'showing N of M'",
+          gf.get("topics_total", 0) >= len(gx.get("topics", []))
+          and gf.get("tables_total", 0) >= len(gx.get("tables", []))
+          and gf.get("endpoints_total", 0) >= len(gx.get("endpoints", []))
+          and gf.get("topics_total", 0) > 0, str(gf))
 
     an = str(ar / ("annotate.mjs" if rt == "node" else "annotate.py"))
     code, oan = run(exe + [an, json.dumps({

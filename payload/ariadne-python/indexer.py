@@ -484,7 +484,11 @@ def index_file(con, relpath, force=False):
     lang = LANG_BY_EXT.get(full.suffix.lower(), "other")
     is_test = 1 if is_test_path(relpath) else 0
 
-    con.execute("DELETE FROM chunks WHERE path=?", (relpath,))
+    # FTS5 can't index a plain WHERE path=? — it full-scans the whole chunk table
+    # PER FILE (measured 37.5ms at 100k chunks). The trigram tokenizer serves
+    # LIKE from the index (35×); AND path=? keeps exactness because `_`/`%` in
+    # real paths are LIKE wildcards. Same path bound to both params.
+    con.execute("DELETE FROM chunks WHERE path LIKE ? AND path=?", (relpath, relpath))
     old = con.execute("SELECT id FROM files WHERE path=?", (relpath,)).fetchone()
     # Non-import edges (e.g. SCIP-derived 'ref') are owned by other passes; the
     # file-row swap below cascade-deletes them, so carry them over to the new id.
@@ -1156,7 +1160,7 @@ def full_index(con, rebuild=False):
     for (p,) in con.execute("SELECT path FROM files").fetchall():
         if p not in tracked:
             con.execute("DELETE FROM files WHERE path=?", (p,))
-            con.execute("DELETE FROM chunks WHERE path=?", (p,))
+            con.execute("DELETE FROM chunks WHERE path LIKE ? AND path=?", (p, p))
             removed += 1
     touched, skipped = [], 0
     for rel in files:
@@ -1177,6 +1181,12 @@ def full_index(con, rebuild=False):
             pass  # never fatal
     con.execute("INSERT OR REPLACE INTO meta VALUES('last_run', ?)", (str(time.time()),))
     con.commit()
+    # after commit (a checkpoint inside a tx is a no-op): the bulk transaction
+    # balloons the -wal file to ~DB size and it then sits on disk indefinitely
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error:
+        pass  # never fatal
     log.info("Full index: %d (re)indexed, %d unchanged (cached), %d removed of %d tracked in %dms",
              len(touched), skipped, removed, len(files), int((time.time() - t0) * 1000))
 
@@ -1210,7 +1220,7 @@ def incremental_index(con):
         return full_index(con)
     for p in deleted:
         con.execute("DELETE FROM files WHERE path=?", (p,))
-        con.execute("DELETE FROM chunks WHERE path=?", (p,))
+        con.execute("DELETE FROM chunks WHERE path LIKE ? AND path=?", (p, p))
     touched = []
     for p in changed:
         rec = index_file(con, p)
@@ -1262,6 +1272,11 @@ def main():
         try:
             con = connect()
             incremental_index(con) if args.incremental else full_index(con, rebuild=args.rebuild)
+            # keep the query planner's stats current as the graph grows
+            try:
+                con.execute("PRAGMA optimize")
+            except sqlite3.Error:
+                pass  # never fatal
         except Exception:
             log.exception("Indexing failed")
             sys.exit(1)
