@@ -17,10 +17,11 @@ environment, and the single most common thing an assistant gets wrong here.
 
 ## Step 1 — Establish the current truth
 
-- `message_flow` with no arguments — the whole topology. Learn the naming
-  convention in use (`orders.created`, `payments.completed` — noun.past-tense is
-  typical) and follow it. A new topic that doesn't match the house convention is
-  a review finding.
+- `message_flow` with no arguments — the whole topology (on large systems this
+  is a summary with the complete warning lists; query per topic for sites,
+  that's deliberate). Learn the naming convention in use (`orders.created`,
+  `payments.completed` — noun.past-tense is typical) and follow it. A new topic
+  that doesn't match the house convention is a review finding.
 - `message_flow <topic>` if the topic already exists — who produces it, who
   consumes it, and how each one resolves the name (a literal, a constant, or a
   `${config.key}` placeholder). Match whatever mechanism is already in use.

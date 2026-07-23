@@ -1,6 +1,6 @@
 ---
 name: spec-driven-artifacts
-description: "Artifact-driven engineering workflow (Spec-Kit / HVE style) \u2014 every non-trivial feature flows through persistent, structured markdown documents (spec.md, plan.md, tasks.md, review.md, changes.md) stored in docs/features/<NNN-name>/, so work is traceable, resumable, and reviewable rather than trapped in chat. Use for ANY feature, story, or significant fix: when starting work (\"specify/plan/implement X\"), when resuming partially complete work, or when the user asks for a spec, plan, task breakdown, or review document. The delivery-loop, daedalus, themis, and code-reviewer all write their outputs through these artifacts."
+description: "Artifact-driven engineering workflow (Spec-Kit / HVE style) \u2014 every non-trivial feature flows through persistent, structured markdown documents (spec.md, plan.md, tasks.md, review.md, changes.md) stored in docs/features/<NNN-name>/, so work is traceable, resumable, and reviewable rather than trapped in chat. Use for ANY feature, story, or significant fix: when starting work (\"specify/plan/implement X\"), when resuming partially complete work, or when the user asks for a spec, plan, task breakdown, or review document. The feature-delivery-loop invokes this for its documents (it is the umbrella for implementation); reach for this skill directly when the user asks for a spec, plan, task breakdown, or review document by itself. The delivery-loop, daedalus, themis, and code-reviewer all write their outputs through these artifacts."
 ---
 
 # Spec-Driven Artifacts

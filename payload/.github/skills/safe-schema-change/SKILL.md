@@ -1,6 +1,6 @@
 ---
 name: safe-schema-change
-description: Change the database schema correctly — add or alter a table or column — following the Liquibase-plus-JPA procedure this codebase actually uses, and verifying afterwards that code and schema agree. Use whenever a change involves a new table, a new column, a type change, an index, a constraint, a new entity, or a new repository. Trigger on "add a field to", "new table", "migration", "changeset", or any request that implies persisted data that doesn't exist yet.
+description: Change the database schema correctly — add or alter a table or column — through the migration layer this codebase actually uses (Liquibase, Flyway, Prisma, Rails, or Alembic; `db_map`'s changeset tags show which), verifying afterwards that code and schema agree. Use whenever a change involves a new table, a new column, a type change, an index, a constraint, a new entity, or a new repository. Trigger on "add a field to", "new table", "migration", "changeset", or any request that implies persisted data that doesn't exist yet.
 ---
 
 # Safe Schema Change

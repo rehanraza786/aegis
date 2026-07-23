@@ -287,6 +287,33 @@ top_topics = [r[0] for r in q("SELECT topic, COUNT(*) n FROM msg_edges GROUP BY 
 top_tables = [r[0] for r in q("SELECT tbl, COUNT(*) n FROM db_access GROUP BY tbl ORDER BY n DESC LIMIT 15")]
 n_test = q("SELECT COUNT(*) c FROM files WHERE is_test=1")[0]["c"] if has_test else 0
 _more = lambda all_, n, doc: f" (+{len(all_) - n} more, see {doc})" if len(all_) > n else ""  # noqa: E731
+# Standing rules are DERIVED from what the graph actually found, never stated
+# as universal truths: a Rails shop must not be told "Liquibase first, always".
+_msg_systems = [r[0] or "kafka" for r in q("SELECT DISTINCT COALESCE(system,'kafka') FROM msg_edges")]
+
+
+def _mig_tool(t):
+    if t.startswith("prisma:"):
+        return "the Prisma schema"
+    if t.startswith("rails:"):
+        return "Rails migrations"
+    if t.startswith("alembic:"):
+        return "Alembic revisions"
+    import re as _re
+    return "Flyway migrations" if _re.match(r"^[VUR]\d*__", t, _re.I) else "Liquibase changesets"
+
+
+_mig_tools = sorted({_mig_tool(r[0]) for r in q("SELECT DISTINCT changeset FROM db_defs WHERE changeset IS NOT NULL")})
+_rules = ["- Follow the codebase's existing patterns over textbook patterns; when they conflict, match the codebase and note the tension."]
+if topics_l:
+    _kind = "Topic/queue" if any(s != "kafka" for s in _msg_systems) else "Topic"
+    _rules.append(f"- {_kind} names come from application config or constants, never hardcode a new literal "
+                  "(hardcoding a config-declared name gets flagged).")
+if _mig_tools:
+    _rules.append(f"- Every table change goes through your migration layer (detected: {', '.join(_mig_tools)}); "
+                  "`db_map` shows the history and will flag drift.")
+_rules.append("- Run the feature-delivery-loop (test → implement → build → verify → review → document) per increment; "
+              "update `docs/features/<id>/tasks.md` as you go. PROGRESS.md is generated from it.")
 md = f"""# Agent Context Pack (generated, read this FIRST, then use Ariadne tools)
 
 This file plus one or two tool calls should orient you completely. Do not
@@ -312,10 +339,7 @@ Tests: {n_test} test files indexed. Test-derived facts are labeled [TEST] in too
 {chr(10).join(f"- `{h['path']}` ({h['n']} dependents)" for h in hot6)}
 
 ## Standing rules for implementation work
-- Follow the codebase's existing patterns over textbook patterns; when they conflict, match the codebase and note the tension.
-- Kafka topic names come from application.yaml or constants, never hardcode a new literal topic.
-- Every table change goes through a Liquibase changeset; `db_map` shows the history and will flag drift.
-- Run the feature-delivery-loop (test → implement → build → verify → review → document) per increment; update `docs/features/<id>/tasks.md` as you go. PROGRESS.md is generated from it.
+{chr(10).join(_rules)}
 """
 write("agent-context.md", md)
 ext = DB.parent / "extensions"

@@ -1,6 +1,6 @@
 ---
 name: feature-delivery-loop
-description: Agile iterative delivery workflow — implement features in small increments, building, testing, and writing unit tests each cycle until the Definition of Done is met, and keeping markdown documentation in sync with the code. Use this skill for ANY feature work, story, or ticket implementation, whenever the user asks to "implement", "build", "add a feature", "work on this story", or when a task will change code that has documentation. Also use when resuming a partially complete feature.
+description: Agile iterative delivery workflow — implement features in small increments, building, testing, and writing unit tests each cycle until the Definition of Done is met, and keeping markdown documentation in sync with the code. This is the UMBRELLA skill for implementation — it drives spec-driven-artifacts for its documents and embeds task breakdown, so when code will actually change, start here rather than with those. Use for ANY feature work, story, or ticket implementation, whenever the user asks to "implement", "build", "add a feature", "work on this story", or when a task will change code that has documentation. Also use when resuming a partially complete feature.
 ---
 
 # Feature Delivery Loop

@@ -1,6 +1,6 @@
 ---
 name: complex-task-breakdown
-description: A structured method for planning, decomposing, and executing complex or multi-step tasks reliably. Use this skill whenever a task has more than 2-3 steps, touches multiple files or systems, has ambiguous requirements, involves debugging something non-obvious, or feels too large to answer in one pass — even if the user doesn't explicitly ask for a plan. Also use it when a previous attempt at the task failed or produced incomplete results.
+description: A structured method for planning, decomposing, and executing complex or multi-step tasks reliably. Use for multi-step work that is NOT feature implementation (research, analysis, operational tasks), when the user asks for a plan or breakdown without implementing yet, or when a previous attempt failed or produced incomplete results. For work that will change code, use feature-delivery-loop instead — it embeds this discipline.
 ---
 
 # Complex Task Breakdown
