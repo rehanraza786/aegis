@@ -125,6 +125,16 @@ The post-review release. Highlights, roughly in the order they landed:
   plain B-tree index, and a pre-v6 index migrates itself with a one-time full
   rebuild on the next indexing run — while read-side opens (`--status`) leave
   it untouched.
+- **Graph view closes the loop:** PNG/SVG export of the current map (PNG from
+  the canvas; SVG from a first-party serializer for the view's four node
+  shapes, because the common cytoscape SVG plugin is GPLv3 and cannot ship in
+  this MIT vsix) with the provenance encoding intact — and drag-to-connect:
+  toggle ✏ Assert edge, drag module → topic/table/endpoint (or topic/table →
+  module), and the gesture becomes a prefilled assertion form that still
+  demands the anchor file:line and evidence. cytoscape-edgehandles (MIT) is
+  bundled self-contained; zero egress as always. The suite also gained a
+  deterministic routing eval: canonical utterances must route to their
+  intended skills by description token overlap, so trigger drift fails CI.
 
 ## 0.1.0
 
