@@ -320,6 +320,7 @@ function render(keepPositions, freshLayout) {
 
 const siteRow = (s, extra = "") =>
   `<div class="site"><a data-open="${esc(s.path)}:${s.line}">${esc(s.path)}:${s.line}</a>` +
+  `<a data-cite="${esc(s.path)}:${s.line}" title="Cite this line as evidence">⎘</a>` +
   (s.via ? `<span class="tag">via ${esc(s.via)}</span>` : "") +
   (s.test ? `<span class="tag">TEST</span>` : "") +
   (s.asserted ? `<span class="tag">${esc(s.asserted)}</span>` : "") + extra + "</div>";
@@ -456,10 +457,20 @@ function renderGaps() {
   bindDetailHandlers(g);
 }
 
+let citeBox = null; // the evidence textarea nearest the clicked cite link
 function bindDetailHandlers(root) {
   root.querySelectorAll("a[data-open]").forEach((a) => a.addEventListener("click", () => {
     const [p, l] = a.dataset.open.split(/:(?=\d+$)/);
     vscode.postMessage({ type: "openFile", path: p, line: Number(l) || 1 });
+  }));
+  // cite-this-line: better evidence with one click — the extension reads the
+  // line and it lands, quoted with its file:line, in the nearest evidence box
+  root.querySelectorAll("a[data-cite]").forEach((a) => a.addEventListener("click", () => {
+    const [p, l] = a.dataset.cite.split(/:(?=\d+$)/);
+    const scope = a.closest(".gap-item") || root;
+    citeBox = scope.querySelector("form.annotate textarea[name=evidence]") ||
+      document.querySelector("#details form.annotate textarea[name=evidence]");
+    vscode.postMessage({ type: "cite", path: p, line: Number(l) || 1 });
   }));
   root.querySelectorAll("form.annotate").forEach((f) => f.addEventListener("submit", (ev) => {
     ev.preventDefault();
@@ -501,6 +512,10 @@ window.addEventListener("message", (ev) => {
     }
   }
   if (m.type === "toast") toast(m.message, m.isError);
+  if (m.type === "citation" && citeBox) {
+    citeBox.value = (citeBox.value ? citeBox.value + "\n" : "") + m.text;
+    citeBox.focus();
+  }
 });
 document.getElementById("refresh").addEventListener("click", () => vscode.postMessage({ type: "refresh" }));
 document.getElementById("staleReindex").addEventListener("click", () => {

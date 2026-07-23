@@ -339,6 +339,15 @@ function openGraphPanel(context) {
         panel.webview.postMessage({ type: "toast", message: String(e.stderr || e.message).trim(), isError: true });
       }
       await send(true);
+    } else if (m.type === "cite") {
+      // read the cited line and hand it back quoted — evidence with one click
+      try {
+        const lines = fs.readFileSync(absOf(m.path), "utf8").split("\n");
+        const text = (lines[(m.line || 1) - 1] || "").trim().slice(0, 200);
+        panel.webview.postMessage({ type: "citation", text: `${m.path}:${m.line}: ${text}` });
+      } catch {
+        panel.webview.postMessage({ type: "toast", message: `AEGIS: cannot read ${m.path}`, isError: true });
+      }
     } else if (m.type === "openFile") {
       try {
         const doc = await vscode.workspace.openTextDocument(absOf(m.path));
