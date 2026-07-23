@@ -57,6 +57,12 @@
   .toast { position: fixed; bottom: 12px; left: 12px; right: 372px; padding: 8px 12px; border-radius: 4px;
            background: var(--vscode-notifications-background, #333); border: 1px solid var(--vscode-panel-border);
            box-shadow: 0 2px 8px rgba(0,0,0,.35); display: none; }
+  #stale { display: none; position: absolute; top: 44px; left: 50%; transform: translateX(-50%); z-index: 5;
+           align-items: center; gap: 10px; padding: 6px 12px; border-radius: 4px; font-size: .92em;
+           background: var(--vscode-notifications-background, #333);
+           border: 1px solid var(--vscode-editorWarning-foreground, #cca700);
+           box-shadow: 0 2px 8px rgba(0,0,0,.35); }
+  #stale.on { display: inline-flex; }
 </style>
 </head>
 <body>
@@ -71,6 +77,8 @@
     <button id="refresh">Refresh</button>
   </div>
   <div id="cy"></div>
+  <div id="stale"><span class="warn">⚠ Index is stale</span><span class="muted" id="staleDetail"></span>
+    <button id="staleReindex">Reindex</button></div>
   <div id="side">
     <div class="legend" id="legend"></div>
     <div id="details"><h3>Details</h3><p class="muted">Click a node. Modules are rectangles, Kafka topics are
@@ -193,9 +201,22 @@ function render(keepPositions) {
     `<span><span class="sw diamond" style="background:${c.topic}"></span>Kafka topic</span>` +
     `<span><span class="sw round" style="background:${c.table}"></span>DB table</span>` +
     `<span><span class="warn">⚠ warning</span></span><span class="muted">dashed = asserted</span>`;
+  // "shown/total" whenever the export capped a list — silent truncation reads
+  // as "covered everything" when it didn't
+  const gf = G.generated_from;
+  const cnt = (shown, total) => (total && total > shown ? `${shown}/${total}` : `${shown}`);
   document.getElementById("meta").textContent =
-    `${G.modules.length}${G.generated_from.modules_truncated_to ? "/" + G.generated_from.modules_total : ""} modules · ` +
-    `${G.topics.length} topics · ${G.tables.length} tables · ${G.endpoints.length} endpoints · ${G.generated_from.symbols} symbols`;
+    `${cnt(G.modules.length, gf.modules_total)} modules · ${cnt(G.topics.length, gf.topics_total)} topics · ` +
+    `${cnt(G.tables.length, gf.tables_total)} tables · ${cnt(G.endpoints.length, gf.endpoints_total)} endpoints · ${gf.symbols} symbols`;
+  // stale-index banner: the graph must be able to say it's out of date
+  const stale = document.getElementById("stale");
+  if (gf.fresh === false) {
+    document.getElementById("staleDetail").textContent =
+      `indexed ${String(gf.indexed_sha || "?").slice(0, 8)} · HEAD ${String(gf.head_sha || "?").slice(0, 8)}`;
+    stale.classList.add("on");
+  } else {
+    stale.classList.remove("on");
+  }
 }
 
 const siteRow = (s, extra = "") =>
@@ -277,7 +298,7 @@ function renderGaps() {
     ${declUnused.length ? `<h4 class="warn">Declared in config, unused</h4>` + declUnused.map((it) => `<div class="gap-item"><span class="warn">⚠</span> <b>${esc(it.topic)}</b> — ${esc(it.config_key)} declares it, but no producer or consumer references it.<div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div></div>`).join("") : ""}
     ${drift.length ? `<h4 class="err">Drift tables</h4>` + drift.map((t) => `<div class="gap-item"><span class="err">⚠</span> <b>${esc(t.table)}</b> — no changeset. Click its node to assert.</div>`).join("") : ""}
     ${orphans.length ? `<h4 class="warn">Orphan topics</h4>` + orphans.map((t) => `<div class="gap-item"><span class="warn">⚠</span> <b>${esc(t.topic)}</b> — ${t.warnings.orphan_produce ? "no consumer" : "no producer"} found. Often a real bug: investigate before silencing.</div>`).join("") : ""}
-    ${uncalled.length ? `<h4 class="warn">Endpoints with no caller</h4>` + uncalled.slice(0, 10).map((e) => `<div class="gap-item"><span class="warn">⚠</span> ${esc(e.method)} <b>${esc(e.path)}</b><div class="site"><a data-open="${esc(e.file)}:${e.line}">${esc(e.file)}:${e.line}</a></div></div>`).join("") : ""}`;
+    ${uncalled.length ? `<h4 class="warn">Endpoints with no caller</h4>` + uncalled.slice(0, 10).map((e) => `<div class="gap-item"><span class="warn">⚠</span> ${esc(e.method)} <b>${esc(e.path)}</b><div class="site"><a data-open="${esc(e.file)}:${e.line}">${esc(e.file)}:${e.line}</a></div></div>`).join("") + (uncalled.length > 10 ? `<div class="muted">…and ${uncalled.length - 10} more uncalled endpoints (query http_map)</div>` : "") : ""}`;
   bindDetailHandlers(g);
 }
 
@@ -306,10 +327,23 @@ function bindDetailHandlers(root) {
 
 window.addEventListener("message", (ev) => {
   const m = ev.data;
-  if (m.type === "data") { G = m.graph; render(m.keepPositions); renderGaps(); if (selected) resetDetails(); }
+  if (m.type === "data") {
+    G = m.graph; render(m.keepPositions); renderGaps();
+    // selection survives a refresh: re-resolve the node in the NEW graph and
+    // re-render its (possibly changed) details, instead of dropping to blank
+    if (selected) {
+      const n = cy.getElementById(selected.id);
+      if (n && n.nonempty()) { n.select(); selected = n.data(); showDetails(selected); }
+      else { selected = null; resetDetails(); }
+    }
+  }
   if (m.type === "toast") toast(m.message, m.isError);
 });
 document.getElementById("refresh").addEventListener("click", () => vscode.postMessage({ type: "refresh" }));
+document.getElementById("staleReindex").addEventListener("click", () => {
+  toast("Reindexing (incremental)…");
+  vscode.postMessage({ type: "reindex" });
+});
 document.getElementById("fit").addEventListener("click", () => cy && cy.fit(undefined, 30));
 for (const id of ["tTopics", "tTables", "tTests"]) {
   document.getElementById(id).addEventListener("change", () => { render(false); renderGaps(); });
