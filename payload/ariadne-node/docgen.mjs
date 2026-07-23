@@ -15,6 +15,8 @@
  */
 import Database from "better-sqlite3";
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+import { approvedFiles } from "./trust.mjs";
 import path from "node:path";
 
 const ROOT = process.cwd();
@@ -335,9 +337,9 @@ ${hot.map((h) => `- \`${h.path}\` (${h.n} dependents)`).join("\n")}\n
 {
   const dir = path.join(path.dirname(DB_PATH), "extensions");
   if (fs.existsSync(dir)) {
-    for (const f of fs.readdirSync(dir).filter((x) => /^doc-.*\.mjs$/.test(x))) {
+    for (const f of approvedFiles(dir, /^doc-.*\.mjs$/, (l, m) => console.error(m))) {
       try {
-        const mod = await import("file://" + path.join(dir, f));
+        const mod = await import(pathToFileURL(path.join(dir, f)).href);
         if (typeof mod.generate === "function") await mod.generate({ q, write, mmId, svc, OUT });
       } catch (e) { console.error(`  ! doc extension ${f}: ${e.message}`); }
     }

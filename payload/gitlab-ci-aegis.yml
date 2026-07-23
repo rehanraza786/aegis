@@ -13,8 +13,17 @@ aegis-index:
     - if: '$CI_PIPELINE_SOURCE == "web"'   # allow manual runs from the UI
   variables:
     GIT_DEPTH: "0"          # full history: indexer stamps SHAs and diffs against them
+    TS_PROJECT_DIR: "frontend"          # directory containing tsconfig.json ("" to skip)
+    # Pin these for reproducible CI once you know the versions your build likes;
+    # "latest" trades reproducibility for zero maintenance.
+    SCIP_TS_VERSION: "latest"           # @sourcegraph/scip-typescript
+    SCIP_JAVA_VERSION: "latest.stable"  # com.sourcegraph:scip-java_2.13
+    COURSIER_VERSION: "v2.1.24"         # pinned launcher release (was a moving branch URL)
   before_script:
-    - apt-get update -qq && apt-get install -y -qq python3 python3-pip openjdk-21-jdk-headless curl
+    # node:20 is Debian bookworm: there is no openjdk-21 package there, so the
+    # old `openjdk-21-jdk-headless` install failed the whole job out of the box.
+    # default-jdk-headless (17 on bookworm) is all scip-java needs.
+    - apt-get update -qq && apt-get install -y -qq python3 python3-pip default-jdk-headless curl
     # Runtime auto-detect: Node edition (indexer.mjs) or Python edition (indexer.py)
     - |
       if [ -f .ariadne/indexer.mjs ]; then
@@ -30,23 +39,27 @@ aegis-index:
     - eval "$INDEX --full"
 
     # ---------- TypeScript / React (compiler-grade) ----------
-    # ADJUST: repeat this block per directory containing a tsconfig.json
+    # Set TS_PROJECT_DIR above; repeat the block per additional tsconfig root.
     - |
-      (cd frontend \
-        && npm ci \
-        && npx --yes @sourcegraph/scip-typescript index --output index.scip) \
-        || echo "WARN: scip-typescript failed; baseline index still published"
+      if [ -n "$TS_PROJECT_DIR" ] && [ -d "$TS_PROJECT_DIR" ]; then
+        (cd "$TS_PROJECT_DIR" \
+          && npm ci \
+          && npx --yes "@sourcegraph/scip-typescript@${SCIP_TS_VERSION}" index --output index.scip) \
+          || echo "WARN: scip-typescript failed; baseline index still published"
+      else
+        echo "TS_PROJECT_DIR '$TS_PROJECT_DIR' not present; skipping scip-typescript"
+      fi
 
     # ---------- Java (compiler-grade) ----------
     # ADJUST: run at the Gradle/Maven root. scip-java autodetects the build tool.
     - |
-      (curl -fLo coursier https://github.com/coursier/launchers/raw/master/coursier \
-        && chmod +x coursier \
-        && ./coursier launch com.sourcegraph:scip-java_2.13:latest.stable -- index --output java.scip) \
+      (curl -fLo cs.gz "https://github.com/coursier/coursier/releases/download/${COURSIER_VERSION}/cs-x86_64-pc-linux.gz" \
+        && gunzip -f cs.gz && chmod +x cs \
+        && ./cs launch "com.sourcegraph:scip-java_2.13:${SCIP_JAVA_VERSION}" -- index --output java.scip) \
         || echo "WARN: scip-java failed; baseline index still published"
 
     # ---------- Ingest whatever succeeded ----------
-    - eval "$INGEST $(ls frontend/index.scip java.scip 2>/dev/null)" || echo "no SCIP output to ingest"
+    - eval "$INGEST $(ls "$TS_PROJECT_DIR"/index.scip java.scip 2>/dev/null)" || echo "no SCIP output to ingest"
     - eval "$INDEX --status"
     # ---------- Generate flow docs + progress report (zero LLM tokens) ----------
     - |

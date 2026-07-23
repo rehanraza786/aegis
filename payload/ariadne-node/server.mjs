@@ -13,6 +13,8 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 import { pathsMatch } from "./http.mjs";
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+import { approvedFiles } from "./trust.mjs";
 import path from "node:path";
 
 function git(args) {
@@ -797,9 +799,9 @@ tool(server, "reindex",
 {
   const extDir = path.join(GR_DIR, "extensions");
   if (fs.existsSync(extDir)) {
-    for (const f of fs.readdirSync(extDir).filter((x) => x.endsWith(".tool.mjs"))) {
+    for (const f of approvedFiles(extDir, /\.tool\.mjs$/, (l, m) => console.error(m))) {
       try {
-        const mod = await import("file://" + path.join(extDir, f));
+        const mod = await import(pathToFileURL(path.join(extDir, f)).href);
         if (typeof mod.register === "function") await mod.register({ tool: (n, d2, s, f2) => tool(server, n, d2, s, f2), z, withDb, server });
       } catch (e) { console.error(`extension tool ${f} failed: ${e.message}`); }
     }

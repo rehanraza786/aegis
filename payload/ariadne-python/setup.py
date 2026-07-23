@@ -22,28 +22,67 @@ def git_repos():
     return [d for d in CWD.iterdir() if d.is_dir() and not d.name.startswith(".") and (d / ".git").exists()]
 
 
-HOOK = f"""#!/bin/sh
-# AEGIS: refresh the codebase graph in the background (never blocks git)
-AR="{CWD.as_posix()}/.ariadne"
-[ -f "$AR/indexer.mjs" ] && IDX="node \\"$AR/indexer.mjs\\"" || IDX="${{PYTHON:-python3}} \\"$AR/indexer.py\\""
-command -v python3 >/dev/null 2>&1 || PYTHON=python
-(eval "$IDX --incremental" >> "$AR/index.log" 2>&1
-  if [ -f "$AR/docgen.mjs" ]; then node "$AR/docgen.mjs" >> "$AR/index.log" 2>&1; \\
-  elif [ -f "$AR/docgen.py" ]; then ${{PYTHON:-python3}} "$AR/docgen.py" >> "$AR/index.log" 2>&1; fi) &
-exit 0
+def _dq(s) -> str:
+    """Escape a baked path for the hook's single-quoted bash -c script: a
+    double-quoted shell literal with backslash/backtick/dollar/quote escaped."""
+    s = str(s).replace("\\", "/")
+    for ch in ("`", "$", '"'):
+        s = s.replace(ch, "\\" + ch)
+    return f'"{s}"'
+
+
+REPOS = git_repos()
+MULTI = len(REPOS) > 1 or bool(os.environ.get("ARIADNE_ROOTS"))
+# Single repo: the hook resolves everything at RUN time (survives repo moves).
+# Multi-repo workspace: the workspace root cannot be derived from inside one
+# member repo, so it is baked here — along with ARIADNE_ROOTS/ARIADNE_HOME so
+# the incremental index actually runs in workspace mode with the shared DB.
+if MULTI:
+    AR_BLOCK = (f"  AR={_dq(CWD.as_posix() + '/.ariadne')}\n"
+                f"  export ARIADNE_HOME={_dq(CWD.as_posix())}\n"
+                f"  export ARIADNE_ROOTS={_dq(','.join(str(r) for r in REPOS))}")
+else:
+    AR_BLOCK = '  AR="$(git rev-parse --show-toplevel)/.ariadne"'
+HOOK_BLOCK = f"""
+# aegis-index-hook: keep the codebase graph fresh (background; never blocks git; lockfile prevents overlap)
+(nohup bash -c '
+{AR_BLOCK}
+  [ -d "$AR" ] || exit 0
+  {{
+    if [ -f "$AR/indexer.mjs" ]; then
+      node "$AR/indexer.mjs" --incremental && node "$AR/docgen.mjs"
+    elif [ -f "$AR/indexer.py" ]; then
+      PY="$(command -v python3 || command -v python)"
+      "$PY" "$AR/indexer.py" --incremental && "$PY" "$AR/docgen.py"
+    fi
+  }} >> "$AR/index.log" 2>&1' >/dev/null 2>&1 &) || true
 """
 
 hooks = 0
-for repo in git_repos():
-    hook_dir = repo / ".git" / "hooks"
-    if not hook_dir.exists():
-        continue
+for repo in REPOS:
+    # git resolves the real hooks dir (worktrees, submodules, core.hooksPath);
+    # .git/hooks was wrong for all three, silently skipping them
+    r = subprocess.run(["git", "rev-parse", "--git-path", "hooks"],
+                       capture_output=True, text=True, cwd=repo)
+    if r.returncode != 0:
+        continue  # not a git repo
+    hook_dir = (Path(repo) / r.stdout.strip()).resolve() if not Path(r.stdout.strip()).is_absolute() \
+        else Path(r.stdout.strip())
+    hook_dir.mkdir(parents=True, exist_ok=True)
     for h in ("post-commit", "post-merge", "post-checkout"):
         f = hook_dir / h
-        if f.exists() and "AEGIS" not in f.read_text(encoding="utf-8", errors="replace"):
-            print(f"  skip {h} in {repo.name} (existing non-AEGIS hook)")
+        existing = f.read_text(encoding="utf-8", errors="replace") if f.exists() else None
+        if existing and "aegis-index-hook" in existing:
             continue
-        f.write_text(HOOK, encoding="utf-8")
+        if existing and "# AEGIS: refresh the codebase graph" in existing:
+            # migrate a hook written by the previous installer (whole file was ours)
+            f.write_text("#!/bin/sh" + HOOK_BLOCK, encoding="utf-8")
+        elif existing:
+            # chain onto an existing hook instead of refusing (matches install-hooks.sh)
+            with f.open("a", encoding="utf-8") as fh:
+                fh.write(HOOK_BLOCK)
+        else:
+            f.write_text("#!/bin/sh" + HOOK_BLOCK, encoding="utf-8")
         try:
             f.chmod(f.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         except OSError:

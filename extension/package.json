@@ -5,6 +5,10 @@
   "version": "0.1.0",
   "publisher": "aegis-dev",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rehanraza786/aegis"
+  },
   "engines": {
     "vscode": "^1.99.0"
   },
@@ -61,6 +65,10 @@
       {
         "command": "aegis.docgen",
         "title": "AEGIS: Generate Flow Docs & Progress Report"
+      },
+      {
+        "command": "aegis.approveExtensions",
+        "title": "AEGIS: Approve Workspace Extensions (trust gate)"
       }
     ],
     "mcpServerDefinitionProviders": [

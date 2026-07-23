@@ -1,7 +1,7 @@
 name: release-vsix
-# Builds the AEGIS .vsix and attaches it to a GitHub Release whenever you push
-# a version tag (v1.0.2, v1.1.0, ...). Everyone can then download it from the
-# repo's Releases page — no marketplace account required.
+# Builds the AEGIS .vsix and attaches it (with checksums) to a GitHub Release
+# whenever you push a version tag (v1.0.2, v1.1.0, ...). Everyone can then
+# download it from the repo's Releases page.
 on:
   push:
     tags: ["v*"]
@@ -14,16 +14,31 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      # Never ship an untested tag: the same suite the CI matrix runs gates the release.
+      - name: Test gate (node runtime, full suite)
+        run: python3 tests/run_tests.py --runtime node
       - name: Build .vsix
         run: |
           cd extension
           rm -rf payload && cp -r ../payload .
+          cp ../LICENSE .
           npm install -D @vscode/vsce
-          # keep extension version in sync with the tag
-          npm version --no-git-tag-version "${GITHUB_REF_NAME#v}" || true
-          npx vsce package --allow-missing-repository --skip-license
+          # keep the extension version in sync with the tag — and FAIL loudly if
+          # that can't be done ('|| true' here once meant a v1.2.0 tag could ship
+          # a vsix still labeled 0.1.0)
+          npm version --no-git-tag-version "${GITHUB_REF_NAME#v}"
+          npx vsce package
+      - name: Checksums
+        run: |
+          cd extension
+          sha256sum *.vsix > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: extension/*.vsix
+          files: |
+            extension/*.vsix
+            extension/SHA256SUMS.txt
           generate_release_notes: true

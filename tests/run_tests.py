@@ -322,6 +322,13 @@ def main():
         check("pip install", code == 0, out[-400:])
 
     install_sample_extensions(ws, rt)
+    # the trust gate refuses to execute unapproved extensions; approve the
+    # samples exactly the way a user would (and commit-shaped: writes the lock)
+    idx0 = str((ws / ".ariadne") / ("indexer.mjs" if rt == "node" else "indexer.py"))
+    exe0 = ["node"] if rt == "node" else [py]
+    code, oap = run(exe0 + [idx0, "--approve-extensions"], ws)
+    check("extension approval writes the lock", code == 0 and
+          (ws / ".ariadne" / "extensions" / "extensions.lock").exists(), oap[-200:])
     idx = str(ar / ("indexer.mjs" if rt == "node" else "indexer.py"))
 
     # ---- full index ----
@@ -827,6 +834,19 @@ await c.close();
           bus_rows and all((r[2] or "static") == "static" for r in bus_rows), str(bus_rows))
     db.close()
     check("extension pass logged", "extension pass: todo.pass" in out1)
+
+    # ---- trust gate: a tampered extension must NOT execute until re-approved ----
+    tampered = ws / ".ariadne" / "extensions" / ("todo.pass.mjs" if rt == "node" else "todo.pass.py")
+    tampered.write_text(tampered.read_text(encoding="utf-8")
+                        + ("\n// tampered after approval\n" if rt == "node" else "\n# tampered after approval\n"),
+                        encoding="utf-8")
+    code, otm = run(exe + [idx, "--full"], ws)
+    check("tampered extension is refused with a warning",
+          "NOT loaded" in otm and "todo.pass" in otm, otm[-300:])
+    code, _oap2 = run(exe + [idx, "--approve-extensions"], ws)
+    code2, otm2 = run(exe + [idx, "--full"], ws)
+    check("re-approval restores extension execution",
+          code == 0 and code2 == 0 and "extension pass: todo.pass" in otm2, otm2[-300:])
 
     # ---- enrichment plan mode (drives Copilot/external providers) ----
     en0 = str(ar / ("enrich.mjs" if rt == "node" else "enrich.py"))

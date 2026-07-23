@@ -13,14 +13,12 @@ GR="$REPO_ROOT/.ariadne"
 if [ -f "$GR/indexer.mjs" ]; then
   RUNTIME=node
   command -v node >/dev/null || { echo "Error: Node >=18 required (https://nodejs.org)"; exit 1; }
-  INDEX_CMD='node "$(git rev-parse --show-toplevel)/.ariadne/indexer.mjs"'
   echo "Runtime: Node ($(node --version))"
   (cd "$GR" && npm install --silent --no-audit --no-fund)
 elif [ -f "$GR/indexer.py" ]; then
   RUNTIME=python
   PY="$(command -v python3 || command -v python || true)"
   [ -n "$PY" ] || { echo "Error: Python 3.10+ required"; exit 1; }
-  INDEX_CMD="\"$PY\" \"\$(git rev-parse --show-toplevel)/.ariadne/indexer.py\""
   echo "Runtime: Python ($($PY --version 2>&1))"
   "$PY" -m pip install -r "$GR/requirements.txt" --quiet 2>/dev/null \
     || "$PY" -m pip install -r "$GR/requirements.txt" --break-system-packages --quiet \
@@ -32,13 +30,25 @@ fi
 install_hook () {
   local name="$1"
   local hook="$HOOKS_DIR/$name"
-  local marker="# aegis-index-hook"
-  if [ -f "$hook" ] && grep -q "$marker" "$hook"; then echo "  hook exists: $name"; return; fi
+  if [ -f "$hook" ] && grep -q "aegis-index-hook" "$hook"; then echo "  hook exists: $name"; return; fi
   [ -f "$hook" ] || echo "#!/usr/bin/env bash" > "$hook"
-  cat >> "$hook" <<HOOK
+  # QUOTED heredoc: nothing expands at install time, so the hook resolves the
+  # repo root, the runtime, and the interpreter when it RUNS. No baked absolute
+  # paths (survives moving the repo), and paths with spaces stay quoted.
+  cat >> "$hook" <<'HOOK'
 
-$marker, keep the codebase graph fresh (background; never blocks git; lockfile prevents overlap)
-(nohup bash -c "$INDEX_CMD --incremental && if [ -f \"$(git rev-parse --show-toplevel)/.ariadne/docgen.mjs\" ]; then node \"$(git rev-parse --show-toplevel)/.ariadne/docgen.mjs\"; elif [ -f \"$(git rev-parse --show-toplevel)/.ariadne/docgen.py\" ]; then python3 \"$(git rev-parse --show-toplevel)/.ariadne/docgen.py\"; fi" >> "\$(git rev-parse --show-toplevel)/.ariadne/index.log" 2>&1 &) || true
+# aegis-index-hook: keep the codebase graph fresh (background; never blocks git; lockfile prevents overlap)
+(nohup bash -c '
+  AR="$(git rev-parse --show-toplevel)/.ariadne"
+  [ -d "$AR" ] || exit 0
+  {
+    if [ -f "$AR/indexer.mjs" ]; then
+      node "$AR/indexer.mjs" --incremental && node "$AR/docgen.mjs"
+    elif [ -f "$AR/indexer.py" ]; then
+      PY="$(command -v python3 || command -v python)"
+      "$PY" "$AR/indexer.py" --incremental && "$PY" "$AR/docgen.py"
+    fi
+  } >> "$AR/index.log" 2>&1' >/dev/null 2>&1 &) || true
 HOOK
   chmod +x "$hook"
   echo "  installed: $name"

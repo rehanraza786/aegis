@@ -321,7 +321,15 @@ write("agent-context.md", md)
 ext = DB.parent / "extensions"
 if ext.exists():
     import importlib.util
-    for f in sorted(ext.glob("doc-*.py")):
+    import logging as _logging
+    import sys as _sys
+    from trust import approved_files
+    _dl = _logging.getLogger("ariadne.docgen")
+    if not _dl.handlers:
+        _dl.addHandler(_logging.StreamHandler(_sys.stderr))
+        _dl.setLevel(_logging.WARNING)
+    for name in approved_files(ext, r"^doc-.*\.py$", _dl):
+        f = ext / name
         try:
             spec = importlib.util.spec_from_file_location(f.stem.replace("-", "_"), f)
             mod = importlib.util.module_from_spec(spec)

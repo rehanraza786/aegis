@@ -55,11 +55,33 @@ function detectRuntime(root) {
   if (exists(path.join(root, ".ariadne", "indexer.py"))) return "python";
   return null;
 }
-function runInTerminal(name, cmd) {
-  // env passed via terminal options: works identically in PowerShell, cmd, bash, zsh
-  const t = vscode.window.createTerminal({ name, env: workspaceEnv() });
-  t.show(true);
-  t.sendText(cmd);
+let OUTPUT;
+/** Run a tool as a child process with an argument ARRAY, never a shell string:
+ *  a workspace path containing spaces, quotes, or $() must stay data, not code
+ *  (interpolated terminal.sendText was an injection vector and broke on
+ *  PowerShell 5.1, which has no `&&`). Output streams to the AEGIS channel. */
+function runProcess(title, cmd, args, opts = {}) {
+  const cp = require("child_process");
+  OUTPUT ??= vscode.window.createOutputChannel("AEGIS");
+  OUTPUT.show(true);
+  OUTPUT.appendLine(`\n▶ ${title}`);
+  return new Promise((resolve) => {
+    const child = cp.spawn(cmd, args, {
+      cwd: opts.cwd ?? workspaceRoot(), env: { ...process.env, ...workspaceEnv() }, shell: false,
+    });
+    child.stdout?.on("data", (d) => OUTPUT.append(String(d)));
+    child.stderr?.on("data", (d) => OUTPUT.append(String(d)));
+    child.on("error", (e) => { OUTPUT.appendLine(`✖ ${title}: ${e.message}`); resolve(-1); });
+    child.on("close", (code) => { OUTPUT.appendLine(`▶ ${title} finished (exit ${code})`); resolve(code ?? -1); });
+  });
+}
+/** npm ships as npm.cmd on Windows, which spawn without a shell cannot start;
+ *  route through cmd.exe there. Our arguments are fixed literals, so cmd's
+ *  re-parsing has nothing user-controlled to misinterpret. */
+function npmInvocation(args) {
+  return process.platform === "win32"
+    ? ["cmd.exe", ["/d", "/s", "/c", "npm", ...args]]
+    : ["npm", args];
 }
 
 async function install(context, withAriadne) {
@@ -94,10 +116,12 @@ async function install(context, withAriadne) {
       "Set up", "Later");
     if (pick === "Set up") {
       const rt = runtimeConfig();
-      const setup = rt === "node"
-        ? `node "${path.join(root, ".ariadne", "setup.mjs")}"`
-        : `${process.platform === "win32" ? "python" : "python3"} "${path.join(root, ".ariadne", "setup.py")}"`;
-      runInTerminal("AEGIS setup", setup);
+      const [cmd, args] = rt === "node"
+        ? ["node", [path.join(root, ".ariadne", "setup.mjs")]]
+        : [process.platform === "win32" ? "python" : "python3", [path.join(root, ".ariadne", "setup.py")]];
+      const code = await runProcess("Ariadne setup (dependencies, hooks, initial index)", cmd, args, { cwd: root });
+      if (code === 0) vscode.window.showInformationMessage("AEGIS: Ariadne is set up. Open Copilot Chat in agent mode.");
+      else vscode.window.showErrorMessage("AEGIS: setup failed, see the AEGIS output channel.");
     }
   }
 }
@@ -113,9 +137,14 @@ function ariadneCommand(action) {
     const idx = indexerPath(root, runtime);
     const exe = runtime === "node" ? "node" : (process.platform === "win32" ? "python" : "python3");
     if (action === "pull") {
-      runInTerminal("AEGIS pull index", `bash "${path.join(root, ".ariadne", "pull-index.sh")}"`);
+      // bash script (GitLab API): on Windows this needs Git Bash/WSL on PATH;
+      // the spawn error handler surfaces a clear message if bash is absent
+      runProcess("Pull team-shared index", "bash", [path.join(root, ".ariadne", "pull-index.sh")], { cwd: root });
+    } else if (action === "approve") {
+      runProcess("Approve workspace extensions", exe, [idx, "--approve-extensions"], { cwd: root });
     } else {
-      runInTerminal(`AEGIS ${action}`, `${exe} "${idx}" --${action === "status" ? "status" : "full"}`);
+      runProcess(`Ariadne ${action === "status" ? "index status" : "full reindex"}`, exe,
+        [idx, action === "status" ? "--status" : "--full"], { cwd: root });
     }
   };
 }
@@ -312,10 +341,14 @@ function updateWorkspace(context) {
   overwriteDir(path.join(payload, ".github", "skills"), path.join(root, ".github", "skills"));
   overwriteDir(path.join(payload, ".github", "agents"), path.join(root, ".github", "agents"));
   // new payload versions may add dependencies, refresh them
-  const dep = runtime === "node"
-    ? `cd "${path.join(root, ".ariadne")}" && npm install --no-audit --no-fund`
-    : `${process.platform === "win32" ? "python" : "python3"} -m pip install -r "${path.join(root, ".ariadne", "requirements.txt")}"`;
-  runInTerminal("AEGIS update deps", dep);
+  const arDir = path.join(root, ".ariadne");
+  if (runtime === "node") {
+    const [c, a] = npmInvocation(["install", "--no-audit", "--no-fund"]);
+    runProcess("Refresh Ariadne dependencies", c, a, { cwd: arDir });
+  } else {
+    runProcess("Refresh Ariadne dependencies", process.platform === "win32" ? "python" : "python3",
+      ["-m", "pip", "install", "-r", path.join(arDir, "requirements.txt")], { cwd: arDir });
+  }
   vscode.window.showInformationMessage(`AEGIS updated ${updated} managed files (config, index, knowledge, and extensions preserved). Rebuild the index if the schema changed: AEGIS: Rebuild Index.`);
 }
 
@@ -333,9 +366,11 @@ function activate(context) {
       const root = workspaceRoot();
       const runtime = root && detectRuntime(root);
       if (!runtime) { vscode.window.showWarningMessage("AEGIS: Ariadne not installed here."); return; }
-      const exe = runtime === "node" ? "node .ariadne/docgen.mjs" : `${process.platform === "win32" ? "python" : "python3"} .ariadne/docgen.py`;
-      runInTerminal("AEGIS docgen", exe);
+      const exe = runtime === "node" ? "node" : (process.platform === "win32" ? "python" : "python3");
+      runProcess("Generate flow docs & progress report", exe,
+        [path.join(root, ".ariadne", runtime === "node" ? "docgen.mjs" : "docgen.py")], { cwd: root });
     }),
+    vscode.commands.registerCommand("aegis.approveExtensions", ariadneCommand("approve")),
 );
   registerMcpProvider(context);
 
