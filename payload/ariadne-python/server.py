@@ -956,7 +956,14 @@ def _load_tool_extensions():
     if not ext.exists():
         return
     import importlib.util
-    for f in sorted(ext.glob("*.tool.py")):
+    import logging as _logging
+    from trust import approved_files
+    _tl = _logging.getLogger("ariadne.server")
+    if not _tl.handlers:
+        _tl.addHandler(_logging.StreamHandler(sys.stderr))
+        _tl.setLevel(_logging.WARNING)
+    for name in approved_files(ext, r"\.tool\.py$", _tl):
+        f = ext / name
         try:
             spec = importlib.util.spec_from_file_location(f.stem.replace(".", "_"), f)
             mod = importlib.util.module_from_spec(spec)

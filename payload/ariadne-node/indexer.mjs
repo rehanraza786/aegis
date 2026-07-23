@@ -17,6 +17,8 @@ import { extractJavaHttp, extractTsHttp, normalizePath as normalizeAssertedPath 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+import { approvedFiles, approveAll, LOCK_NAME } from "./trust.mjs";
 import path from "node:path";
 import process from "node:process";
 
@@ -483,9 +485,11 @@ async function loadExtractors() {
   const dir = path.join(GR_DIR, "extensions");
   const out = [];
   if (!fs.existsSync(dir)) return out;
-  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith(".extract.mjs"))) {
+  for (const f of approvedFiles(dir, /\.extract\.mjs$/, log)) {
     try {
-      const mod = await import("file://" + path.join(dir, f));
+      // pathToFileURL, not "file://"+join: bare concatenation yields file://C:\…
+      // on Windows, which the ESM loader rejects, silently skipping extensions.
+      const mod = await import(pathToFileURL(path.join(dir, f)).href);
       if (mod.extractors) out.push({ name: f, x: normalizeHooks(mod.extractors) });
     } catch (e) { log("WARN", `extractor ${f} failed to load: ${e.message}`); }
   }
@@ -824,9 +828,9 @@ async function kafkaPass(db, scopePrefixes = null) {
 async function runExtensionPasses(db, ctx) {
   const dir = path.join(GR_DIR, "extensions");
   if (!fs.existsSync(dir)) return;
-  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith(".pass.mjs"))) {
+  for (const f of approvedFiles(dir, /\.pass\.mjs$/, log)) {
     try {
-      const mod = await import("file://" + path.join(dir, f));
+      const mod = await import(pathToFileURL(path.join(dir, f)).href);
       if (typeof mod.run === "function") { await mod.run({ db, ...ctx }); log("INFO", `extension pass: ${f}`); }
     } catch (e) { log("WARN", `extension ${f} failed: ${e.message}`); }
   }
@@ -947,6 +951,11 @@ if (MULTI) log("INFO", `Workspace mode: ${ROOTS.length} repos: ${ROOTS.map(r=>pa
 const mode = process.argv[2] ?? "--status";
 if (mode === "--status") {
   status(connect());
+} else if (mode === "--approve-extensions") {
+  const { approved, changed } = approveAll(path.join(GR_DIR, "extensions"));
+  console.log(approved.length
+    ? `Approved ${approved.length} extension file(s)${changed.length ? ` (${changed.length} new/changed: ${changed.join(", ")})` : " (no changes)"}. Commit .ariadne/${LOCK_NAME} to share the approval.`
+    : "No extension files found in .ariadne/extensions/.");
 } else if (mode === "--full" || mode === "--incremental" || mode === "--rebuild") {
   if (!acquireLock()) { log("INFO", "Another indexer run is in progress; exiting cleanly."); process.exit(0); }
   try {
@@ -959,6 +968,6 @@ if (mode === "--status") {
     releaseLock();
   }
 } else {
-  console.log("Usage: node indexer.mjs --full | --incremental | --rebuild | --status");
+  console.log("Usage: node indexer.mjs --full | --incremental | --rebuild | --status | --approve-extensions");
   process.exitCode = 2;
 }

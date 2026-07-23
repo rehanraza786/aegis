@@ -25,6 +25,25 @@ errors are logged, never abort indexing); scope-aware extensions should honor
 `inScope(rel)`; prefix your tables to avoid collisions; and if you add tables
 referencing `files(id)`, use `ON DELETE CASCADE` so pruning stays clean.
 
+## Extensions are gated by explicit approval
+
+`.ariadne/extensions/` is committed and shared — which would otherwise mean
+anyone with push access executes code in every teammate's MCP server and
+post-commit hook on their next pull, and cloning a third-party repo and
+starting the server would run whatever it contained. So extensions execute
+only when their sha256 matches an entry in **`.ariadne/extensions.lock`**:
+
+```
+node .ariadne/indexer.mjs --approve-extensions     # or indexer.py
+git add .ariadne/extensions.lock && git commit     # approval is PR-reviewed
+```
+
+A new or edited extension is skipped with a WARN naming it until someone
+reviews and re-approves — the same discipline as `graph-assertions.json`. The
+lock hashes both editions' files, so switching runtimes keeps approvals. The
+VS Code palette has *AEGIS: Approve Workspace Extensions*; hermetic CI that
+builds the extensions directory itself can set `ARIADNE_TRUST_EXTENSIONS=1`.
+
 ## The graph-view contract (visual clients)
 
 `node .ariadne/graph_export.mjs` (or `python3 .ariadne/graph_export.py`) prints

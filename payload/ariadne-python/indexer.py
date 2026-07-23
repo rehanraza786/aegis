@@ -534,7 +534,9 @@ def _load_extractors():
     if not ext.exists():
         return out
     import importlib.util
-    for f in sorted(ext.glob("*.extract.py")):
+    from trust import approved_files
+    for name in approved_files(ext, r"\.extract\.py$", log):
+        f = ext / name
         try:
             spec = importlib.util.spec_from_file_location(f.stem.replace(".", "_").replace("-", "_"), f)
             mod = importlib.util.module_from_spec(spec)
@@ -950,7 +952,9 @@ def kafka_pass(con, scope_prefixes=None):
     ext = DB_DIR / "extensions"
     if ext.exists():
         import importlib.util
-        for f in sorted(ext.glob("*.pass.py")):
+        from trust import approved_files
+        for name in approved_files(ext, r"\.pass\.py$", log):
+            f = ext / name
             try:
                 spec = importlib.util.spec_from_file_location(f.stem.replace(".", "_"), f)
                 mod = importlib.util.module_from_spec(spec)
@@ -1079,7 +1083,18 @@ if __name__ == "__main__":
     ap.add_argument("--incremental", action="store_true")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--rebuild", action="store_true")
+    ap.add_argument("--approve-extensions", action="store_true")
     args = ap.parse_args()
+    if args.approve_extensions:
+        from trust import approve_all, LOCK_NAME
+        r = approve_all(DB_DIR / "extensions")
+        if r["approved"]:
+            delta = f" ({len(r['changed'])} new/changed: {', '.join(r['changed'])})" if r["changed"] else " (no changes)"
+            print(f"Approved {len(r['approved'])} extension file(s){delta}. "
+                  f"Commit .ariadne/{LOCK_NAME} to share the approval.")
+        else:
+            print("No extension files found in .ariadne/extensions/.")
+        sys.exit(0)
     if MULTI:
         log.info("Workspace mode: %d repos: %s", len(ROOTS), ", ".join(r.name for r in ROOTS))
     if args.full or args.incremental or args.rebuild:
