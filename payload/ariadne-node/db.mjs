@@ -12,6 +12,24 @@
 
 const CHANGELOG_PATH_RE = /(changelog|migration|liquibase)/i;
 
+/** Newline offsets scanned once, O(log n) per lookup — replaces the per-match
+ *  prefix re-scan (O(text × matches) on big changelogs). Parity: _line (Python). */
+function makeLineAt(text) {
+  let offs = null;
+  return (idx) => {
+    if (!offs) {
+      offs = [];
+      for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) offs.push(i);
+    }
+    let lo = 0, hi = offs.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (offs[mid] < idx) lo = mid + 1; else hi = mid;
+    }
+    return lo + 1;
+  };
+}
+
 // ---------- Liquibase parsing ----------
 const XML_CHANGESET_RE = /<changeSet[^>]*\bid\s*=\s*"([^"]+)"[^>]*\bauthor\s*=\s*"([^"]+)"/g;
 const XML_OPS = [
@@ -62,7 +80,7 @@ export function isSchemaFile(relpath, text) {
 /** [{table, op, line, changeset}] from Prisma schema / Rails schema+migrations / Alembic revisions. */
 export function extractSchemaDefs(relpath, text) {
   const out = [];
-  const lineAt = (i) => text.slice(0, i).split("\n").length;
+  const lineAt = makeLineAt(text);
   const stem = relpath.split("/").pop().replace(/\.\w+$/, "");
   if (relpath.endsWith(".prisma")) {
     for (const m of text.matchAll(PRISMA_MODEL_RE)) {
@@ -86,7 +104,7 @@ export function extractSchemaDefs(relpath, text) {
 /** Returns [{table, op, line, changeset}] from one changelog file. */
 export function extractChangelog(relpath, text) {
   const out = [];
-  const lineAt = (i) => text.slice(0, i).split("\n").length;
+  const lineAt = makeLineAt(text);
   // nearest preceding changeset id for context
   const changesets = [];
   for (const m of text.matchAll(XML_CHANGESET_RE)) changesets.push({ idx: m.index, id: `${m[2]}:${m[1]}` });
@@ -158,7 +176,7 @@ const cap = (s) => s[0].toUpperCase() + s.slice(1);
 /** Symbols Lombok will generate at compile time, so find_symbol/outline see them. */
 export function extractLombokSymbols(text) {
   const out = [];
-  const lineAt = (i) => text.slice(0, i).split("\n").length;
+  const lineAt = makeLineAt(text);
   for (const m of text.matchAll(ANN_CLASS_RE)) {
     const ann = m[1];
     const cls = m[2];
@@ -192,7 +210,7 @@ const EXEC_SQL_RE = /\b(?:execute(?:many)?|query|raw|exec_driver_sql)\s*\(\s*(?:
  *  with a literal SQL string (psycopg/sqlite3/knex/pg/generic execute/query). */
 export function extractGenericDbAccess(text) {
   const out = [];
-  const lineAt = (i) => text.slice(0, i).split("\n").length;
+  const lineAt = makeLineAt(text);
   for (const m of text.matchAll(SA_TABLENAME_RE)) {
     out.push({ table: m[1].toLowerCase(), kind: "entity", mode: "rw", line: lineAt(m.index), detail: "SQLAlchemy __tablename__" });
   }
@@ -216,7 +234,7 @@ export function extractGenericDbAccess(text) {
 
 export function extractDbAccess(text, entityTables, constants) {
   const out = [];
-  const lineAt = (i) => text.slice(0, i).split("\n").length;
+  const lineAt = makeLineAt(text);
   // entities declared in this file (annotation-block parse: order-independent, Lombok-safe)
   for (const m of text.matchAll(ANN_CLASS_RE)) {
     if (!/@Entity\b/.test(m[1])) continue;

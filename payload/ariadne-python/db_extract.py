@@ -2,6 +2,7 @@
 Liquibase changelogs (XML/YAML/formatted SQL) -> table definitions;
 Spring Boot code (JPA entities, Spring Data repos, @Query, JdbcTemplate) -> access sites."""
 import re
+from bisect import bisect_left
 
 CHANGELOG_PATH_RE = re.compile(r"(changelog|migration|liquibase)", re.I)
 CHANGELOG_CONTENT_RE = re.compile(r"databaseChangeLog|--\s*liquibase|<changeSet|changeSet:", re.I)
@@ -96,8 +97,24 @@ def extract_schema_defs(relpath, text):
     return out
 
 
+# Newline offsets computed once per text (extraction is single-threaded, so a
+# last-text memo suffices), O(log n) per lookup — replaces the per-match prefix
+# re-scan, O(text × matches) on big changelogs. Parity: makeLineAt (Node).
+_ln_text = None
+_ln_offs = None
+
+
 def _line(text, idx):
-    return text.count("\n", 0, idx) + 1
+    global _ln_text, _ln_offs
+    if text is not _ln_text:
+        offs = []
+        find = text.find
+        i = find("\n")
+        while i != -1:
+            offs.append(i)
+            i = find("\n", i + 1)
+        _ln_text, _ln_offs = text, offs
+    return bisect_left(_ln_offs, idx) + 1
 
 
 def extract_changelog(relpath, text):

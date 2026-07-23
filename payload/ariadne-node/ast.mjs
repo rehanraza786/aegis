@@ -22,6 +22,10 @@ const GRAMMAR_BY_LANG = {
 
 let ParserCls = null;
 const langCache = new Map();
+// ONE parser per language, reused across every file. `new Parser()` allocates
+// WASM-heap state that only `.delete()` frees; a parser per file (the old shape)
+// both leaked that heap across thousands of files and paid setup per file.
+const parserCache = new Map();
 
 export async function initAst(log = () => {}) {
   try {
@@ -152,8 +156,12 @@ function arrowSymbols(node, out, parentName) {
 export async function extractAst(lang, ext, text) {
   const language = await languageFor(lang, ext);
   if (!language) return null;
-  const parser = new ParserCls();
-  parser.setLanguage(language);
+  let parser = parserCache.get(language);
+  if (!parser) {
+    parser = new ParserCls();
+    parser.setLanguage(language);
+    parserCache.set(language, parser);
+  }
   const tree = parser.parse(text);
   const family = familyOf(lang);
   const defs = DEFS[family];
@@ -200,7 +208,10 @@ export async function extractAst(lang, ext, text) {
     for (const child of node.namedChildren) walk(child, newEnclosing, newParentClass);
   }
 
-  walk(tree.rootNode, null, null);
-  tree.delete();
+  try {
+    walk(tree.rootNode, null, null);
+  } finally {
+    tree.delete(); // trees are per-file and WASM-backed: free even if walk throws
+  }
   return { symbols, calls };
 }

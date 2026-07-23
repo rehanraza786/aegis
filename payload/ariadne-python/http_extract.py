@@ -1,5 +1,6 @@
 """HTTP seam extraction (Python edition; mirror of http.mjs)."""
 import re
+from bisect import bisect_left
 
 CLASS_MAPPING_RE = re.compile(r'@RequestMapping\s*\(\s*(?:value\s*=\s*|path\s*=\s*)?"([^"]*)"[^)]*\)\s*(?:@\w+(?:\([^)]*\))?\s*)*(?:public\s+)?(?:abstract\s+)?(?:class|interface)\s+(\w+)')
 METHOD_MAPPING_RE = re.compile(r'@(Get|Post|Put|Delete|Patch|Request)Mapping\s*(?:\(\s*(?:value\s*=\s*|path\s*=\s*)?"([^"]*)"[^)]*\)|\(\s*\)|\b)')
@@ -28,8 +29,24 @@ def normalize_path(raw):
     return p.rstrip("/") if len(p) > 1 else p
 
 
+# Newline offsets computed once per text (extraction is single-threaded, so a
+# last-text memo suffices), O(log n) per lookup — replaces the per-match prefix
+# re-scan, O(text × matches) on big files. Parity: makeLineAt (Node).
+_ln_text = None
+_ln_offs = None
+
+
 def _line(text, i):
-    return text.count("\n", 0, i) + 1
+    global _ln_text, _ln_offs
+    if text is not _ln_text:
+        offs = []
+        find = text.find
+        j = find("\n")
+        while j != -1:
+            offs.append(j)
+            j = find("\n", j + 1)
+        _ln_text, _ln_offs = text, offs
+    return bisect_left(_ln_offs, i) + 1
 
 
 def extract_java_http(text):

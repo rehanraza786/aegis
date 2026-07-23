@@ -15,6 +15,24 @@ import fs from "node:fs";
 import path from "node:path";
 
 const CONFIG_FILE_RE = /(^|\/)(application|bootstrap)[^/]*\.(ya?ml|properties)$/;
+
+/** Newline offsets scanned once, O(log n) per lookup — replaces the per-match
+ *  prefix re-scan (O(text × matches) on big files). Parity: _line (Python). */
+function makeLineAt(text) {
+  let offs = null;
+  return (idx) => {
+    if (!offs) {
+      offs = [];
+      for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) offs.push(i);
+    }
+    let lo = 0, hi = offs.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (offs[mid] < idx) lo = mid + 1; else hi = mid;
+    }
+    return lo + 1;
+  };
+}
 // Java `static final String X = "…"` and Kotlin `const val X[: String] = "…"`
 const CONST_RE = /(?:(?:static\s+final|final\s+static)\s+String\s+(\w+)|const\s+val\s+(\w+)(?:\s*:\s*String)?)\s*=\s*"([^"]+)"/g;
 const LISTENER_RE = /@(?:Kafka|Jms|Rabbit)?KafkaListener\s*\(([^)]*)\)|@KafkaListener\s*\(([^)]*)\)/gs;
@@ -136,7 +154,7 @@ function resolveExpr(raw, configMap, constants) {
 /** Extract message edges from one java/kotlin file. Returns [{topic, direction, line, resolved, via, system}] */
 export function extractKafkaEdges(text, configMap, constants) {
   const edges = [];
-  const lineAt = (idx) => text.slice(0, idx).split("\n").length;
+  const lineAt = makeLineAt(text);
   const push = (raw, direction, idx, system = "kafka") => {
     for (const r of resolveExpr(raw, configMap, constants)) {
       edges.push({ ...r, direction, line: lineAt(idx), system });
@@ -179,7 +197,7 @@ const NATS_SUB_RE = /\.\s*subscribe\s*\(\s*["'`]([^"'`]+)/g;
  *  family, so `.publish(` in ordinary code never becomes a phantom queue. */
 export function extractBrokerEdges(text) {
   const edges = [];
-  const lineAt = (idx) => text.slice(0, idx).split("\n").length;
+  const lineAt = makeLineAt(text);
   const push = (re, direction, system) => {
     re.lastIndex = 0;
     for (const m of text.matchAll(re)) {

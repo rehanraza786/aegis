@@ -38,7 +38,24 @@ export function normalizePath(raw) {
   return p;
 }
 
-const lineAt = (text, idx) => text.slice(0, idx).split("\n").length;
+// Newline offsets computed once per text (extraction is single-threaded, so a
+// last-text memo suffices), O(log n) per lookup — replaces the per-match prefix
+// re-scan, O(text × matches) on big files. Parity: _line (Python).
+let _lnText = null;
+let _lnOffs = null;
+function lineAt(text, idx) {
+  if (text !== _lnText) {
+    _lnText = text;
+    _lnOffs = [];
+    for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) _lnOffs.push(i);
+  }
+  let lo = 0, hi = _lnOffs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (_lnOffs[mid] < idx) lo = mid + 1; else hi = mid;
+  }
+  return lo + 1;
+}
 
 /** Java: extract Spring endpoints (and Feign client calls) from one file. */
 export function extractJavaHttp(text) {
