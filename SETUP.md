@@ -43,7 +43,8 @@ Both paths are idempotent and neither overwrites a file you have edited.
     docs/adr/                   decisions, once you start recording them
     docs/features/              spec, plan, tasks, review per feature
     docs/generated/             regenerated on every commit and merge (gitignore it)
-    gitlab-ci-aegis.yml         the CI job, to merge into your pipeline
+    gitlab-ci-aegis.yml         the CI job (GitLab), to merge into your pipeline
+    github-actions-aegis.yml    the same job for GitHub Actions (copy to .github/workflows/aegis-index.yml)
 
 The index is a local build artifact and is gitignored. Everything else is text you
 review in pull requests like any other change.
@@ -60,11 +61,15 @@ worth knowing when an answer looks stale.
 
 ## CI, and sharing one index across the team
 
-Merge the `aegis-index` job from `gitlab-ci-aegis.yml` into your pipeline. On merges
-to the default branch it builds the index, runs `scip-typescript` and `scip-java` for
-the compiler-grade layer, generates the docs, and publishes `.ariadne/index.db` and
-`docs/generated/` as artifacts. It caches the index between runs, so each pipeline
-only reindexes what the merge actually changed.
+GitLab: merge the `aegis-index` job from `gitlab-ci-aegis.yml` into your pipeline.
+GitHub: copy `github-actions-aegis.yml` to `.github/workflows/aegis-index.yml`
+(keep the workflow name `aegis-index`; the pull script looks it up by name). On
+pushes to the default branch either one builds the index, runs `scip-typescript`
+and `scip-java` for the compiler-grade layer, generates the docs, and publishes
+`.ariadne/index.db` and `docs/generated/` as artifacts. Both cache the index
+between runs, so each pipeline only reindexes what actually changed.
+`pull-index.sh` auto-detects the provider from your origin remote (gh CLI or
+`$GITHUB_TOKEN` on GitHub; glab CLI or `$GITLAB_TOKEN` on GitLab).
 
 Teammates then pull that artifact instead of building it locally:
 
