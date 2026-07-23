@@ -976,6 +976,14 @@ await c.close();
           code == 0 and not any(x.get("topic") == "orders.created.manual" for x in alist), ort[-200:])
     run(exe + [idx, "--incremental"], ws)
     db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    code, odm = run(exe + [an, json.dumps({"action": "dismiss", "gap": "orphan_topic",
+                                           "key": "audit.q", "reason": "fire-and-forget audit stream; consumer lives outside this workspace"})], ws)
+    run(exe + [idx, "--incremental"], ws)
+    code2, og2 = run(exe + [ge], ws)
+    gx2 = json.loads(og2.strip().splitlines()[-1])
+    check("dismissed orphan topic carries its audit trail in the export",
+          code == 0 and any(t.get("topic") == "audit.q" and t.get("dismissed", {}).get("reason", "").startswith("fire-and-forget")
+                            for t in gx2.get("topics", [])), odm[-160:])
     check("retracted assertion leaves the graph on reindex",
           db.execute("SELECT 1 FROM msg_edges WHERE topic='orders.created.manual'").fetchone() is None)
     db.close()

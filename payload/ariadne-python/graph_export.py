@@ -190,6 +190,30 @@ gaps = {
         for r in decl_rows if r["topic"] not in by_topic][:MAX_ITEMS],
 }
 
+# ---- dismissals: triaged gaps mute but stay auditable ----
+dismissals = {}
+if has("assertions"):
+    for r in q("SELECT payload FROM assertions WHERE kind='dismissal'"):
+        try:
+            d = json.loads(r["payload"])
+            dismissals[f"{d.get('gap')}|{d.get('key')}"] = {"by": d.get("author"), "reason": d.get("reason")}
+        except Exception:  # noqa: BLE001
+            pass
+def _dis(gap, key):
+    return dismissals.get(f"{gap}|{key}")
+for g in gaps["unresolved_topic_expressions"]:
+    d = _dis("unresolved", f"{g['path']}:{g['line']}")
+    if d: g["dismissed"] = d
+for g in gaps["topics_declared_in_config_but_unused"]:
+    d = _dis("declared_unused", g["topic"])
+    if d: g["dismissed"] = d
+for t in topics:
+    d = _dis("orphan_topic", t["topic"])
+    if d and (t["warnings"].get("orphan_produce") or t["warnings"].get("orphan_consume")): t["dismissed"] = d
+for t in tables:
+    d = _dis("drift_table", t["table"])
+    if d and t["warnings"].get("drift_no_changeset"): t["dismissed"] = d
+
 # ---- annotations ----
 def _assertion_row(r):
     try:

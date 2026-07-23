@@ -433,6 +433,15 @@ function renderAssertions() {
   bindDetailHandlers(el);
 }
 
+/* dismissed gaps mute with their audit trail; live ones offer a one-line
+   dismissal (reason mandatory) through the same reviewed write path */
+function dismissRow(d, gap, key) {
+  if (d) return `<div class="muted">dismissed by ${esc(d.by || "?")}: ${esc(d.reason || "")}</div>`;
+  return `<form class="annotate" data-dismiss='${esc(JSON.stringify({ gap, key }))}'>
+    <input name="reason" placeholder="Dismiss with reason (≥10 chars — stays auditable)">
+    <button type="submit" class="secondary">Dismiss</button></form>`;
+}
+
 function renderGaps() {
   renderAssertions();
   const g = document.getElementById("gaps");
@@ -450,9 +459,9 @@ function renderGaps() {
         <textarea name="evidence" placeholder="Evidence (≥20 chars): how did you resolve it? Quote the constant/config/profile."></textarea>
         <select name="confidence"><option>high</option><option selected>medium</option><option>low</option></select>
         <button type="submit">Assert resolved topic</button></form></div>`).join("")}
-    ${declUnused.length ? `<h4 class="warn">Declared in config, unused</h4>` + declUnused.map((it) => `<div class="gap-item"><span class="warn">⚠</span> <b>${esc(it.topic)}</b> — ${esc(it.config_key)} declares it, but no producer or consumer references it.<div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div></div>`).join("") : ""}
+    ${declUnused.length ? `<h4 class="warn">Declared in config, unused</h4>` + declUnused.map((it) => `<div class="gap-item${it.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(it.topic)}</b> — ${esc(it.config_key)} declares it, but no producer or consumer references it.<div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div>${dismissRow(it.dismissed, "declared_unused", it.topic)}</div>`).join("") : ""}
     ${drift.length ? `<h4 class="err">Drift tables</h4>` + drift.map((t) => `<div class="gap-item"><span class="err">⚠</span> <b>${esc(t.table)}</b> — no changeset. Click its node to assert.</div>`).join("") : ""}
-    ${orphans.length ? `<h4 class="warn">Orphan topics</h4>` + orphans.map((t) => `<div class="gap-item"><span class="warn">⚠</span> <b>${esc(t.topic)}</b> — ${t.warnings.orphan_produce ? "no consumer" : "no producer"} found. Often a real bug: investigate before silencing.</div>`).join("") : ""}
+    ${orphans.length ? `<h4 class="warn">Orphan topics</h4>` + orphans.map((t) => `<div class="gap-item${t.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(t.topic)}</b> — ${t.warnings.orphan_produce ? "no consumer" : "no producer"} found. Often a real bug: investigate before silencing.${dismissRow(t.dismissed, "orphan_topic", t.topic)}</div>`).join("") : ""}
     ${uncalled.length ? `<h4 class="warn">Endpoints with no caller</h4>` + uncalled.slice(0, 10).map((e) => `<div class="gap-item"><span class="warn">⚠</span> ${esc(e.method)} <b>${esc(e.path)}</b><div class="site"><a data-open="${esc(e.file)}:${e.line}">${esc(e.file)}:${e.line}</a></div></div>`).join("") + (uncalled.length > 10 ? `<div class="muted">…and ${uncalled.length - 10} more uncalled endpoints (query http_map)</div>` : "") : ""}`;
   bindDetailHandlers(g);
 }
@@ -475,7 +484,11 @@ function bindDetailHandlers(root) {
   root.querySelectorAll("form.annotate").forEach((f) => f.addEventListener("submit", (ev) => {
     ev.preventDefault();
     const fd = new FormData(f);
-    if (f.dataset.note) {
+    if (f.dataset.dismiss) {
+      const reason = (fd.get("reason") || "").toString().trim();
+      if (reason.length < 10) { toast("Give a reason (≥10 chars) — dismissals stay auditable.", true); return; }
+      vscode.postMessage({ type: "annotate", payload: { action: "dismiss", ...JSON.parse(f.dataset.dismiss), reason } });
+    } else if (f.dataset.note) {
       const summary = (fd.get("summary") || "").toString().trim();
       if (summary.length < 40) { toast("Note must be at least 40 characters, write something an agent can use.", true); return; }
       vscode.postMessage({ type: "annotate", payload: { action: "insight", target: f.dataset.note, kind: f.dataset.kind, summary } });

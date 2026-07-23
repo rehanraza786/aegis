@@ -171,6 +171,20 @@ const gaps = {
     .map((r) => ({ topic: r.topic, config_key: r.config_key, path: r.path, line: r.line })),
 };
 
+/* ---- dismissals: triaged gaps mute but stay auditable ---- */
+const dismissals = new Map();
+if (has("assertions")) {
+  for (const r of q("SELECT payload FROM assertions WHERE kind='dismissal'")) {
+    try { const d = JSON.parse(r.payload); dismissals.set(`${d.gap}|${d.key}`, { by: d.author, reason: d.reason }); }
+    catch { /* legacy */ }
+  }
+}
+const dis = (gap, key) => dismissals.get(`${gap}|${key}`);
+for (const g of gaps.unresolved_topic_expressions) { const d = dis("unresolved", `${g.path}:${g.line}`); if (d) g.dismissed = d; }
+for (const g of gaps.topics_declared_in_config_but_unused) { const d = dis("declared_unused", g.topic); if (d) g.dismissed = d; }
+for (const t of topics) { const d = dis("orphan_topic", t.topic); if (d && (t.warnings.orphan_produce || t.warnings.orphan_consume)) t.dismissed = d; }
+for (const t of tables) { const d = dis("drift_table", t.table); if (d && t.warnings.drift_no_changeset) t.dismissed = d; }
+
 /* ---- annotations already in the graph ---- */
 const fileHash = new Map(q("SELECT path, hash FROM files").map((r) => [r.path, r.hash]));
 const annotations = {
