@@ -13,6 +13,7 @@
  * workspace root after indexing). Schema documented in EXTENDING.md.
  */
 import Database from "better-sqlite3";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { pathsMatch } from "./http.mjs";
@@ -184,10 +185,39 @@ const annotations = {
     : [],
 };
 
+/* ---- freshness: a stale graph must be able to say so. The indexer stamps one
+ * last_sha:<prefix> per root ("." single-root), so freshness is per-root:
+ * every stamped SHA must equal its repo's current HEAD. If any root can't be
+ * checked (no git), freshness is unknown and the field is omitted — never
+ * guessed. ---- */
+const indexedSha = q("SELECT value FROM meta WHERE key='last_sha'")[0]?.value ?? null;
+const shaRows = q("SELECT key, value FROM meta WHERE key LIKE 'last_sha:%'");
+let headSha = null;
+let checked = 0;
+let matched = 0;
+for (const r of shaRows) {
+  const pref = r.key.slice("last_sha:".length);
+  const dir = pref === "." ? ROOT : path.join(ROOT, pref);
+  let h = null;
+  try { h = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", timeout: 10_000, cwd: dir }).trim() || null; } catch { /* no git / not a repo */ }
+  if (h) {
+    checked++;
+    if (h === r.value) matched++;
+    if (shaRows.length === 1) headSha = h;
+  }
+}
+const fresh = shaRows.length && checked === shaRows.length ? matched === checked : null;
+
 const out = {
   schema: 1,
   generated_from: { db: path.basename(DB_PATH), modules_total: services.size, files: files.length,
     symbols: q("SELECT COUNT(*) c FROM symbols")[0].c,
+    // pre-cap totals, so a UI can say "showing N of M" instead of truncating silently
+    topics_total: byTopic.size, tables_total: byTbl.size,
+    endpoints_total: eps.filter((e) => !(hasTest && e.is_test)).length,
+    ...(indexedSha ? { indexed_sha: indexedSha } : {}),
+    ...(headSha ? { head_sha: headSha } : {}),
+    ...(fresh === null ? {} : { fresh }),
     ...(services.size > MAX_MODULES ? { modules_truncated_to: MAX_MODULES } : {}) },
   modules, topics, tables, endpoints, gaps, annotations,
 };

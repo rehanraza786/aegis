@@ -14,6 +14,7 @@ workspace root after indexing). Schema documented in EXTENDING.md.
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -203,10 +204,41 @@ annotations = {
     if has("assertions") else [],
 }
 
+# ---- freshness: a stale graph must be able to say so. The indexer stamps one
+# last_sha:<prefix> per root ("." single-root), so freshness is per-root: every
+# stamped SHA must equal its repo's current HEAD. If any root can't be checked
+# (no git), freshness is unknown and the field is omitted — never guessed. ----
+_sha_row = q("SELECT value FROM meta WHERE key='last_sha'")
+indexed_sha = _sha_row[0]["value"] if _sha_row else None
+sha_rows = q("SELECT key, value FROM meta WHERE key LIKE 'last_sha:%'")
+head_sha = None
+checked = matched = 0
+for r in sha_rows:
+    pref = r["key"][len("last_sha:"):]
+    d = ROOT if pref == "." else ROOT / pref
+    try:
+        h = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                           timeout=10, cwd=d).stdout.strip() or None
+    except Exception:  # noqa: BLE001 - no git / not a repo
+        h = None
+    if h:
+        checked += 1
+        if h == r["value"]:
+            matched += 1
+        if len(sha_rows) == 1:
+            head_sha = h
+fresh = (matched == checked) if sha_rows and checked == len(sha_rows) else None
+
 out = {
     "schema": 1,
     "generated_from": {"db": DB_PATH.name, "modules_total": len(services), "files": len(files),
                        "symbols": q("SELECT COUNT(*) c FROM symbols")[0]["c"],
+                       # pre-cap totals, so a UI can say "showing N of M" instead of truncating silently
+                       "topics_total": len(by_topic), "tables_total": len(by_tbl),
+                       "endpoints_total": sum(1 for e in eps if not (HAS_TEST and e["is_test"])),
+                       **({"indexed_sha": indexed_sha} if indexed_sha else {}),
+                       **({"head_sha": head_sha} if head_sha else {}),
+                       **({} if fresh is None else {"fresh": fresh}),
                        **({"modules_truncated_to": MAX_MODULES} if len(services) > MAX_MODULES else {})},
     "modules": modules, "topics": topics, "tables": tables, "endpoints": endpoints,
     "gaps": gaps, "annotations": annotations,
