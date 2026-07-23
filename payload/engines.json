@@ -19,8 +19,9 @@
     "command": "npx",
     "args": [
       "-y",
-      "@sdsrs/code-graph"
+      "@sdsrs/code-graph@0.101.0"
     ],
+    "_note": "Package @sdsrs/code-graph's repository field verifiably points at github.com/sdsrss/code-graph-mcp (the name difference is upstream's, not a typo). Version pinned because npx -y executes whatever the registry serves; bump deliberately.",
     "installHint": "Runs via npx; see https://github.com/sdsrss/code-graph-mcp for init/snapshot options.",
     "toolHints": "Use the code-graph tools for all structural questions: its explore/context tools instead of reading files, impact analysis before modifying shared code, and semantic search instead of repo-wide grep."
   },
