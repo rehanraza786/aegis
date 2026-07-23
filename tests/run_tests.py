@@ -927,6 +927,14 @@ await c.close();
     db.close()
     check("annotate: note carries human provenance in db",
           irow is not None and str(irow[0]).startswith("human"), str(irow))
+    code, otn = run(exe + [an, json.dumps({
+        "action": "insight", "target": "orders.created", "kind": "topic",
+        "summary": "Order lifecycle fan-out topic; consumers must be idempotent because replays happen on deploy."})], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    trow = db.execute("SELECT kind, model FROM insights WHERE target='orders.created'").fetchone()
+    db.close()
+    check("annotate: notes attach to topics (kind widened past module|file)",
+          code == 0 and trow is not None and trow[0] == "topic" and str(trow[1]).startswith("human"), otn[-160:])
     code, oas = run(exe + [an, json.dumps({
         "action": "assert", "kind": "kafka", "file": gap_row[0], "line": 601,
         "direction": "produce", "topic": "orders.created.manual",

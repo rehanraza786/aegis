@@ -37,8 +37,8 @@ except Exception:  # noqa: BLE001
 author = a.get("author") or "human"
 
 if a.get("action") == "insight":
-    if a.get("kind") not in ("module", "file") or len(a.get("summary", "")) < 40 or not a.get("target"):
-        die("insight needs target, kind (module|file), and a summary of at least 40 chars.")
+    if a.get("kind") not in ("module", "file", "topic", "table") or len(a.get("summary", "")) < 40 or not a.get("target"):
+        die("insight needs target, kind (module|file|topic|table), and a summary of at least 40 chars.")
     con = sqlite3.connect(DB_PATH, timeout=10)
     try:
         con.execute("PRAGMA busy_timeout=10000")
@@ -49,10 +49,12 @@ if a.get("action") == "insight":
             if not r or not r[0]:
                 die(f"File '{a['target']}' is not in the index (paths are repo-prefixed in a multi-repo workspace).")
             h = r[0]
-        else:
+        elif a["kind"] == "module":
             hs = [x[0] or "" for x in con.execute(
                 "SELECT hash FROM files WHERE path LIKE ? ORDER BY path", (a["target"] + "/%",))]
             h = hashlib.sha1("|".join(hs).encode()).hexdigest()
+        else:
+            h = ""  # topic/table notes have no single backing file; they don't auto-stale
         con.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)",
                     (a["target"], a["kind"], h, a["summary"][:4000], f"{author}:graph-view", time.time()))
         con.commit()
