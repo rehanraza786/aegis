@@ -6,5 +6,5 @@ tree-sitter>=0.23
 # the AST engine in offline/locked-down environments (regex fallback, degraded
 # graph) and (b) adds a network call PRIVACY.md promises this project never
 # makes. The 0.x line ships every grammar inside the wheel.
-tree-sitter-language-pack>=0.7,<1
+tree-sitter-language-pack>=0.7,<2
 pypdf>=4
