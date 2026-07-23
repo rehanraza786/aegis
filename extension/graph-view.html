@@ -229,6 +229,8 @@ function showDetails(d) {
       ${w.orphan_consume ? `<div class="warn">⚠ consumed but no producer found</div>` : ""}
       ${w.test_only ? `<div class="warn">⚠ only exercised by tests</div>` : ""}
       ${w.unresolved_expression ? `<div class="err">⚠ contains an unresolved runtime expression (see Gaps)</div>` : ""}
+      ${t.system ? `<div class="muted">system: ${esc(t.system)}</div>` : ""}
+      ${t.config_keys ? `<div class="muted">declared in config: ${t.config_keys.map(esc).join(", ")}</div>` : ""}
       <h4>Producers</h4>${(t.producers.items || []).map((s) => siteRow(s)).join("") || '<div class="muted">none</div>'}${moreRow(t.producers)}
       <h4>Consumers</h4>${(t.consumers.items || []).map((s) => siteRow(s)).join("") || '<div class="muted">none</div>'}${moreRow(t.consumers)}
       ${t.test_sites ? `<h4>Test usage</h4>${(t.test_sites.items || []).map((s) => siteRow(s)).join("")}` : ""}`;
@@ -259,10 +261,11 @@ function resetDetails() {
 function renderGaps() {
   const g = document.getElementById("gaps");
   const items = (G.gaps.unresolved_topic_expressions || []);
+  const declUnused = (G.gaps.topics_declared_in_config_but_unused || []);
   const orphans = G.topics.filter((t) => t.warnings && (t.warnings.orphan_produce || t.warnings.orphan_consume));
   const drift = G.tables.filter((t) => t.warnings && t.warnings.drift_no_changeset);
   const uncalled = G.endpoints.filter((e) => e.warnings && e.warnings.no_caller);
-  g.innerHTML = `<h3>Gaps — the graph needs a human (${items.length + drift.length})</h3>
+  g.innerHTML = `<h3>Gaps — the graph needs a human (${items.length + drift.length + declUnused.length})</h3>
     ${items.map((it, i) => `<div class="gap-item">
       <div class="err">unresolved: <b>${esc(it.expression)}</b> (${esc(it.direction)})</div>
       <div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div>
@@ -271,6 +274,7 @@ function renderGaps() {
         <textarea name="evidence" placeholder="Evidence (≥20 chars): how did you resolve it? Quote the constant/config/profile."></textarea>
         <select name="confidence"><option>high</option><option selected>medium</option><option>low</option></select>
         <button type="submit">Assert resolved topic</button></form></div>`).join("")}
+    ${declUnused.length ? `<h4 class="warn">Declared in config, unused</h4>` + declUnused.map((it) => `<div class="gap-item"><span class="warn">⚠</span> <b>${esc(it.topic)}</b> — ${esc(it.config_key)} declares it, but no producer or consumer references it.<div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div></div>`).join("") : ""}
     ${drift.length ? `<h4 class="err">Drift tables</h4>` + drift.map((t) => `<div class="gap-item"><span class="err">⚠</span> <b>${esc(t.table)}</b> — no changeset. Click its node to assert.</div>`).join("") : ""}
     ${orphans.length ? `<h4 class="warn">Orphan topics</h4>` + orphans.map((t) => `<div class="gap-item"><span class="warn">⚠</span> <b>${esc(t.topic)}</b> — ${t.warnings.orphan_produce ? "no consumer" : "no producer"} found. Often a real bug: investigate before silencing.</div>`).join("") : ""}
     ${uncalled.length ? `<h4 class="warn">Endpoints with no caller</h4>` + uncalled.slice(0, 10).map((e) => `<div class="gap-item"><span class="warn">⚠</span> ${esc(e.method)} <b>${esc(e.path)}</b><div class="site"><a data-open="${esc(e.file)}:${e.line}">${esc(e.file)}:${e.line}</a></div></div>`).join("") : ""}`;

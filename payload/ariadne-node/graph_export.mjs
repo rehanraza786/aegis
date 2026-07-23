@@ -84,17 +84,26 @@ const modules = [...services.entries()]
 
 /* ---- topics: production topology + labeled test usage + warnings ---- */
 const mrows = has("msg_edges")
-  ? q(`SELECT m.topic, m.direction, m.line, m.via, m.resolved, m.source, f.path${T}
+  ? q(`SELECT m.topic, m.direction, m.line, m.via, m.resolved, m.source, m.system, f.path${T}
        FROM msg_edges m JOIN files f ON f.id=m.file_id ORDER BY m.topic, m.line`)
   : [];
 const byTopic = new Map();
 for (const r of mrows) (byTopic.get(r.topic) ?? byTopic.set(r.topic, []).get(r.topic)).push(r);
+// config-declared topics: the seam's source of truth (validation + linkage)
+const declRows = has("msg_topics")
+  ? q("SELECT t.topic, t.config_key, f.path, t.line FROM msg_topics t JOIN files f ON f.id=t.file_id ORDER BY t.topic")
+  : [];
+const declByTopic = new Map();
+for (const r of declRows) (declByTopic.get(r.topic) ?? declByTopic.set(r.topic, []).get(r.topic)).push(r.config_key);
 const topics = warnFirst([...byTopic.entries()].map(([topic, rows]) => {
   const prod = rows.filter((r) => r.direction === "produce" && !(hasTest && r.is_test));
   const cons = rows.filter((r) => r.direction === "consume" && !(hasTest && r.is_test));
   const test = rows.filter((r) => hasTest && r.is_test);
+  const systems = [...new Set(rows.map((r) => r.system ?? "kafka"))];
   return {
     topic,
+    ...(systems.length === 1 && systems[0] === "kafka" ? {} : { system: systems.join("+") }),
+    ...(declByTopic.has(topic) ? { config_keys: [...new Set(declByTopic.get(topic))] } : {}),
     producers: capped(prod.map((r) => site(r)), MAX_SITES),
     consumers: capped(cons.map((r) => site(r)), MAX_SITES),
     ...(test.length ? { test_sites: capped(test.map((r) => site(r, { direction: r.direction })), 6) } : {}),
@@ -155,6 +164,10 @@ const gaps = {
     .filter((r) => !r.resolved && !(hasTest && r.is_test))
     .slice(0, MAX_ITEMS)
     .map((r) => ({ expression: r.topic, direction: r.direction, path: r.path, line: r.line })),
+  topics_declared_in_config_but_unused: declRows
+    .filter((r) => !byTopic.has(r.topic))
+    .slice(0, MAX_ITEMS)
+    .map((r) => ({ topic: r.topic, config_key: r.config_key, path: r.path, line: r.line })),
 };
 
 /* ---- annotations already in the graph ---- */
