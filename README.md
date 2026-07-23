@@ -2,9 +2,11 @@
 
 <img src="assets/aegis-logo-256.png" alt="AEGIS" width="110" align="right">
 
+[![test](https://github.com/rehanraza786/aegis/actions/workflows/test.yml/badge.svg)](https://github.com/rehanraza786/aegis/actions/workflows/test.yml)
+
 Agentic Engineering Guardrails & Intelligence System. A local codebase graph, a set of MCP tools, and a handful of skills and agents that make GitHub Copilot behave like it actually knows your repositories.
 
-Built for a specific kind of codebase: Java/Kotlin on Spring Boot, TypeScript/React on the front end, Kafka between services, Liquibase for schema, Lombok everywhere, several repos open in one VS Code workspace, GitLab CI. If that describes you, most of this works out of the box. If it doesn't, the extraction layers are pluggable and the rest still applies.
+Built first for a specific kind of codebase — Java/Kotlin on Spring Boot, TypeScript/React on the front end, Kafka between services, Liquibase for schema, Lombok everywhere, several repos in one VS Code workspace, GitLab CI — and grown outward from it: Express/Nest/Flask/FastAPI endpoints, Rabbit/SQS/NATS, Flyway/Prisma/Rails/Alembic migrations, GitHub Actions, and installs for Claude Code, Cursor, and AGENTS.md hosts are first-class now too. Where it's still blind, the extraction layers are pluggable and the graph says so rather than guessing.
 
 MIT licensed. Runs entirely on your machines. No telemetry, no accounts, no API keys required.
 
@@ -67,7 +69,7 @@ Open your workspace. One repo or a folder of repos both work. The extension offe
 
 Requirements: git, and either Node ≥18 or Python ≥3.10. VS Code ≥1.99 registers the MCP server automatically.
 
-There is a shell installer too, plus configuration and CI wiring, in [SETUP.md](SETUP.md).
+There is a shell installer too, plus configuration and CI wiring, in [SETUP.md](SETUP.md). Going deeper: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how the engine works), [docs/TOOLS.md](docs/TOOLS.md) (all 24 tools), [EXTENDING.md](EXTENDING.md) (plug in your stack), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md).
 
 **Not on VS Code?** The engine installs like any package, for any MCP client:
 
