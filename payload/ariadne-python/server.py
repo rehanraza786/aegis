@@ -20,6 +20,7 @@ import re
 import sqlite3
 import sys
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -113,15 +114,38 @@ def _safe_tool(*d_args, **d_kwargs):
 mcp.tool = _safe_tool
 
 
+# Read-only connections cached per thread (FastMCP runs sync tools in a worker
+# pool, and sqlite3 objects default to single-thread use). WAL readers see every
+# indexer commit through a long-lived handle, so per-call reopen+pragma (the old
+# shape) bought nothing — except after corruption recovery, when the indexer
+# REPLACES the db file; the (st_ino, st_dev) check catches that, and a failing
+# handle is dropped and reopened. Mirror of Node's withDb reopen-on-error.
+_ro_local = threading.local()
+
+
 def db():
-    """Read-only connection; reopened per call so indexer swaps are picked up.
-    All tools catch exceptions and return messages, so the agent can adapt
-    instead of the server crashing."""
+    """Cached read-only connection; reopened when the index file is replaced or
+    the handle errors. All tools catch exceptions and return messages, so the
+    agent can adapt instead of the server crashing."""
     if not DB_PATH.exists():
+        _ro_local.con = None
         raise RuntimeError("Index not found. Run: python3 .ariadne/indexer.py --full (or indexer.mjs for the Node edition)")
+    st = DB_PATH.stat()
+    sig = (st.st_ino, st.st_dev)
+    con = getattr(_ro_local, "con", None)
+    if con is not None and getattr(_ro_local, "sig", None) == sig:
+        try:
+            con.execute("SELECT 1")
+            return con
+        except sqlite3.Error:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
     con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10)
     con.execute("PRAGMA busy_timeout=5000")
     con.row_factory = sqlite3.Row
+    _ro_local.con, _ro_local.sig = con, sig
     return con
 
 

@@ -24,6 +24,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from bisect import bisect_left
 from pathlib import Path
 
 SCHEMA_VERSION = 5
@@ -173,13 +174,26 @@ SYMBOL_PATTERNS["typescript"] = SYMBOL_PATTERNS["javascript"] + [
 ]
 
 
+def make_line_at(text):
+    """O(n) newline scan once, then O(log n) per lookup. The old shape —
+    text.count("\\n", 0, idx) per match — re-scanned the whole prefix for
+    every match, O(text × matches) on big files. Parity: makeLineAt (Node)."""
+    offs = []
+    find = text.find
+    i = find("\n")
+    while i != -1:
+        offs.append(i)
+        i = find("\n", i + 1)
+    return lambda idx: bisect_left(offs, idx) + 1  # newlines strictly before idx, + 1
+
+
 def extract_symbols(lang, text):
     out = []
+    line_at = make_line_at(text)
     for pattern, kind in SYMBOL_PATTERNS.get(lang, []):
         for m in pattern.finditer(text):
-            line = text.count("\n", 0, m.start()) + 1
             sig = (m.groupdict().get("sig") or "").strip()[:200]
-            out.append((m.group("name"), kind, line, sig))
+            out.append((m.group("name"), kind, line_at(m.start()), sig))
     return out
 
 
@@ -193,28 +207,48 @@ def extract_imports(lang, text):
     return mods
 
 
-def resolve_import(mod, src_path, all_paths):
+def build_import_index(all_paths):
+    """Precomputed index for resolve_import: built ONCE per edge rebuild instead
+    of scanning every path per import (the old O(imports × paths) hot spot).
+    For a stem a/b/c it registers every segment-boundary suffix (c, b/c, a/b/c);
+    the first path in iteration order claims a suffix, preserving first-match
+    semantics. Boundary-only matching also stops the old false edges where tail
+    "foo/bar" matched mid-segment inside "xfoo/bar". Parity: buildImportIndex."""
+    by_suffix = {}
+    for p in all_paths:
+        segs = re.sub(r"\.[^.]+$", "", p).split("/")
+        suf = ""
+        for i in range(len(segs) - 1, -1, -1):
+            suf = f"{segs[i]}/{suf}" if suf else segs[i]
+            by_suffix.setdefault(suf, p)
+    return {"paths": set(all_paths), "by_suffix": by_suffix}
+
+
+def resolve_import(mod, src_path, index):
     """Heuristically resolve an import string to a file path in the repo."""
-    candidates = set()
     if mod.startswith("."):  # relative import (js/ts/py styles)
         base = abs_path(src_path).parent
-        raw = (base / mod).resolve()
-        for suffix in ["", ".py", ".js", ".ts", ".jsx", ".tsx", "/index.js", "/index.ts", "/__init__.py"]:
-            candidates.add(str(raw) + suffix)
+        raw = str((base / mod).resolve())
+        for suffix in ("", ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs",
+                       "/index.js", "/index.ts", "/index.tsx", "/__init__.py"):
+            for prefix, root in ROOT_BY_PREFIX.items():
+                try:
+                    rel = os.path.relpath(raw + suffix, root).replace("\\", "/")
+                except ValueError:  # cross-drive on Windows
+                    continue
+                if rel.startswith(".."):
+                    continue
+                rel = f"{prefix}/{rel}" if prefix else rel
+                if rel in index["paths"]:
+                    return rel
+        return None
     # TS path aliases (@/x, ~/x) -> treat as repo-relative tails
     for prefix in ALIAS_PREFIXES:
         if mod.startswith(prefix):
             mod = mod[len(prefix):]
             break
     tail = mod.replace(".", "/").replace("::", "/").replace("\\", "/")
-    for p in all_paths:
-        ap = str(REPO_ROOT / p)
-        if ap in candidates:
-            return p
-        stem = p.rsplit(".", 1)[0]
-        if stem.endswith(tail) or stem.endswith(tail.replace("/", os.sep)):
-            return p
-    return None
+    return index["by_suffix"].get(tail) if tail else None
 
 # ------------------------------------------------------------------ storage
 
@@ -464,9 +498,10 @@ def index_file(con, relpath, force=False):
         "INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime, is_test) VALUES(?,?,?,?,?,?,?,?)",
         (relpath, lang, h, text.count("\n") + 1, time.time(), st.st_size, st.st_mtime, is_test))
     fid = cur.lastrowid
-    for src, dst, kind in kept_edges:
-        con.execute("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,?)",
-                    (fid if src == old[0] else src, fid if dst == old[0] else dst, kind))
+    if kept_edges:
+        con.executemany("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,?)",
+                        [(fid if src == old[0] else src, fid if dst == old[0] else dst, kind)
+                         for src, dst, kind in kept_edges])
 
     ast_result = None
     if lang in AST_LANGS and AST_EXTRACT is None and not globals().get("_ast_tried"):
@@ -478,22 +513,25 @@ def index_file(con, relpath, force=False):
             ast_result = AST_EXTRACT(lang, full.suffix.lower(), text)
         except Exception as e:  # noqa: BLE001 - AST must never break indexing
             log.debug("AST failed for %s: %s", relpath, e)
+    # executemany: the row loop runs in C, one statement compile — row-at-a-time
+    # con.execute() per symbol/call/chunk dominated per-file cost on the cold path
     if ast_result:
+        con.executemany("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,?)",
+                        [(fid, s_["name"], s_["kind"], s_["line"], s_.get("sig", ""), s_.get("parent"))
+                         for s_ in ast_result["symbols"]])
         id_by_name = {}
-        for s_ in ast_result["symbols"]:
-            cur2 = con.execute(
-                "INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,?)",
-                (fid, s_["name"], s_["kind"], s_["line"], s_.get("sig", ""), s_.get("parent")))
-            id_by_name.setdefault(s_["name"], cur2.lastrowid)
+        for sid, name in con.execute("SELECT id, name FROM symbols WHERE file_id=? ORDER BY id", (fid,)):
+            id_by_name.setdefault(name, sid)  # first inserted id per name, as before
+        call_rows = []
         for c in ast_result["calls"]:
             src = id_by_name.get(c["caller"]) if c["caller"] else None
             if src:
-                con.execute("INSERT INTO calls(src_symbol, callee, line) VALUES(?,?,?)",
-                            (src, c["callee"], c["line"]))
+                call_rows.append((src, c["callee"], c["line"]))
+        if call_rows:
+            con.executemany("INSERT INTO calls(src_symbol, callee, line) VALUES(?,?,?)", call_rows)
     else:
-        for name, kind, line, sig in extract_symbols(lang, text):
-            con.execute("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,NULL)",
-                        (fid, name, kind, line, sig))
+        con.executemany("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,NULL)",
+                        [(fid, name, kind, line, sig) for name, kind, line, sig in extract_symbols(lang, text)])
 
     if is_test:
         # behaviors, not helpers: annotation-gated for JUnit, so a @KafkaListener
@@ -507,32 +545,37 @@ def index_file(con, relpath, force=False):
         else:
             tc_re = None
         if tc_re:
-            for m in tc_re.finditer(text):
-                con.execute("INSERT INTO test_cases(file_id, name, line) VALUES(?,?,?)",
-                            (fid, m.group(1), text.count("\n", 0, m.start()) + 1))
+            line_at = make_line_at(text)
+            con.executemany("INSERT INTO test_cases(file_id, name, line) VALUES(?,?,?)",
+                            [(fid, m.group(1), line_at(m.start())) for m in tc_re.finditer(text)])
 
     lines = text.splitlines()
+    chunk_rows = []
     for start in range(0, len(lines), CHUNK_LINES):
         chunk = "\n".join(lines[start:start + CHUNK_LINES])
         if chunk.strip():
-            con.execute("INSERT INTO chunks(path, start_line, content) VALUES(?,?,?)",
-                        (relpath, start + 1, chunk))
-    return fid, lang, text
+            chunk_rows.append((relpath, start + 1, chunk))
+    if chunk_rows:
+        con.executemany("INSERT INTO chunks(path, start_line, content) VALUES(?,?,?)", chunk_rows)
+    return fid, lang, text, relpath
 
 
 def rebuild_edges(con, touched):
-    """(Re)build import edges for the given file records (fid, lang, text)."""
+    """(Re)build import edges for the given file records (fid, lang, text, relpath)."""
     all_paths = [r[0] for r in con.execute("SELECT path FROM files")]
     id_by_path = {r[1]: r[0] for r in con.execute("SELECT id, path FROM files")}
-    for fid, lang, text in touched:
-        # only import edges are ours to clear; kind='ref' rows belong to scip_ingest
-        con.execute("DELETE FROM edges WHERE src=? AND kind='import'", (fid,))
-        src_path = con.execute("SELECT path FROM files WHERE id=?", (fid,)).fetchone()[0]
+    index = build_import_index(all_paths)  # once per rebuild, not per import
+    # only import edges are ours to clear; kind='ref' rows belong to scip_ingest
+    con.executemany("DELETE FROM edges WHERE src=? AND kind='import'",
+                    [(fid,) for fid, _lang, _text, _rel in touched])
+    edge_rows = []
+    for fid, lang, text, relpath in touched:
         for mod in extract_imports(lang, text):
-            dst = resolve_import(mod, src_path, all_paths)
-            if dst and dst != src_path and dst in id_by_path:
-                con.execute("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,'import')",
-                            (fid, id_by_path[dst]))
+            dst = resolve_import(mod, relpath, index)
+            if dst and dst != relpath and dst in id_by_path:
+                edge_rows.append((fid, id_by_path[dst]))
+    if edge_rows:
+        con.executemany("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,'import')", edge_rows)
 
 
 def _load_extractors():
@@ -616,15 +659,30 @@ def kafka_pass(con, scope_prefixes=None):
     # its correlation rows away, so this set must be exact.
     extracted_at = {r[0]: r[1] for r in con.execute("SELECT path, hash FROM extract_cache")}
     constants, entity_tables = {}, {}
+    # LRU-bounded text cache. Unbounded (the old shape), the whole tracked corpus
+    # lives in RSS for the entire pass — a 100 MB SQL dump included. Over the cap,
+    # the least-recently-used texts fall out and are re-read on next use.
+    TEXT_MEMO_CAP = 64 * 1024 * 1024  # chars ≈ bytes for code
     text_memo = {}
+    memo_chars = 0
 
     def read_text(rel):
-        if rel not in text_memo:
-            try:
-                text_memo[rel] = abs_path(rel).read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                text_memo[rel] = None
-        return text_memo[rel]
+        nonlocal memo_chars
+        if rel in text_memo:
+            t = text_memo.pop(rel)
+            text_memo[rel] = t  # refresh recency (dicts keep insertion order)
+            return t
+        try:
+            t = abs_path(rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            t = None
+        text_memo[rel] = t
+        memo_chars += len(t) if t else 0
+        while memo_chars > TEXT_MEMO_CAP and len(text_memo) > 1:
+            k = next(iter(text_memo))  # oldest = least recently used
+            v = text_memo.pop(k)
+            memo_chars -= len(v) if v else 0
+        return t
 
     for rel in javaish:
         fh = hash_by_path.get(rel)
@@ -1110,6 +1168,13 @@ def full_index(con, rebuild=False):
     rebuild_edges(con, touched)
     kafka_pass(con, None)
     stamp_all(con)
+    if len(touched) > 200:
+        # merge FTS b-trees after a bulk load; per-file inserts leave many small
+        # segments that slow every MATCH until merged
+        try:
+            con.execute("INSERT INTO chunks(chunks) VALUES('optimize')")
+        except sqlite3.Error:
+            pass  # never fatal
     con.execute("INSERT OR REPLACE INTO meta VALUES('last_run', ?)", (str(time.time()),))
     con.commit()
     log.info("Full index: %d (re)indexed, %d unchanged (cached), %d removed of %d tracked in %dms",

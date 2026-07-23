@@ -2,9 +2,29 @@
 Correlates producers/consumers across modules; resolves topics from literals,
 static-final constants, and application.yaml/.properties placeholders."""
 import re
+from bisect import bisect_left
 from pathlib import Path
 
 CONFIG_FILE_RE = re.compile(r"(^|/)(application|bootstrap)[^/]*\.(ya?ml|properties)$")
+
+# Newline offsets computed once per text (extraction is single-threaded, so a
+# last-text memo suffices), O(log n) per lookup — replaces the per-match prefix
+# re-scan, O(text × matches) on big files. Parity: makeLineAt (Node).
+_ln_text = None
+_ln_offs = None
+
+
+def _line(text, idx):
+    global _ln_text, _ln_offs
+    if text is not _ln_text:
+        offs = []
+        find = text.find
+        i = find("\n")
+        while i != -1:
+            offs.append(i)
+            i = find("\n", i + 1)
+        _ln_text, _ln_offs = text, offs
+    return bisect_left(_ln_offs, idx) + 1
 # Java `static final String X = "…"` and Kotlin `const val X[: String] = "…"`
 CONST_RE = re.compile(r'(?:(?:static\s+final|final\s+static)\s+String\s+(\w+)|const\s+val\s+(\w+)(?:\s*:\s*String)?)\s*=\s*"([^"]+)"')
 # value forms: Java array {"a","b"}, Kotlin array ["a","b"], or a bare expression
@@ -127,7 +147,7 @@ def extract_kafka_edges(text, cfg, const):
     edges, seen = [], set()
 
     def push(raw, direction, idx, system="kafka"):
-        line = text.count("\n", 0, idx) + 1
+        line = _line(text, idx)
         for topic, resolved, via in _resolve(raw, cfg, const):
             key = (topic, direction, line)
             if key not in seen:
@@ -171,11 +191,11 @@ def extract_broker_edges(text):
     edges, seen = [], set()
 
     def push(topic, direction, idx, system, via=None):
-        key = (system, topic, direction, text.count("\n", 0, idx) + 1)
+        line = _line(text, idx)
+        key = (system, topic, direction, line)
         if key not in seen:
             seen.add(key)
-            edges.append({"topic": topic, "direction": direction,
-                          "line": text.count("\n", 0, idx) + 1,
+            edges.append({"topic": topic, "direction": direction, "line": line,
                           "resolved": True, "via": via, "system": system})
 
     if re.search(r"amqplib|amqp://", text):

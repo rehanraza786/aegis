@@ -81,22 +81,29 @@ def ingest(paths):
             con.execute("DELETE FROM scip_defs WHERE path=?", (rel,))
             con.execute("DELETE FROM scip_refs WHERE path=?", (rel,))
             docs_by_symbol = {s.symbol: "\n".join(s.documentation)[:300] for s in doc.symbols}
+            # batched per document: a large SCIP index carries millions of
+            # occurrences, and executemany runs the row loop in C instead of a
+            # Python-level con.execute per row (order preserved, so OR REPLACE
+            # keeps the same winner)
+            def_rows, ref_rows = [], []
             for occ in doc.occurrences:
                 if occ.symbol.startswith("local "):
                     continue  # file-local variables add noise, not knowledge
                 line = (occ.range[0] if occ.range else 0) + 1
                 if occ.symbol_roles & DEFINITION_ROLE:
-                    con.execute("INSERT OR REPLACE INTO scip_defs VALUES(?,?,?,?)",
-                                (occ.symbol, rel, line, docs_by_symbol.get(occ.symbol, "")))
+                    def_rows.append((occ.symbol, rel, line, docs_by_symbol.get(occ.symbol, "")))
                     def_file_by_symbol[occ.symbol] = rel
-                    total_defs += 1
                 else:
-                    con.execute("INSERT OR REPLACE INTO scip_refs VALUES(?,?,?)",
-                                (occ.symbol, rel, line))
-                    total_refs += 1
+                    ref_rows.append((occ.symbol, rel, line))
+            if def_rows:
+                con.executemany("INSERT OR REPLACE INTO scip_defs VALUES(?,?,?,?)", def_rows)
+            if ref_rows:
+                con.executemany("INSERT OR REPLACE INTO scip_refs VALUES(?,?,?)", ref_rows)
+            total_defs += len(def_rows)
+            total_refs += len(ref_rows)
 
     # Derive precise file->file reference edges (replaces guesswork for indexed files)
-    edge_count = 0
+    edge_rows = []
     rows = con.execute("SELECT DISTINCT symbol, path FROM scip_refs").fetchall()
     for sym, ref_path in rows:
         def_path = def_file_by_symbol.get(sym)
@@ -104,8 +111,10 @@ def ingest(paths):
             continue
         src, dst = files_by_path.get(ref_path), files_by_path.get(def_path)
         if src and dst:
-            con.execute("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,'ref')", (src, dst))
-            edge_count += 1
+            edge_rows.append((src, dst))
+    if edge_rows:
+        con.executemany("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,'ref')", edge_rows)
+    edge_count = len(edge_rows)
 
     con.execute("INSERT OR REPLACE INTO meta VALUES('scip_ingested_at', ?)", (str(time.time()),))
     con.execute("INSERT OR REPLACE INTO meta VALUES('scip_sha', ?)", (
