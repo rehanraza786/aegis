@@ -1,0 +1,67 @@
+name: publish-packages
+# Publishes the engine to npm (aegis-ariadne) and PyPI (aegis-ariadne) when a
+# version tag is pushed — after the full suite passes on BOTH runtimes, and
+# only if the tag matches the committed manifest versions (a tag can never
+# ship a mislabeled package).
+#
+# Setup (one-time):
+#   npm : add an automation token as the NPM_TOKEN repo secret (publish is
+#         skipped, not failed, while the secret is absent).
+#   PyPI: configure Trusted Publishing for this repo/workflow on pypi.org
+#         (no secret needed), then set the repo Variable ENABLE_PYPI_PUBLISH=true.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+  id-token: write   # npm provenance + PyPI trusted publishing
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Full suite, node runtime
+        run: python3 tests/run_tests.py --runtime node
+      - name: Full suite, python runtime
+        run: python3 tests/run_tests.py --runtime python
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Tag must match the committed manifest versions
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          NODE_V="$(node -p 'require("./payload/ariadne-node/package.json").version')"
+          PY_V="$(python3 -c 'import re,pathlib;print(re.search(r"^version\s*=\s*\"([^\"]+)\"", pathlib.Path("payload/ariadne-python/pyproject.toml").read_text(), re.M).group(1))')"
+          echo "tag=$TAG npm=$NODE_V pypi=$PY_V"
+          [ "$TAG" = "$NODE_V" ] && [ "$TAG" = "$PY_V" ] || { echo "::error::tag/manifest version mismatch"; exit 1; }
+      - name: Publish to npm (skipped until NPM_TOKEN is set)
+        if: env.NPM_TOKEN != ''
+        working-directory: payload/ariadne-node
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
+      - name: Build Python distributions
+        if: vars.ENABLE_PYPI_PUBLISH == 'true'
+        working-directory: payload/ariadne-python
+        run: |
+          python3 -m pip install --quiet build
+          python3 -m build --outdir dist
+      - name: Publish to PyPI (trusted publishing; enable via repo variable)
+        if: vars.ENABLE_PYPI_PUBLISH == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: payload/ariadne-python/dist
