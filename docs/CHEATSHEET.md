@@ -35,7 +35,9 @@ Enrich Insights via Copilot · Update Workspace Payload
 edges are dashed. The *Gaps* panel is a worklist: every card is a place the graph
 needs a human — fill one in (with evidence) and every agent gets smarter, with
 your answer recorded as `asserted:human`, PR-reviewable, and auto-staled if the
-code changes.
+code changes. **PNG / SVG** exports the picture for a PR or doc; **✏ Assert
+edge** lets you draw a missing edge (module → topic/table/endpoint) and turns
+the gesture into a prefilled assertion — evidence still required, always.
 
 ## Two rules worth remembering
 

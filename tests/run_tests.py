@@ -1452,6 +1452,60 @@ asyncio.run(main())
           {"daedalus", "argus", "themis", "hermes", "pythia",
            "asclepius", "hephaestus", "metis"} == agent_names, str(sorted(agent_names)))
 
+    # ---- routing eval: the prompt layer's front door, pinned ----
+    # The skills' `description` frontmatter is the routing surface hosts decide
+    # on. A deterministic lexical router (df-weighted token overlap, name
+    # tokens doubled) must send each canonical utterance to its intended skill
+    # top-1 — so a description rewrite that would strand or misroute a common
+    # ask fails CI here instead of shipping. No model in the loop, no flake.
+    import math as _math
+    _sdocs = {}
+    for sd in sorted(skills_dir.iterdir()):
+        md = sd / "SKILL.md"
+        if not md.exists():
+            continue
+        fmm = _re2.match(r"^---\n(.*?)\n---\n", md.read_text(encoding="utf-8"), _re2.S)
+        dm2 = fmm and _re2.search(r"^description:\s*(.+)$", fmm.group(1), _re2.M)
+        if dm2:
+            _sdocs[sd.name] = dm2.group(1).strip().strip("\"'")
+    _RSTOP = {"the", "and", "for", "with", "from", "that", "this", "when", "what", "which", "into",
+              "your", "them", "use", "using", "used", "are", "was", "has", "have", "how", "can",
+              "its", "all", "you", "not", "one", "does", "also", "after", "before", "should",
+              "about", "their", "they", "there", "then", "than"}
+
+    def _rtoks(s):
+        return [w for w in _re2.findall(r"[a-z][a-z0-9_-]{2,}", s.lower()) if w not in _RSTOP]
+
+    _rdocs = {n: _rtoks(d) + [t for part in n.split("-") if part not in _RSTOP for t in [part]] * 2
+              for n, d in _sdocs.items()}
+    _rdf = {}
+    for _ts in _rdocs.values():
+        for t in set(_ts):
+            _rdf[t] = _rdf.get(t, 0) + 1
+
+    def _route(utt):
+        ut = set(_rtoks(utt))
+        return max(_rdocs, key=lambda n: sum(_math.log(1 + len(_rdocs) / _rdf[t]) for t in ut if t in set(_rdocs[n])))
+
+    ROUTES = [
+        ("I'm new here, get me up to speed on this unfamiliar codebase", "codebase-orientation"),
+        ("what breaks if I change this shared service class?", "change-impact-analysis"),
+        ("follow this order event end-to-end through the stack, from the frontend call to the database write", "flow-tracing"),
+        ("the payment event was published but the consumer never received it", "flow-tracing"),
+        ("I need to add a column to the payments table safely", "safe-schema-change"),
+        ("we want to publish a new event when an order ships", "event-contract-change"),
+        ("which tool or agent should I use for this question?", "aegis-help"),
+        ("the graph reports an unresolved dynamic topic, how do I teach it the answer?", "graph-augmentation"),
+        ("build the discount feature end to end with tests and docs", "feature-delivery-loop"),
+        ("review this diff for correctness and hidden blast radius before merge", "peer-code-review"),
+        ("does the implementation actually satisfy the spec requirements?", "spec-gap-analysis"),
+        ("plan and decompose this multi-step research task into an ordered breakdown", "complex-task-breakdown"),
+        ("write the spec, plan, and task artifacts before any code", "spec-driven-artifacts"),
+    ]
+    _misses = [f"{want} -> {_route(utt)} ({utt[:40]}…)" for utt, want in ROUTES if _route(utt) != want]
+    check("routing eval: every canonical utterance routes to its intended skill",
+          not _misses and len({w for _, w in ROUTES}) >= 11, "; ".join(_misses[:4]))
+
     # ---- tool-name cross-check: the prompt layer must reference real tools ----
     # A renamed/removed MCP tool silently strands every skill that mentions it.
     node_src = (TOOLKIT / "payload" / "ariadne-node" / "server.mjs").read_text(encoding="utf-8")

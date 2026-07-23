@@ -273,8 +273,10 @@ function openGraphPanel(context) {
   });
   const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
   const cytoUri = panel.webview.asWebviewUri(vscode.Uri.file(path.join(context.extensionPath, "media", "cytoscape.min.js")));
+  const ehUri = panel.webview.asWebviewUri(vscode.Uri.file(path.join(context.extensionPath, "media", "edgehandles.min.js")));
   panel.webview.html = fs.readFileSync(path.join(context.extensionPath, "graph-view.html"), "utf8")
-    .replaceAll("__NONCE__", nonce).replaceAll("__CYTOSCAPE__", String(cytoUri));
+    .replaceAll("__NONCE__", nonce).replaceAll("__CYTOSCAPE__", String(cytoUri))
+    .replaceAll("__EDGEHANDLES__", String(ehUri));
 
   // node positions + viewport survive closing the panel: the webview persists
   // them here (workspaceState), and every data message hands them back
@@ -347,6 +349,29 @@ function openGraphPanel(context) {
         panel.webview.postMessage({ type: "citation", text: `${m.path}:${m.line}: ${text}` });
       } catch {
         panel.webview.postMessage({ type: "toast", message: `AEGIS: cannot read ${m.path}`, isError: true });
+      }
+    } else if (m.type === "saveImage") {
+      // export the picture: the webview renders (PNG from the canvas, SVG from
+      // the first-party serializer); this side only opens the save dialog and
+      // writes bytes — no shell, no network
+      try {
+        const ext = m.format === "svg" ? "svg" : "png";
+        const uri = await vscode.window.showSaveDialog({
+          defaultUri: vscode.Uri.file(path.join(root, `aegis-graph.${ext}`)),
+          filters: ext === "svg" ? { "SVG image": ["svg"] } : { "PNG image": ["png"] },
+        });
+        if (!uri) return;
+        if (ext === "png") {
+          const b64 = String(m.dataUri || "").replace(/^data:image\/png;base64,/, "");
+          fs.writeFileSync(uri.fsPath, Buffer.from(b64, "base64"));
+        } else {
+          fs.writeFileSync(uri.fsPath, String(m.text || ""));
+        }
+        panel.webview.postMessage({ type: "toast", message: `Saved ${uri.fsPath}` });
+        const pick = await vscode.window.showInformationMessage("AEGIS: graph image saved.", "Reveal");
+        if (pick === "Reveal") vscode.commands.executeCommand("revealFileInOS", uri);
+      } catch (e) {
+        panel.webview.postMessage({ type: "toast", message: `Save failed: ${e.message}`, isError: true });
       }
     } else if (m.type === "openFile") {
       try {
