@@ -834,7 +834,7 @@ const t = new StdioClientTransport({ command: "node", args: [".ariadne/server.mj
 const c = new Client({ name: "smoke", version: "1" });
 await c.connect(t);
 const names = (await c.listTools()).tools.map((x) => x.name);
-const need = ["decisions", "decision_trace", "save_decision", "explain", "save_insight", "message_flow", "db_map", "http_map", "todos"];
+const need = ["decisions", "decision_trace", "save_decision", "explain", "save_insight", "message_flow", "db_map", "http_map", "todos", "plan_context", "change_check"];
 if (!need.every((n) => names.includes(n))) { console.error("MISSING:" + need.filter((n) => !names.includes(n))); process.exit(1); }
 const r = await c.callTool({ name: "decisions", arguments: { target: "orders.created" } });
 if (!r.content[0].text.includes("ADR-012")) { console.error("decisions tool wrong: " + r.content[0].text.slice(0, 200)); process.exit(1); }
@@ -1026,6 +1026,194 @@ await c.close();
           and q3("SELECT 1 FROM msg_edges WHERE topic='refunds.requested'") == [])
     db.close()
 
+    # ---- MCP surface: prompts, resources, updated-notifications, composites ----
+    # One stdio protocol round-trip per runtime (for Python this is ALSO the
+    # first full protocol-level test of the server, not just the module surface):
+    # list/get the four prompts, list/read the ariadne:// resources, check the
+    # readOnlyHint annotations, exercise plan_context/change_check, then
+    # subscribe and require resources/updated + list_changed after reindex.
+    if rt == "node":
+        sprobe = ws / ".ariadne" / "_surface.mjs"
+        sprobe.write_text("""import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ResourceUpdatedNotificationSchema, ResourceListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+const c = new Client({ name: "surface", version: "1" });
+const got = [];
+c.setNotificationHandler(ResourceUpdatedNotificationSchema, (n) => got.push("updated:" + n.params.uri));
+c.setNotificationHandler(ResourceListChangedNotificationSchema, () => got.push("list_changed"));
+await c.connect(new StdioClientTransport({ command: "node", args: [".ariadne/server.mjs"], cwd: process.cwd() }));
+const call = async (n, a = {}) => (await c.callTool({ name: n, arguments: a })).content[0].text;
+const gp = async (n, a = {}) => (await c.getPrompt({ name: n, arguments: a })).messages[0].content.text;
+const tools = (await c.listTools()).tools;
+const ann = (n) => tools.find((t) => t.name === n)?.annotations ?? {};
+const prompts = (await c.listPrompts()).prompts.map((p) => p.name).sort();
+const impact = await gp("aegis-impact", { target: "OrderPublisher" });
+const orient = await gp("aegis-orient", { module: "order-service" });
+const gap = await gp("aegis-resolve-gap");
+const rel = await gp("aegis-release-check");
+const res = (await c.listResources()).resources.map((r) => r.uri).sort();
+const tpl = (await c.listResourceTemplates()).resourceTemplates.map((r) => r.uriTemplate);
+const read = async (uri) => (await c.readResource({ uri })).contents[0].text;
+const st = JSON.parse(await read("ariadne://status"));
+const adr = await read("ariadne://decisions/ADR-012");
+const graph = JSON.parse(await read("ariadne://graph"));
+const ctx = await read("ariadne://context");
+const asr = JSON.parse(await read("ariadne://assertions"));
+const pc = JSON.parse(await call("plan_context", { task: "publish the order created event to kafka" }));
+const cc = JSON.parse(await call("change_check", { files: ["order-service/src/main/java/com/acme/OrderPublisher.java", "billing-service/src/main/java/com/acme/PaymentDao.java", "no-such-file.java"] }));
+await c.subscribeResource({ uri: "ariadne://status" });
+await c.subscribeResource({ uri: "ariadne://graph" });
+await call("reindex", { mode: "incremental" });
+const dl = Date.now() + 10000;
+while (Date.now() < dl && !(got.includes("updated:ariadne://status") && got.includes("updated:ariadne://graph") && got.includes("list_changed"))) await new Promise((r) => setTimeout(r, 200));
+const out = {
+  prompts,
+  impactOk: impact.includes("OrderPublisher.java") && impact.includes("orders.created") && impact.includes("ADR-012") && impact.includes("OrderPublisherTest.java"),
+  orientOk: orient.startsWith("Orientation for module order-service") && orient.includes("context_pack"),
+  gapOk: gap.includes("DynamicPublisher.java") && gap.includes("assert_edge") && gap.includes("NEVER assert from naming alone"),
+  relOk: rel.includes("legacy_invoices") && rel.includes("bulk.orphan1") && rel.includes("previously triaged"),
+  relDismissed: !rel.includes("audit.q"),
+  res, tpl,
+  stOk: typeof st.fresh === "boolean" && st.files > 0,
+  adrOk: adr.includes("read-only queries"),
+  graphOk: (graph.modules ?? []).length > 0 && (graph.topics ?? []).length > 0,
+  ctxOk: ctx.includes("test files indexed"),
+  asrOk: (asr.assertions ?? []).some((a) => a.author === "copilot"),
+  annOk: ann("find_symbol").readOnlyHint === true && ann("save_insight").readOnlyHint === false && ann("reindex").readOnlyHint === false,
+  pcOk: (pc.files_to_read ?? []).some((f) => f.path.endsWith("OrderPublisher.java")) && String(pc.governing_decisions).includes("ADR-012") && ((pc.tests || {}).behaviors ?? []).includes("should publish order created event"),
+  ccOk: JSON.stringify(cc.seam_warnings ?? {}).includes("sole producer of orders.created") && JSON.stringify(cc.seam_warnings ?? {}).includes("legacy_invoices") && (cc.tests_to_rerun.files ?? []).some((f) => f.includes("OrderPublisherTest.java")) && (cc.files.not_in_index ?? []).includes("no-such-file.java"),
+  notif: { updated: got.includes("updated:ariadne://status") && got.includes("updated:ariadne://graph"), listChanged: got.includes("list_changed") },
+};
+console.log("SURFACE:" + JSON.stringify(out));
+await c.close();
+""")
+        code, osf = run(["node", str(sprobe)], ws)
+        sprobe.unlink(missing_ok=True)
+    else:
+        sprobe = ws / ".ariadne" / "_surface.py"
+        sprobe.write_text('''import asyncio, json, sys
+from mcp import ClientSession, StdioServerParameters, types
+from mcp.client.stdio import stdio_client
+from pydantic import AnyUrl
+
+got = []
+
+
+async def handler(message):
+    if isinstance(message, types.ServerNotification):
+        root = message.root
+        if isinstance(root, types.ResourceUpdatedNotification):
+            got.append("updated:" + str(root.params.uri))
+        elif isinstance(root, types.ResourceListChangedNotification):
+            got.append("list_changed")
+
+
+async def main():
+    params = StdioServerParameters(command=sys.executable, args=[".ariadne/server.py"])
+    async with stdio_client(params) as (r, w):
+        async with ClientSession(r, w, message_handler=handler) as s:
+            await s.initialize()
+            tools = (await s.list_tools()).tools
+
+            def ann(n):
+                t = next(x for x in tools if x.name == n)
+                return t.annotations
+
+            prompts = sorted(p.name for p in (await s.list_prompts()).prompts)
+
+            async def gp(n, a=None):
+                return (await s.get_prompt(n, a)).messages[0].content.text
+
+            async def call(n, a):
+                return (await s.call_tool(n, a)).content[0].text
+
+            async def read(uri):
+                return (await s.read_resource(AnyUrl(uri))).contents[0].text
+
+            impact = await gp("aegis-impact", {"target": "OrderPublisher"})
+            orient = await gp("aegis-orient", {"module": "order-service"})
+            gap = await gp("aegis-resolve-gap")
+            rel = await gp("aegis-release-check")
+            res = sorted(str(x.uri) for x in (await s.list_resources()).resources)
+            tpl = [t.uriTemplate for t in (await s.list_resource_templates()).resourceTemplates]
+            st = json.loads(await read("ariadne://status"))
+            adr = await read("ariadne://decisions/ADR-012")
+            graph = json.loads(await read("ariadne://graph"))
+            ctx = await read("ariadne://context")
+            asr = json.loads(await read("ariadne://assertions"))
+            pc = json.loads(await call("plan_context", {"task": "publish the order created event to kafka"}))
+            cc = json.loads(await call("change_check", {"files": [
+                "order-service/src/main/java/com/acme/OrderPublisher.java",
+                "billing-service/src/main/java/com/acme/PaymentDao.java", "no-such-file.java"]}))
+            await s.subscribe_resource(AnyUrl("ariadne://status"))
+            await s.subscribe_resource(AnyUrl("ariadne://graph"))
+            await s.call_tool("reindex", {"mode": "incremental"})
+            deadline = asyncio.get_event_loop().time() + 10
+            want = {"updated:ariadne://status", "updated:ariadne://graph", "list_changed"}
+            while asyncio.get_event_loop().time() < deadline and not want <= set(got):
+                await asyncio.sleep(0.2)
+            warn_s = json.dumps(cc.get("seam_warnings", {}))
+            tests_pc = pc.get("tests") if isinstance(pc.get("tests"), dict) else {}
+            out = {
+                "prompts": prompts,
+                "impactOk": "OrderPublisher.java" in impact and "orders.created" in impact
+                            and "ADR-012" in impact and "OrderPublisherTest.java" in impact,
+                "orientOk": orient.startswith("Orientation for module order-service") and "context_pack" in orient,
+                "gapOk": "DynamicPublisher.java" in gap and "assert_edge" in gap and "NEVER assert from naming alone" in gap,
+                "relOk": "legacy_invoices" in rel and "bulk.orphan1" in rel and "previously triaged" in rel,
+                "relDismissed": "audit.q" not in rel,
+                "res": res, "tpl": tpl,
+                "stOk": isinstance(st.get("fresh"), bool) and st.get("files", 0) > 0,
+                "adrOk": "read-only queries" in adr,
+                "graphOk": len(graph.get("modules", [])) > 0 and len(graph.get("topics", [])) > 0,
+                "ctxOk": "test files indexed" in ctx,
+                "asrOk": any(a.get("author") == "copilot" for a in asr.get("assertions", [])),
+                "annOk": ann("find_symbol").readOnlyHint is True and ann("save_insight").readOnlyHint is False
+                         and ann("reindex").readOnlyHint is False,
+                "pcOk": any(f["path"].endswith("OrderPublisher.java") for f in pc.get("files_to_read", []))
+                        and "ADR-012" in str(pc.get("governing_decisions"))
+                        and "should publish order created event" in tests_pc.get("behaviors", []),
+                "ccOk": "sole producer of orders.created" in warn_s and "legacy_invoices" in warn_s
+                        and any("OrderPublisherTest.java" in f for f in cc["tests_to_rerun"].get("files", []))
+                        and "no-such-file.java" in cc["files"].get("not_in_index", []),
+                "notif": {"updated": "updated:ariadne://status" in got and "updated:ariadne://graph" in got,
+                          "listChanged": "list_changed" in got},
+            }
+            print("SURFACE:" + json.dumps(out))
+
+
+asyncio.run(main())
+''')
+        code, osf = run([py, str(sprobe)], ws)
+        sprobe.unlink(missing_ok=True)
+    msf = re.search(r"SURFACE:(\{.*\})", osf)
+    sf = json.loads(msf.group(1)) if msf else {}
+    check("prompt registry served over the protocol (4 aegis prompts)",
+          sf.get("prompts") == ["aegis-impact", "aegis-orient", "aegis-release-check", "aegis-resolve-gap"], osf[-400:])
+    check("aegis-impact renders blast radius, seams, decisions, tests from the live graph",
+          sf.get("impactOk") is True, str(sf))
+    check("aegis-orient renders the module reading plan", sf.get("orientOk") is True)
+    check("aegis-resolve-gap serves the top gap with the assert contract", sf.get("gapOk") is True)
+    check("aegis-release-check aggregates drift/orphans for review", sf.get("relOk") is True)
+    check("aegis-release-check honors dismissals (audit.q excluded)", sf.get("relDismissed") is True)
+    check("resource registry served over the protocol (5 static + decisions template)",
+          sf.get("res") == ["ariadne://assertions", "ariadne://context", "ariadne://decisions",
+                            "ariadne://graph", "ariadne://status"]
+          and sf.get("tpl") == ["ariadne://decisions/{id}"], str(sf.get("res")))
+    check("ariadne://status serves freshness JSON", sf.get("stOk") is True)
+    check("ariadne://decisions/<id> serves the ADR source", sf.get("adrOk") is True)
+    check("ariadne://graph serves the export snapshot", sf.get("graphOk") is True)
+    check("ariadne://context serves the agent orientation pack", sf.get("ctxOk") is True)
+    check("ariadne://assertions serves the human knowledge layer", sf.get("asrOk") is True)
+    check("tool annotations visible over the protocol (readOnlyHint)", sf.get("annOk") is True)
+    check("plan_context finds files, decisions, and tests from a task description",
+          sf.get("pcOk") is True, str(sf))
+    check("change_check warns on sole-producer and drift, names the tests",
+          sf.get("ccOk") is True, str(sf))
+    check("resources/updated + list_changed arrive after reindex (subscription round-trip)",
+          (sf.get("notif") or {}).get("updated") is True and (sf.get("notif") or {}).get("listChanged") is True,
+          str(sf.get("notif")))
+
     # ---- plugin hooks: pass extension populated todos table ----
     db = sqlite3.connect(ws / ".ariadne" / "index.db")
     check("extension pass ran (todos table)",
@@ -1199,12 +1387,39 @@ await c.close();
 
     # ---- tool-name cross-check: the prompt layer must reference real tools ----
     # A renamed/removed MCP tool silently strands every skill that mentions it.
-    node_reg = set(_re2.findall(r'tool\(server, "([a-z][a-z0-9_]*)"',
-                                (TOOLKIT / "payload" / "ariadne-node" / "server.mjs").read_text(encoding="utf-8")))
-    py_reg = set(_re2.findall(r"@mcp\.tool\(\)\s*\n(?:async )?def ([a-z][a-z0-9_]*)",
-                              (TOOLKIT / "payload" / "ariadne-python" / "server.py").read_text(encoding="utf-8")))
-    check("node and python tool registries match (24 tools)",
-          node_reg == py_reg and len(node_reg) == 24, str(sorted(node_reg ^ py_reg)))
+    node_src = (TOOLKIT / "payload" / "ariadne-node" / "server.mjs").read_text(encoding="utf-8")
+    py_src = (TOOLKIT / "payload" / "ariadne-python" / "server.py").read_text(encoding="utf-8")
+    node_reg = set(_re2.findall(r'tool\(server, "([a-z][a-z0-9_]*)"', node_src))
+    # the decorator now REQUIRES an RO/WR annotation: an unannotated tool falls
+    # out of this regex and fails the registry-size check by construction
+    py_ann = {name: ann for ann, name in _re2.findall(
+        r"@mcp\.tool\(annotations=(RO|WR)\)\s*\n(?:async )?def ([a-z][a-z0-9_]*)", py_src)}
+    py_reg = set(py_ann)
+    check("node and python tool registries match (26 tools)",
+          node_reg == py_reg and len(node_reg) == 26, str(sorted(node_reg ^ py_reg)))
+    # annotations: every tool annotated, identically across editions, and only
+    # the four writers are non-read-only (hosts parallelize reads, gate writes)
+    m_ann = _re2.search(r"const TOOL_ANNOTATIONS = \{(.*?)\};", node_src, _re2.S)
+    node_ann = dict(_re2.findall(r"([a-z_][a-z0-9_]*): (RO|WR)", m_ann.group(1))) if m_ann else {}
+    check("tool annotations identical across editions and covering every tool",
+          node_ann == py_ann and set(node_ann) == node_reg,
+          str(sorted(set(node_ann.items()) ^ set(py_ann.items()))))
+    check("tool annotations: exactly the four writers are non-read-only",
+          {t for t, a in node_ann.items() if a == "WR"} == {"save_decision", "save_insight", "assert_edge", "reindex"},
+          str(sorted(t for t, a in node_ann.items() if a == "WR")))
+    # prompt registry parity: the four graph-aware recipes, both editions
+    node_prompts = set(_re2.findall(r'prompt\(server, "([a-z][a-z0-9-]*)"', node_src))
+    py_prompts = set(_re2.findall(r'@mcp\.prompt\(name="([a-z][a-z0-9-]*)"', py_src))
+    check("node and python prompt registries match (4 prompts)",
+          node_prompts == py_prompts == {"aegis-impact", "aegis-orient", "aegis-resolve-gap", "aegis-release-check"},
+          str(sorted(node_prompts ^ py_prompts)))
+    # resource registry parity: the ariadne:// URIs are the cross-edition contract
+    node_res = set(_re2.findall(r'resource\(server, "[a-z]+", (?:new ResourceTemplate\()?"(ariadne://[^"]+)"', node_src))
+    py_res = set(_re2.findall(r'@mcp\.resource\("(ariadne://[^"]+)"', py_src))
+    check("node and python resource registries match (6 URIs)",
+          node_res == py_res == {"ariadne://graph", "ariadne://status", "ariadne://context",
+                                 "ariadne://decisions", "ariadne://decisions/{id}", "ariadne://assertions"},
+          str(sorted(node_res ^ py_res)))
     # one version identity across every manifest: npm, PyPI, and the CHANGELOG
     node_ver = json.loads((TOOLKIT / "payload" / "ariadne-node" / "package.json").read_text(encoding="utf-8"))["version"]
     pym = _re2.search(r'^version\s*=\s*"([^"]+)"',
@@ -1213,10 +1428,15 @@ await c.close();
     check("payload version identity agrees (npm == pypi == CHANGELOG)",
           pym and chm and node_ver == pym.group(1) == chm.group(1),
           f"npm={node_ver} pypi={pym and pym.group(1)} changelog={chm and chm.group(1)}")
-    # the tool reference must document every registered tool (and no ghosts)
+    # the tool reference must document every registered tool (and no ghosts),
+    # every prompt, and every resource URI — the doc is pinned to the registry
     tools_doc = (TOOLKIT / "docs" / "TOOLS.md").read_text(encoding="utf-8")
     undocumented = sorted(t for t in node_reg if f"`{t}`" not in tools_doc)
-    check("docs/TOOLS.md documents all 24 registered tools", not undocumented, str(undocumented))
+    check("docs/TOOLS.md documents all 26 registered tools", not undocumented, str(undocumented))
+    undoc_prompts = sorted(p for p in node_prompts if f"`/{p}`" not in tools_doc)
+    check("docs/TOOLS.md documents every MCP prompt", not undoc_prompts, str(undoc_prompts))
+    undoc_res = sorted(u for u in node_res if f"`{u}`" not in tools_doc)
+    check("docs/TOOLS.md documents every ariadne:// resource", not undoc_res, str(undoc_res))
     # the two constitution templates must never drift apart again
     check("constitution templates are identical (payload/ vs spec-driven-artifacts/)",
           (TOOLKIT / "payload" / "constitution-template.md").read_bytes()

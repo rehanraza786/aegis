@@ -96,6 +96,21 @@ The post-review release. Highlights, roughly in the order they landed:
   policy and threat model, issue/PR templates, CODEOWNERS, dependabot, CI
   badge, `docs/ARCHITECTURE.md`, and `docs/TOOLS.md` (suite-pinned to the
   live tool registry).
+- **MCP surface completed:** the server speaks all three MCP primitives now.
+  Four prompts rendered server-side from live graph queries (`/aegis-impact`,
+  `/aegis-orient`, `/aegis-resolve-gap`, `/aegis-release-check`); six
+  `ariadne://` resources (graph export, status, agent context, decision
+  ledger + per-ADR template, assertions with computed staleness) with real
+  subscription support — `resources/updated` + `list_changed` fan out when
+  the index moves, whether via the `reindex` tool or a hook outside the
+  process; composite decision tools `plan_context(task)` (task →
+  files/seams/decisions/tests in one call) and `change_check(files)`
+  (pre-edit blast radius, tests to re-run, seam warnings, governing ADRs,
+  assertions the edit stales); and `readOnlyHint` annotations on all 26
+  tools (the four writers marked non-read-only, non-destructive). Registry
+  parity across editions is suite-pinned for tools, prompts, resources, AND
+  annotations; the Python edition gained its first full stdio protocol
+  round-trip test in the process.
 
 ## 0.1.0
 

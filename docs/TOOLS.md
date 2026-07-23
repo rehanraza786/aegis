@@ -1,9 +1,16 @@
 # Ariadne tool reference
 
-All 24 MCP tools, identical across both editions (a suite check pins the
-registries equal, and pins this document to the registry). Every result is
-budget-capped (rows and bytes, warnings kept first); every error returns as a
-message the agent can adapt to, never a crash. Params marked ? are optional.
+All 26 MCP tools — plus 4 server-rendered prompts and 6 `ariadne://`
+resources — identical across both editions (a suite check pins the tool,
+prompt, and resource registries equal, and pins this document to them). Every
+result is budget-capped (rows and bytes, warnings kept first); every error
+returns as a message the agent can adapt to, never a crash. Params marked ?
+are optional.
+
+Every tool carries MCP annotations: `readOnlyHint: true` on the 22 read-only
+tools, and the four writers (`save_decision`, `save_insight`, `assert_edge`,
+`reindex`) marked non-read-only and non-destructive — so hosts can parallelize
+reads and gate writes.
 
 ## Orientation
 
@@ -60,6 +67,21 @@ mode. Drift warnings: accessed-but-no-changeset, defined-but-never-accessed.
 path, cross-language. Warnings: endpoints nobody calls, calls matching no
 endpoint.
 
+## Composite decision tools
+
+**`plan_context`** (task) → when you have a TASK but no target yet: full-text
++ symbol matches for the task's terms, the files they concentrate in
+(`files_to_read`, with why each matched), the seams those files touch, the
+governing decisions, and the tests that cover them. One call instead of the
+3–5 exploratory searches every session used to open with; follow with
+`context_pack` on the target you choose.
+
+**`change_check`** (files[]) → pre-edit decision support for a whole edit set:
+combined blast radius, `tests_to_rerun`, per-file seam participation, seam
+warnings the edit could trip (sole producer/consumer of a topic, drift tables,
+uncalled endpoints, unresolved expressions in these files), governing ADRs,
+and the assertions the edit will mark STALE. Call BEFORE proposing a diff.
+
 ## Where the graph is blind — and how it learns
 
 **`graph_gaps`** (limit?=20) → the graph's own worklist: unresolved topic
@@ -94,4 +116,51 @@ governed artifacts with existence check (decision drift).
 ## Maintenance
 
 **`reindex`** (mode?: incremental|full) → rebuild the index (async; never
-blocks the session). Use when `index_status` says `fresh: false`.
+blocks the session). Use when `index_status` says `fresh: false`. On
+completion, subscribed resource readers get `notifications/resources/updated`.
+
+## Prompts
+
+Four graph-aware recipes, rendered SERVER-SIDE from live queries at request
+time — hosts that support MCP prompts surface them as slash commands. The
+rendered text carries current facts (blast radius, seams, decisions), never a
+static template.
+
+**`/aegis-impact`** (target) → "what am I about to break": blast radius,
+tests to re-run, seams touched, governing decisions, assertions the edit will
+stale — and the pre-edit protocol.
+
+**`/aegis-orient`** (module) → first encounter with a module: file/language
+shape, the most-depended-on entry points, seams, decisions, cached insight,
+and the suggested reading order.
+
+**`/aegis-resolve-gap`** () → the top open gap from the graph's worklist
+(dismissed items skipped), the investigation protocol, and the `assert_edge`
+contract (evidence quotes code, ≥20 chars; never assert from naming alone).
+
+**`/aegis-release-check`** () → pre-release review: schema drift, orphan
+topics, uncalled endpoints, unresolved expressions, stale assertions —
+each with the tool that investigates it, dismissed items excluded but counted.
+
+## Resources
+
+Context a host can ATTACH without spending tool calls. Subscribe to any of
+these and the server emits `notifications/resources/updated` (plus one
+`resources/list_changed`) whenever the index moves — after the `reindex` tool,
+and within ~2s of a hook- or agent-triggered reindex outside this process.
+
+**`ariadne://graph`** → the full graph-export JSON snapshot (modules, topics,
+tables, endpoints, gaps, annotations), cached until the index moves.
+
+**`ariadne://status`** → freshness JSON; the resource twin of `index_status`.
+
+**`ariadne://context`** → `docs/generated/agent-context.md`, the graph-derived
+orientation pack.
+
+**`ariadne://decisions`** → the decision ledger (id, title, status, validity).
+
+**`ariadne://decisions/{id}`** → one ADR as markdown (the git-versioned source
+file when present, else the indexed summary).
+
+**`ariadne://assertions`** → the human knowledge layer:
+`docs/graph-assertions.json` with a computed `stale` flag per assertion.
