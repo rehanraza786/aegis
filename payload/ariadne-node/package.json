@@ -25,7 +25,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "better-sqlite3": "^11.0.0",
+    "better-sqlite3": "^13.0.1",
     "protobufjs": "^7.4.0",
     "tree-sitter-wasms": "^0.1.13",
     "unpdf": "^0.12.0",
