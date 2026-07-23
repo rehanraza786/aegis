@@ -360,7 +360,7 @@ function openGraphPanel(context) {
       try {
         const res = await runtimeExec(root, runtime, `annotate.${suffix}`, [JSON.stringify(m.payload)]);
         panel.webview.postMessage({ type: "toast", message: res.trim() });
-        if (["assert", "retract", "reaffirm"].includes(m.payload.action)) {
+        if (["assert", "retract", "reaffirm", "dismiss"].includes(m.payload.action)) {
           // one gesture, no modal: record → incremental reindex → the graph
           // reflects the change (edge appears, disappears, or STALE clears)
           await reindex("AEGIS: updating the graph (incremental reindex)…");

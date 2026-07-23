@@ -80,6 +80,25 @@ if (a.action === "insight") {
   fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
   console.log(`Asserted (provenance: ${author}) and recorded in docs/graph-assertions.json (${list.length} total). It enters the graph on the next index, marked STALE automatically if ${a.file} changes. Commit the file to share it.`);
 
+} else if (a.action === "dismiss") {
+  // gap triage: a dismissed gap stops shouting but stays auditable. Stored in
+  // the same reviewed file, kind "dismissal"; the export mutes matching gaps.
+  if (!a.gap || !a.key) die("dismiss needs gap (e.g. orphan_topic) and key (topic/table/path).");
+  if (!(a.reason?.length >= 10)) die("reason must say why this gap is acceptable (10+ chars).");
+  const af = path.join(ROOT, "docs", "graph-assertions.json");
+  let list = [];
+  if (fs.existsSync(af)) {
+    try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
+    catch (e) { die(`docs/graph-assertions.json is not valid JSON (${e.message}). Fix it first.`); }
+    if (!Array.isArray(list)) die("docs/graph-assertions.json is not a JSON array. Fix it first.");
+  }
+  list = list.filter((x) => !(x.kind === "dismissal" && x.gap === a.gap && x.key === a.key));
+  list.push({ kind: "dismissal", gap: a.gap, key: a.key, reason: a.reason, author,
+    dismissed_at: new Date().toISOString().slice(0, 10) });
+  fs.mkdirSync(path.dirname(af), { recursive: true });
+  fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
+  console.log(`Dismissed ${a.gap} '${a.key}' (by: ${author}). It mutes in the worklist after reindex but stays auditable; commit the file to share.`);
+
 } else if (a.action === "retract" || a.action === "reaffirm") {
   // lifecycle for existing assertions, keyed by the same natural key the
   // no-duplicate filter uses. retract removes; reaffirm re-verifies: the

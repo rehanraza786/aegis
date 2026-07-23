@@ -107,6 +107,29 @@ elif a.get("action") == "assert":
           f"It enters the graph on the next index, marked STALE automatically if {a['file']} changes. "
           "Commit the file to share it.")
 
+elif a.get("action") == "dismiss":
+    # gap triage: a dismissed gap stops shouting but stays auditable. Stored in
+    # the same reviewed file, kind "dismissal"; the export mutes matching gaps.
+    if not a.get("gap") or not a.get("key"):
+        die("dismiss needs gap (e.g. orphan_topic) and key (topic/table/path).")
+    if len(a.get("reason", "")) < 10:
+        die("reason must say why this gap is acceptable (10+ chars).")
+    af = ROOT / "docs" / "graph-assertions.json"
+    alist = []
+    if af.exists():
+        try:
+            alist = json.loads(af.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            die(f"docs/graph-assertions.json is not valid JSON ({e}). Fix it first.")
+        if not isinstance(alist, list):
+            die("docs/graph-assertions.json is not a JSON array. Fix it first.")
+    alist = [x for x in alist if not (x.get("kind") == "dismissal" and x.get("gap") == a["gap"] and x.get("key") == a["key"])]
+    alist.append({"kind": "dismissal", "gap": a["gap"], "key": a["key"], "reason": a["reason"],
+                  "author": author, "dismissed_at": datetime.date.today().isoformat()})
+    af.parent.mkdir(parents=True, exist_ok=True)
+    af.write_text(json.dumps(alist, indent=2) + "\n", encoding="utf-8")
+    print(f"Dismissed {a['gap']} '{a['key']}' (by: {author}). It mutes in the worklist after reindex but stays auditable; commit the file to share.")
+
 elif a.get("action") in ("retract", "reaffirm"):
     # lifecycle for existing assertions, keyed by the same natural key the
     # no-duplicate filter uses. retract removes; reaffirm re-verifies: the
