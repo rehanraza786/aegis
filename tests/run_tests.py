@@ -850,6 +850,10 @@ await c.close();
           "test_scratch" not in (gen / "data-map.md").read_text(encoding="utf-8").split("## Per-table detail")[0])
     check("agent-context reports indexed test files",
           "test files indexed" in (gen / "agent-context.md").read_text(encoding="utf-8"))
+    ac_text = (gen / "agent-context.md").read_text(encoding="utf-8")
+    check("standing rules are derived from the graph, not asserted universally",
+          "detected:" in ac_text and "Prisma" in ac_text and "Liquibase changesets" in ac_text
+          and "never hardcode a new literal" in ac_text)
 
     # ---- graph export + annotate: the visual-client surface (graph view) ----
     ge = str(ar / ("graph_export.mjs" if rt == "node" else "graph_export.py"))
@@ -1016,6 +1020,31 @@ await c.close();
           all((ws / r / ".git" / "hooks" / "post-commit").exists()
               for r in ["order-service", "billing-service", "web-app", "docs-repo"]))
 
+    # ---- multi-host prompt-layer install (--host=all) ----
+    if os.name != "nt" and shutil.which("bash"):
+        mh = Path(tempfile.mkdtemp(prefix="aegis-mh-")) / "repo"
+        (mh / "src").mkdir(parents=True)
+        (mh / "src" / "A.java").write_text("public class A {}\n", encoding="utf-8")
+        git(["init", "-q"], mh)
+        git(["add", "-A"], mh)
+        git(["commit", "-qm", "init"], mh)
+        code, omh = run(["bash", str(TOOLKIT / "install.sh"), "--host=all", "--no-hooks"], mh)
+        check("install.sh --host=all exits 0", code == 0, omh[-400:])
+        check("claude host: skills + agents + CLAUDE.md + .mcp.json",
+              (mh / ".claude" / "skills" / "codebase-orientation" / "SKILL.md").exists()
+              and (mh / ".claude" / "agents" / "argus.md").exists()
+              and "Codebase knowledge base" in (mh / "CLAUDE.md").read_text(encoding="utf-8")
+              and json.loads((mh / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"])
+        check("cursor host: rule + mcp config",
+              (mh / ".cursor" / "rules" / "aegis-graph.mdc").read_text(encoding="utf-8").startswith("---")
+              and json.loads((mh / ".cursor" / "mcp.json").read_text(encoding="utf-8"))["mcpServers"])
+        check("agents host: AGENTS.md routing",
+              "Codebase knowledge base" in (mh / "AGENTS.md").read_text(encoding="utf-8"))
+        check("copilot host still installed alongside",
+              (mh / ".github" / "skills" / "aegis-help" / "SKILL.md").exists()
+              and "Codebase knowledge base" in (mh / ".github" / "copilot-instructions.md").read_text(encoding="utf-8"))
+        shutil.rmtree(mh.parent, ignore_errors=True)
+
     # ---- skills & agents: frontmatter integrity (STRICT YAML, not regex) ----
     # Regex "linting" is what let unquoted `description: ... : ...` scalars ship and
     # break every strict Agent Skills reader. Parse with a real YAML parser.
@@ -1102,6 +1131,13 @@ await c.close();
     check("payload version identity agrees (npm == pypi == CHANGELOG)",
           pym and chm and node_ver == pym.group(1) == chm.group(1),
           f"npm={node_ver} pypi={pym and pym.group(1)} changelog={chm and chm.group(1)}")
+    # the two constitution templates must never drift apart again
+    check("constitution templates are identical (payload/ vs spec-driven-artifacts/)",
+          (TOOLKIT / "payload" / "constitution-template.md").read_bytes()
+          == (TOOLKIT / "payload" / ".github" / "skills" / "spec-driven-artifacts" / "templates" / "constitution.md").read_bytes())
+    check("agents carry no copilot tools allowlist (contradicted their own bodies)",
+          not any("\ntools:" in (f.read_text(encoding="utf-8").split("---")[1] if f.read_text(encoding="utf-8").startswith("---") else "")
+                  for f in (TOOLKIT / "payload" / ".github" / "agents").glob("*.agent.md")))
     # backticked snake_case tokens in prompt bodies are tool references unless
     # they name a known schema/config/result-field concept (allowlist below)
     ALLOW = {"is_test", "msg_edges", "db_access", "db_defs", "http_endpoints", "http_calls",

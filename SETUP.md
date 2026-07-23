@@ -49,6 +49,19 @@ Both paths are idempotent and neither overwrites a file you have edited.
 The index is a local build artifact and is gitignored. Everything else is text you
 review in pull requests like any other change.
 
+## Other agent hosts (Claude Code, Cursor, AGENTS.md)
+
+The prompt layer isn't Copilot-only. `install.sh --host=<h>` targets any of:
+`copilot` (the default: `.github/skills`, `.github/agents`,
+`copilot-instructions.md`, `.vscode/mcp.json`), `claude` (`.claude/skills`,
+`.claude/agents/*.md`, routing appended to `CLAUDE.md`, `.mcp.json`), `cursor`
+(`.cursor/rules/aegis-graph.mdc`, `.cursor/mcp.json`), `agents` (routing
+appended to a generic `AGENTS.md` — Zed, Codex CLI, and friends), or `all`.
+Hosts comma-combine (`--host=copilot,claude`). The skills are the open Agent
+Skills format, so the same files work everywhere; the engine itself is also on
+npm/PyPI (`npx aegis-ariadne` / `uvx aegis-ariadne`) for hosts that prefer a
+package to a vendored `.ariadne/`.
+
 ## Git hooks
 
 The setup step installs `post-commit`, `post-merge`, and `post-checkout` hooks in
