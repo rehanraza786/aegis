@@ -442,6 +442,16 @@ def main():
           q("SELECT 1 FROM http_calls WHERE norm='/api/orders/{}' AND client='axios'") != [])
     check("pdf indexed into FTS",
           q("SELECT 1 FROM chunks WHERE path LIKE '%spec.pdf' LIMIT 1") != [])
+    # schema v6: FTS is external-content — the corpus lives ONCE in chunk_text,
+    # the FTS table holds only the trigram index, and snippet()/MATCH still work
+    check("chunks are FTS external-content over chunk_text (schema v6)",
+          "content='chunk_text'" in (q("SELECT sql FROM sqlite_master WHERE name='chunks'")[0][0] or ""))
+    check("chunk_text and the FTS index agree row-for-row",
+          q("SELECT COUNT(*) FROM chunk_text")[0][0] == q("SELECT COUNT(*) FROM chunks")[0][0]
+          and q("SELECT COUNT(*) FROM chunk_text")[0][0] > 0)
+    check("snippet() serves matches through the external-content table",
+          ">>>" in (q("SELECT snippet(chunks, 2, '>>>', '<<<', '…', 8) FROM chunks "
+                      "WHERE chunks MATCH '\"orders\"' LIMIT 1") or [["", ""]])[0][0])
     check("kotlin AST nesting (OrderHandler.handle)",
           q("SELECT 1 FROM symbols WHERE name='handle' AND parent='OrderHandler'") != [])
     check("gradle build file indexed",
@@ -639,6 +649,43 @@ await c.close();
           f"msg {n_msg}, acc {n_acc}")
     after.close()
 
+    # ---- config-delta scoping: one changed constant re-extracts only mentioners ----
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    n_msg2 = db.execute("SELECT COUNT(*) FROM msg_edges").fetchone()[0]
+    db.close()
+    pub = ws / "order-service" / "src/main/java/com/acme/OrderPublisher.java"
+    pub.write_text(pub.read_text(encoding="utf-8").replace('"orders.created"', '"orders.created.v2"'), encoding="utf-8")
+    git(["add", "-A"], ws / "order-service")
+    git(["commit", "-qm", "retopic"], ws / "order-service")
+    code, ocd = run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("config-delta scoping: a changed constant widens only to files that mention it",
+          re.search(r"Config-delta scoping: \d+ changed key\(s\) widened extraction to \d+/\d+ files", ocd) is not None
+          and "Extraction scoped to" in ocd, ocd[-300:])
+    check("config-delta scoping: the re-resolved producer edge lands",
+          db.execute("SELECT COUNT(*) FROM msg_edges WHERE topic='orders.created.v2' AND direction='produce'").fetchone()[0] == 1)
+    check("config-delta scoping: un-mentioned files keep their rows (consumer intact)",
+          db.execute("SELECT COUNT(*) FROM msg_edges m JOIN files f ON f.id=m.file_id "
+                     "WHERE m.topic='orders.created' AND m.direction='consume' AND f.path LIKE '%BillingListener.java'").fetchone()[0] == 1
+          and db.execute("SELECT COUNT(*) FROM msg_edges").fetchone()[0] == n_msg2, ocd[-200:])
+    db.close()
+    # revert, so downstream fixtures (export, correlation, prompt checks) see the original topology
+    pub.write_text(pub.read_text(encoding="utf-8").replace('"orders.created.v2"', '"orders.created"'), encoding="utf-8")
+    git(["add", "-A"], ws / "order-service")
+    git(["commit", "-qm", "retopic revert"], ws / "order-service")
+    run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("config-delta scoping: revert restores the original topology",
+          db.execute("SELECT COUNT(*) FROM msg_edges WHERE topic='orders.created'").fetchone()[0] == 2
+          and db.execute("SELECT COUNT(*) FROM msg_edges WHERE topic='orders.created.v2'").fetchone()[0] == 0)
+    # the two reindex cycles above also pin a long-standing loss: reindexing a
+    # file must NOT drop import edges pointing INTO it from unchanged files
+    check("incremental reindex keeps incoming import edges (reverse deps survive)",
+          db.execute("SELECT COUNT(*) FROM edges e JOIN files s ON s.id=e.src JOIN files d ON d.id=e.dst "
+                     "WHERE s.path LIKE '%OrderPublisherTest.java' AND d.path LIKE '%OrderPublisher.java' "
+                     "AND e.kind='import'").fetchone()[0] == 1)
+    db.close()
+
     # ---- context_pack: one call, focused, budgeted ----
     if rt == "node":
         cp = ws / ".ariadne" / "_cp.mjs"
@@ -712,6 +759,26 @@ await c.close();
           db.execute("SELECT is_test FROM files WHERE path LIKE '%OrderPublisherTest.java'").fetchone()[0] == 1
           and db.execute("SELECT COUNT(*) FROM test_cases WHERE name='shouldPublishOrderCreatedEvent'").fetchone()[0] == 1)
     db.close()
+
+    # ---- parallel extract: pooled and sequential runs build the SAME graph ----
+    # (an explicit --workers engages the pool even on a small fixture; the auto
+    # default only engages at >=100 files, where pool startup pays for itself)
+    ROWTABLES = ("files", "symbols", "calls", "test_cases", "chunk_text", "chunks",
+                 "msg_edges", "msg_topics", "db_defs", "db_access", "http_endpoints", "http_calls")
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    seq_counts = {t: db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ROWTABLES}
+    seq_imports = db.execute("SELECT COUNT(*) FROM edges WHERE kind='import'").fetchone()[0]
+    db.close()
+    code, opw = run(exe + [idx, "--rebuild", "--workers", "2"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    pool_counts = {t: db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ROWTABLES}
+    pool_imports = db.execute("SELECT COUNT(*) FROM edges WHERE kind='import'").fetchone()[0]
+    db.close()
+    check("parallel extract engages with explicit --workers",
+          code == 0 and "Parallel extract: 2 workers" in opw, opw[-300:])
+    check("pooled rebuild produces identical row counts to sequential",
+          pool_counts == seq_counts and pool_imports == seq_imports,
+          str({k: (seq_counts[k], pool_counts[k]) for k in ROWTABLES if seq_counts[k] != pool_counts[k]}))
 
     # ---- corruption auto-recovery ----
     (ws / ".ariadne" / "index.db").write_bytes(b"garbage-not-a-db")
@@ -1462,6 +1529,40 @@ asyncio.run(main())
                 unknown.append(f"{where}: `{tok}`")
     check("every tool referenced by skills/agents exists in the server registry",
           not unknown, "; ".join(sorted(unknown)[:8]))
+
+    # ---- schema v6 migration: a pre-v6 index self-heals on the next index run ----
+    # Downgrade the live DB to the v5 contentful-chunks shape, then require:
+    # a --status open leaves it untouched (search stays alive for read-side
+    # tooling), and the next indexing run migrates + full-rebuilds exactly once.
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    pre_files = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    pre_chunks = db.execute("SELECT COUNT(*) FROM chunk_text").fetchone()[0]
+    db.executescript("""
+        CREATE VIRTUAL TABLE chunks_old USING fts5(path, start_line UNINDEXED, content, tokenize='trigram');
+        INSERT INTO chunks_old(path, start_line, content) SELECT path, start_line, content FROM chunk_text;
+        DROP TRIGGER chunk_text_ai; DROP TRIGGER chunk_text_ad;
+        DROP TABLE chunks; DROP TABLE chunk_text;
+        ALTER TABLE chunks_old RENAME TO chunks;
+        UPDATE meta SET value='5' WHERE key='schema_version';
+    """)
+    db.commit()
+    db.close()
+    code, omg = run(exe + [idx, "--status"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    still_old = "content='chunk_text'" not in (db.execute("SELECT sql FROM sqlite_master WHERE name='chunks'").fetchone()[0] or "")
+    n_old = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    db.close()
+    check("a --status open of a pre-v6 index leaves it untouched (search stays alive)",
+          code == 0 and still_old and n_old == pre_chunks, omg[-200:])
+    code, omg2 = run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("an indexing run migrates v5 chunks to external content and rebuilds",
+          code == 0 and "one-time full rebuild" in omg2
+          and "content='chunk_text'" in (db.execute("SELECT sql FROM sqlite_master WHERE name='chunks'").fetchone()[0] or "")
+          and db.execute("SELECT COUNT(*) FROM chunk_text").fetchone()[0] > 0
+          and db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == pre_files
+          and db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "6", omg2[-300:])
+    db.close()
 
     print()
     if FAILURES:

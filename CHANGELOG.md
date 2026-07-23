@@ -111,6 +111,20 @@ The post-review release. Highlights, roughly in the order they landed:
   parity across editions is suite-pinned for tools, prompts, resources, AND
   annotations; the Python edition gained its first full stdio protocol
   round-trip test in the process.
+- **Engine (schema v6):** the per-file pipeline is split on the single-writer
+  boundary — compute (I/O + hash + parse + extract) runs in a worker pool
+  (`worker_threads` / `ProcessPoolExecutor`; auto-sized, `--workers 1` or
+  `"workers": 1` forces sequential, small batches stay sequential
+  automatically) while all writes stay on one thread in submission order, so
+  parallel and sequential runs build identical graphs (suite-pinned).
+  Config-delta scoping: an edited constant/entity/config key re-extracts only
+  the files that mention a changed key instead of every candidate in the repo
+  (full widen stays as the >50-key / unknown-map fallback). FTS moves to
+  external content: file text lives once in `chunk_text` (roughly halving
+  index.db), `snippet()`/`rank` read through, per-file chunk deletes ride a
+  plain B-tree index, and a pre-v6 index migrates itself with a one-time full
+  rebuild on the next indexing run — while read-side opens (`--status`) leave
+  it untouched.
 
 ## 0.1.0
 

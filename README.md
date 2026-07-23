@@ -295,7 +295,7 @@ Nothing rebuilds from scratch unless you run `--rebuild`. Every file stores a SH
 
 **`aegis.json`**: which graph engine backs the tools. Swap Ariadne for an external MCP graph server and the skills and agents don't care; they're engine-agnostic.
 
-**`.ariadne/config.json`**: `skipDirs`, `aliasPrefixes`, `extraExtensions`, `maxFileBytes`, `tableNameOverrides` (for a custom Hibernate naming strategy, the indexer can't execute your Java), `testPathPatterns` / `prodPathPatterns` (regexes that force files into or out of test classification), plus the context-budget knobs (`maxToolRows`, `maxToolBytes`, `summaryThreshold`, `maxDiagramNodes`, `maxDocItems`).
+**`.ariadne/config.json`**: `skipDirs`, `aliasPrefixes`, `extraExtensions`, `maxFileBytes`, `tableNameOverrides` (for a custom Hibernate naming strategy, the indexer can't execute your Java), `testPathPatterns` / `prodPathPatterns` (regexes that force files into or out of test classification), plus `workers` (parallel extract processes/threads for the cold path; auto by default, `1` forces sequential) and the context-budget knobs (`maxToolRows`, `maxToolBytes`, `summaryThreshold`, `maxDiagramNodes`, `maxDocItems`).
 
 **VS Code**: `aegis.runtime` (`node` | `python`), `aegis.autoRegisterAriadne`.
 

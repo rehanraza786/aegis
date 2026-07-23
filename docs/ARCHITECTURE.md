@@ -20,7 +20,8 @@ engine registry formalizes.
 | `symbols` | name/kind/line/signature/`parent` per file — tree-sitter for the AST six, regex tier otherwise; Lombok accessors synthesized |
 | `calls` | heuristic call graph (src symbol → callee name) |
 | `edges` | file→file import edges (`kind='import'`), plus SCIP `ref` edges after ingest |
-| `chunks` | FTS5 trigram index of file text, 40-line windows |
+| `chunk_text` | file text in 40-line windows — stored ONCE (schema v6) |
+| `chunks` | FTS5 trigram index, external-content over `chunk_text` (kept in sync by triggers; `snippet()`/`rank` read through) |
 | `msg_edges` | messaging seam: `system` (kafka/rabbit/jms/sqs/nats), topic, direction, `resolved`, `via`, `source` |
 | `msg_topics` | topics DECLARED in application config: the seam's source of truth (config key + line) |
 | `db_defs` | schema history: table/op/changeset from Liquibase, Flyway, Prisma, Rails, Alembic |
@@ -46,13 +47,19 @@ a fall-back to full when the stamp is unreachable or the diff is huge):
 
 1. **File pass** — `git ls-files` per root (never the filesystem), hash check
    (size+mtime fast path, then sha1), parse changed files: tree-sitter symbols
-   + calls, imports, FTS chunks, test-case names. Prune deleted files (guarded:
-   an empty listing against a non-empty index refuses rather than wipes).
+   + calls, imports, FTS chunks, test-case names. Compute (I/O + parse +
+   extract) runs in a worker pool on big batches — `worker_threads` (Node) /
+   `ProcessPoolExecutor` (Python) — while ALL writes stay on one thread, in
+   submission order; `--workers 1` forces sequential. Prune deleted files
+   (guarded: an empty listing against a non-empty index refuses rather than
+   wipes).
 2. **Import edges** — per-language import extraction resolved against tracked
    paths (suffix map), cross-module only.
 3. **Correlation pass** (`kafkaPass` — historically named, now all seams):
-   - config fingerprint over `application*` files; any change widens scope to
-     a full re-extract, because one config value can re-resolve every edge
+   - config fingerprint over `application*` files; a change diffs the KEY
+     set (config keys, constants, entity names) and widens only to files that
+     mention a changed key — falling back to a full re-extract when the key
+     set is large or unknown, so correctness never depends on the scoping
    - repo-wide constant + `@Entity` maps from `extract_cache` (recomputed only
      on hash miss; test files never pollute the global maps, but overlay their
      own locals)
