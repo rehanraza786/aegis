@@ -26,6 +26,16 @@ The post-review release. Highlights, roughly in the order they landed:
   multi-repo workspaces), the selected node survives refreshes, capped lists
   read "showing N of M" instead of truncating silently, and submitting an
   assertion auto-ingests it via incremental reindex — no modal, no `--full`.
+  Then the viewing pass: search over every node (`/`, arrows, Enter jumps and
+  focuses), click-to-focus dims everything outside the neighborhood (Esc
+  restores), the HTTP-endpoint layer finally renders (green tags, serves/calls
+  edges, uncalled ones warn-bordered), layouts are deterministic (seeded
+  positions + `randomize:false`) and survive layer toggles AND closing the
+  panel (positions/viewport persist to workspace state), the panel refreshes
+  itself when anything reindexes (debounced watcher; unchanged indexes are
+  never re-exported), edge labels level-of-detail past a zoom threshold, and
+  `f`/`r` keyboard shortcuts. The LOD work also surfaced and fixed a webview
+  renderer crash (class mutation inside the zoom event is now rAF-deferred).
 - **Performance:** FK indexes on every cascade path — a 200-file incremental
   reindex drops ~2.7× on a 1,540-file repo. Then the deep pass: newline-offset
   line math (the per-match prefix re-scan was O(text²) on big files),
