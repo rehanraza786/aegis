@@ -15,10 +15,12 @@ Always prefer the cheapest thing that answers the question. The ladder is
 
 | The question | Reach for |
 | --- | --- |
+| I have a task but no target yet | `plan_context` — one call: files, seams, decisions, tests |
 | Where is X? | `search_code`, `find_symbol` |
 | What's in this file? | `file_outline` (do not read the file) |
 | What calls this? | `find_callers`, then `find_references` to be certain |
 | What breaks if I change this? | the **change-impact-analysis** skill |
+| About to edit these files — what must I check? | `change_check` — blast radius, tests, seam warnings, ADRs |
 | I'm new here / how does this work? | the **codebase-orientation** skill |
 | Follow this request/event end to end | the **flow-tracing** skill |
 | Why isn't X arriving in Y? | the **flow-tracing** skill (debug mode) |

@@ -4,8 +4,9 @@
  * Production traits: read-only DB access, WAL-friendly, input validation,
  * graceful errors surfaced to the model instead of crashes, query limits.
  */
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import Database from "better-sqlite3";
 import { execFileSync, execFile } from "node:child_process";
@@ -89,26 +90,93 @@ const j = (x) => JSON.stringify(x, null, 1);
 const text = (s) => ({ content: [{ type: "text", text: typeof s === "string" ? s : j(s) }] });
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi ?? lo, Number.isFinite(n) ? n : lo));
 
+// ---- MCP tool annotations: free metadata that lets hosts parallelize reads
+// and gate writes. RO/WR mirror the Python edition exactly (suite-pinned).
+// Extension tools are NOT annotated: their read/write behavior is unknown here,
+// and a wrong hint is worse than no hint.
+const RO = { readOnlyHint: true };
+const WR = { readOnlyHint: false, destructiveHint: false };
+const TOOL_ANNOTATIONS = {
+  index_status: RO,
+  search_code: RO,
+  context_pack: RO,
+  find_symbol: RO,
+  file_outline: RO,
+  blast_radius: RO,
+  dependencies: RO,
+  module_map: RO,
+  hotspots: RO,
+  find_callers: RO,
+  find_callees: RO,
+  find_references: RO,
+  goto_definition: RO,
+  explain: RO,
+  decisions: RO,
+  decision_trace: RO,
+  save_decision: WR,
+  save_insight: WR,
+  graph_gaps: RO,
+  assert_edge: WR,
+  message_flow: RO,
+  db_map: RO,
+  http_map: RO,
+  plan_context: RO,
+  change_check: RO,
+  reindex: WR,
+};
+
 // Every tool returns an error message (not a crash) so the agent can adapt.
 function tool(server, name, description, schema, handler) {
-  server.registerTool(name, { description, inputSchema: schema }, async (args) => {
+  const ann = TOOL_ANNOTATIONS[name];
+  server.registerTool(name, { description, inputSchema: schema, ...(ann ? { annotations: ann } : {}) }, async (args) => {
     try { return text(budget(await handler(args))); }
     catch (e) { return text(`Error in ${name}: ${e.message ?? e}`); }
   });
 }
 
+// A prompt is a graph-aware recipe rendered SERVER-SIDE from live queries, so
+// the host gets current facts, not a static template. Errors become messages,
+// never crashes, the same contract as the tools.
+function prompt(server, name, description, argsSchema, handler) {
+  server.registerPrompt(name, { description, ...(argsSchema ? { argsSchema } : {}) }, async (args) => {
+    let out;
+    try { out = await handler(args ?? {}); }
+    catch (e) { out = `Error in ${name}: ${e.message ?? e}`; }
+    return { messages: [{ role: "user", content: { type: "text", text: out } }] };
+  });
+}
+
+// Resources let a host ATTACH graph context instead of spending tool calls.
+// Read errors are returned as text so a broken index degrades, never crashes.
+function resource(server, name, uriOrTemplate, config, handler) {
+  server.registerResource(name, uriOrTemplate, config, async (uri, vars) => {
+    let out, mime = config.mimeType;
+    try {
+      const r = await handler(vars ?? {});
+      out = typeof r === "string" ? r : JSON.stringify(r, null, 1);
+    } catch (e) { out = `Error reading ${name}: ${e.message ?? e}`; mime = "text/plain"; }
+    return { contents: [{ uri: uri.href, mimeType: mime, text: out }] };
+  });
+}
+
 const server = new McpServer({ name: "ariadne", version: "2.0.0" });
 
-tool(server, "index_status",
-  "Check index freshness: file/symbol/edge counts and whether the indexed git SHA matches HEAD. Call first if results seem stale.",
-  {}, () => withDb((d) => {
+// Shared with the ariadne://status resource and the release-check prompt: one
+// implementation of "how fresh is the graph", never three drifting copies.
+function statusData() {
+  return withDb((d) => {
     const c = (sql) => d.prepare(sql).get().c;
     const indexed = d.prepare("SELECT value FROM meta WHERE key='last_sha'").get()?.value ?? null;
     const head = git(["rev-parse", "HEAD"]);
     return { files: c("SELECT COUNT(*) c FROM files"), symbols: c("SELECT COUNT(*) c FROM symbols"),
       edges: c("SELECT COUNT(*) c FROM edges"), indexed_sha: indexed, head_sha: head, fresh: indexed === head,
       payload_version: PAYLOAD_VERSION };
-  }));
+  });
+}
+
+tool(server, "index_status",
+  "Check index freshness: file/symbol/edge counts and whether the indexed git SHA matches HEAD. Call first if results seem stale.",
+  {}, () => statusData());
 
 tool(server, "search_code",
   "Full-text search over all code. Returns matching chunks with path and start line. Use for 'where is X handled/configured/used' questions instead of reading files.",
@@ -130,24 +198,32 @@ tool(server, "search_code",
     return rows.length ? rows : "No matches.";
   }));
 
+// Resolve a target (file path, symbol name, or fragment) to a file row —
+// shared by context_pack and the /aegis-impact prompt.
+function resolveTarget(d, target) {
+  let file = d.prepare("SELECT id, path, lang FROM files WHERE path=?").get(target);
+  let symbol = null;
+  if (!file) {
+    const sym = d.prepare(`SELECT s.name, s.parent, s.kind, s.line, s.signature, f.id fid, f.path
+      FROM symbols s JOIN files f ON f.id=s.file_id
+      WHERE s.name=? OR (s.parent || '.' || s.name)=? ORDER BY (s.kind='class') DESC LIMIT 1`).get(target, target);
+    if (sym) { symbol = sym; file = { id: sym.fid, path: sym.path }; }
+  }
+  if (!file) {
+    const like = d.prepare("SELECT id, path FROM files WHERE path LIKE ? LIMIT 1").get("%" + target + "%");
+    if (like) file = like;
+  }
+  return file ? { file, symbol } : null;
+}
+
 tool(server, "context_pack",
   "ONE call that assembles everything relevant to working on a target (a file path, class, or method): its outline, callers, blast radius, the Kafka topics / DB tables / HTTP endpoints it touches, the architectural decisions governing those, and any cached insight. Use this INSTEAD of six separate lookups when starting work on something, it is the cheapest way to load focused context, and it is budgeted so it cannot flood the window.",
   { target: z.string().min(1).max(300) },
   ({ target }) => withDb((d) => {
     // resolve target -> a file (accept a path, or a symbol name)
-    let file = d.prepare("SELECT id, path, lang FROM files WHERE path=?").get(target);
-    let symbol = null;
-    if (!file) {
-      const sym = d.prepare(`SELECT s.name, s.parent, s.kind, s.line, s.signature, f.id fid, f.path
-        FROM symbols s JOIN files f ON f.id=s.file_id
-        WHERE s.name=? OR (s.parent || '.' || s.name)=? ORDER BY (s.kind='class') DESC LIMIT 1`).get(target, target);
-      if (sym) { symbol = sym; file = { id: sym.fid, path: sym.path }; }
-    }
-    if (!file) {
-      const like = d.prepare("SELECT id, path FROM files WHERE path LIKE ? LIMIT 1").get("%" + target + "%");
-      if (like) file = like;
-    }
-    if (!file) return `Target '${target}' not found. Try find_symbol or search_code first.`;
+    const hit = resolveTarget(d, target);
+    if (!hit) return `Target '${target}' not found. Try find_symbol or search_code first.`;
+    const { file, symbol } = hit;
 
     const cap = (a, n) => (a.length > n ? [...a.slice(0, n), `…and ${a.length - n} more`] : a);
     const mod = file.path.split("/")[0];
@@ -245,33 +321,37 @@ tool(server, "file_outline",
     };
   }));
 
+// Reverse-dependency BFS — shared by the blast_radius tool, the /aegis-impact
+// prompt, and change_check. Returns null when the file is not indexed.
+function blastData(d, p, depth) {
+  const f = d.prepare("SELECT id FROM files WHERE path=?").get(p);
+  if (!f) return null;
+  const hasTest = d.prepare("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'").get().c;
+  let frontier = new Set([f.id]);
+  const seen = new Set([f.id]);
+  const levels = [];
+  const testsAffected = new Set();
+  for (let i = 0; i < depth; i++) {
+    if (!frontier.size) break;
+    const marks = [...frontier].map(() => "?").join(",");
+    const rows = d.prepare(
+      `SELECT DISTINCT e.src, f2.path${hasTest ? ", f2.is_test" : ""} FROM edges e JOIN files f2 ON f2.id=e.src WHERE e.dst IN (${marks})`
+).all(...frontier);
+    frontier = new Set(rows.map((r) => r.src).filter((id) => !seen.has(id)));
+    frontier.forEach((id) => seen.add(id));
+    // tests ride along in the traversal but stay out of the production counts
+    for (const r of rows) if (r.is_test) testsAffected.add(r.path);
+    const prod = rows.filter((r) => !r.is_test);
+    if (prod.length) levels.push([...new Set(prod.map((r) => r.path))].sort());
+  }
+  return { file: p, affected_total: levels.reduce((a, l) => a + l.length, 0), by_depth: levels,
+    ...(hasTest ? { tests_affected: [...testsAffected].sort(), tests_affected_total: testsAffected.size } : {}) };
+}
+
 tool(server, "blast_radius",
   "Everything that transitively depends on a file (reverse dependency BFS). Call BEFORE modifying shared code to know what to re-test.",
   { path: z.string().min(1).max(500), depth: z.number().int().optional() },
-  ({ path: p, depth }) => withDb((d) => {
-    const f = d.prepare("SELECT id FROM files WHERE path=?").get(p);
-    if (!f) return "File not in index.";
-    const hasTest = d.prepare("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'").get().c;
-    let frontier = new Set([f.id]);
-    const seen = new Set([f.id]);
-    const levels = [];
-    const testsAffected = new Set();
-    for (let i = 0; i < clamp(depth ?? 2, 1, 5); i++) {
-      if (!frontier.size) break;
-      const marks = [...frontier].map(() => "?").join(",");
-      const rows = d.prepare(
-        `SELECT DISTINCT e.src, f2.path${hasTest ? ", f2.is_test" : ""} FROM edges e JOIN files f2 ON f2.id=e.src WHERE e.dst IN (${marks})`
-).all(...frontier);
-      frontier = new Set(rows.map((r) => r.src).filter((id) => !seen.has(id)));
-      frontier.forEach((id) => seen.add(id));
-      // tests ride along in the traversal but stay out of the production counts
-      for (const r of rows) if (r.is_test) testsAffected.add(r.path);
-      const prod = rows.filter((r) => !r.is_test);
-      if (prod.length) levels.push([...new Set(prod.map((r) => r.path))].sort());
-    }
-    return { file: p, affected_total: levels.reduce((a, l) => a + l.length, 0), by_depth: levels,
-      ...(hasTest ? { tests_affected: [...testsAffected].sort(), tests_affected_total: testsAffected.size } : {}) };
-  }));
+  ({ path: p, depth }) => withDb((d) => blastData(d, p, clamp(depth ?? 2, 1, 5)) ?? "File not in index."));
 
 tool(server, "dependencies",
   "What a file imports (its direct in-repo dependencies).",
@@ -489,11 +569,9 @@ tool(server, "save_insight",
     } finally { d.close(); }
   });
 
-tool(server, "graph_gaps",
-  "Where static analysis is BLIND, the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, drift tables, and unmatched calls, each with file:line. Use this to find what needs a human or an assistant to work out, then record the answer with assert_edge. This is how the graph gets better instead of staying wrong.",
-  { limit: z.number().int().optional() },
-  ({ limit }) => withDb((d) => {
-    const n = clamp(limit ?? 20, 1, 60);
+// The gap worklist — shared by the graph_gaps tool and the /aegis-resolve-gap
+// and /aegis-release-check prompts (one computation, three consumers).
+function gapsData(d, n) {
     const gaps = {};
     const q = (sql, ...a) => { try { return d.prepare(sql).all(...a); } catch { return []; } };
     // gap math is production-only: a test consumer must not cure a dead topic.
@@ -550,7 +628,12 @@ tool(server, "graph_gaps",
         : "No gaps found, static analysis resolved everything it looked at.",
       ...gaps,
     };
-  }));
+}
+
+tool(server, "graph_gaps",
+  "Where static analysis is BLIND, the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, drift tables, and unmatched calls, each with file:line. Use this to find what needs a human or an assistant to work out, then record the answer with assert_edge. This is how the graph gets better instead of staying wrong.",
+  { limit: z.number().int().optional() },
+  ({ limit }) => withDb((d) => gapsData(d, clamp(limit ?? 20, 1, 60))));
 
 tool(server, "assert_edge",
   "Record a fact you DERIVED by reading code that static analysis could not resolve, a runtime-assembled Kafka topic, a dynamically built SQL table, a gateway-rewritten route. Writes to docs/graph-assertions.json (git-committed and reviewable, exactly like an ADR) and into the graph, tagged with your name so it is never mistaken for a parsed fact. Requires evidence: quote the code that convinced you. Only assert what you can defend.",
@@ -819,6 +902,188 @@ tool(server, "http_map",
     return out;
   }));
 
+// ---- composite decision tools: the session-opening dance, server-side ----
+const STOPWORDS = new Set(["the", "and", "for", "with", "from", "that", "this", "then", "than", "when", "where",
+  "which", "into", "onto", "over", "under", "about", "after", "before", "should", "would", "could", "will",
+  "must", "make", "made", "need", "needs", "want", "wants", "add", "use", "using", "used", "new", "our",
+  "are", "was", "were", "has", "have", "had", "not", "but", "all", "any", "can", "its", "also", "only",
+  "just", "some", "how", "why", "what", "who", "each", "per", "via", "one", "two", "code", "file", "files"]);
+
+// Must match the Python edition token-for-token: same stopwords, same cap.
+function taskTerms(task) {
+  const words = (task.toLowerCase().match(/[a-z0-9_.$-]{3,}/g) ?? []).filter((w) => !STOPWORDS.has(w));
+  const out = [];
+  for (const w of words) if (!out.includes(w)) out.push(w);
+  return out.slice(0, 8);
+}
+
+function fileSeams(d, fid) {
+  return {
+    topics: d.prepare("SELECT DISTINCT topic, direction FROM msg_edges WHERE file_id=?").all(fid),
+    tables: d.prepare("SELECT DISTINCT tbl, mode FROM db_access WHERE file_id=?").all(fid),
+    endpoints: d.prepare("SELECT method, path FROM http_endpoints WHERE file_id=? LIMIT 15").all(fid),
+    calls: d.prepare("SELECT method, path FROM http_calls WHERE file_id=? LIMIT 15").all(fid),
+  };
+}
+
+function governingFor(d, targets) {
+  if (!targets.length) return [];
+  try {
+    const marks = targets.map(() => "?").join(",");
+    return d.prepare(`SELECT DISTINCT dc.id, dc.title FROM decision_links dl JOIN decisions dc ON dc.id=dl.decision_id
+      WHERE dl.target IN (${marks}) AND dc.valid_until IS NULL`).all(...targets);
+  } catch { return []; }
+}
+
+const capList = (a, n = 10) => (a.length > n ? [...a.slice(0, n), `…and ${a.length - n} more`] : a);
+
+tool(server, "plan_context",
+  "When you have a TASK but no target yet: ONE call that finds the starting set server-side — full-text and symbol matches for the task's terms, the files they concentrate in, the Kafka topics / DB tables / HTTP endpoints those files touch, the decisions governing them, and the tests that cover them. Use INSTEAD of the 3-5 exploratory search calls at session start; then context_pack the target you choose.",
+  { task: z.string().min(3).max(500) },
+  ({ task }) => withDb((d) => {
+    const terms = taskTerms(task);
+    if (!terms.length) return "Could not extract search terms from the task; describe it with a few concrete words (component, topic, table, endpoint).";
+    const score = new Map();
+    const why = new Map();
+    const bump = (p, n, w) => { score.set(p, (score.get(p) ?? 0) + n); (why.get(p) ?? why.set(p, new Set()).get(p)).add(w); };
+    try {
+      const ftsQ = terms.map((t) => '"' + t.replaceAll('"', '""') + '"').join(" OR ");
+      d.prepare("SELECT path FROM chunks WHERE chunks MATCH ? ORDER BY rank LIMIT 40").all(ftsQ)
+        .forEach((r, i) => bump(r.path, 40 - i, "text match"));
+    } catch { /* FTS syntax edge: symbols still cover us */ }
+    const symbols = [];
+    for (const t of terms.slice(0, 6)) {
+      for (const s of d.prepare(`SELECT s.name, s.kind, s.parent, f.path, s.line FROM symbols s JOIN files f ON f.id=s.file_id
+        WHERE s.name LIKE ? ORDER BY LENGTH(s.name) LIMIT 4`).all(`%${t}%`)) {
+        symbols.push(`${s.parent ? s.parent + "." : ""}${s.name} (${s.kind}) ${s.path}:${s.line}`);
+        bump(s.path, 25, `symbol ${s.name}`);
+      }
+    }
+    if (!score.size) return `Nothing in the graph matches [${terms.join(", ")}]. Try search_code with different words, or module_map to orient.`;
+    const seeds = [...score.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([p]) => p);
+    const marks = seeds.map(() => "?").join(",");
+    const topics = new Map();
+    const tables = new Map();
+    const defines = new Set();
+    const hcalls = new Set();
+    for (const f of d.prepare(`SELECT id, path FROM files WHERE path IN (${marks})`).all(...seeds)) {
+      const s = fileSeams(d, f.id);
+      for (const t of s.topics) topics.set(`${t.direction} ${t.topic}`, t.topic);
+      for (const t of s.tables) tables.set(`${t.mode} ${t.tbl}`, t.tbl);
+      for (const e of s.endpoints) defines.add(`${e.method} ${e.path}`);
+      for (const c of s.calls) hcalls.add(`${c.method} ${c.path}`);
+    }
+    const mods = [...new Set(seeds.map((p) => p.split("/")[0]))];
+    const govern = governingFor(d, [...new Set([...topics.values(), ...tables.values(), ...mods])]);
+    // tests that import any seed file, and the behaviors they assert
+    let tests = "none found — no test imports these files";
+    try {
+      const tf = d.prepare(`SELECT DISTINCT f2.path FROM edges e JOIN files f2 ON f2.id=e.src JOIN files f ON f.id=e.dst
+        WHERE f.path IN (${marks}) AND f2.is_test=1 LIMIT 6`).all(...seeds).map((r) => r.path);
+      if (tf.length) {
+        const decamel = (s) => s.includes(" ") ? s : s.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/_/g, " ").toLowerCase();
+        tests = { files: tf, behaviors: d.prepare(`SELECT tc.name FROM test_cases tc JOIN files f2 ON f2.id=tc.file_id
+          WHERE f2.path IN (${tf.map(() => "?").join(",")}) LIMIT 6`).all(...tf).map((r) => decamel(r.name)) };
+      }
+    } catch { /* files.is_test / test_cases may predate this index build */ }
+    let insights = [];
+    try {
+      insights = d.prepare(`SELECT target, summary FROM insights WHERE target IN (${mods.map(() => "?").join(",")})`)
+        .all(...mods).map((r) => `${r.target}: ${String(r.summary).slice(0, 150)}`);
+    } catch { /* no insights yet */ }
+    return {
+      task_terms: terms,
+      files_to_read: seeds.map((p) => ({ path: p, matched: [...(why.get(p) ?? [])].slice(0, 4) })),
+      symbols: capList(symbols, 12),
+      kafka: topics.size ? [...topics.keys()] : "none",
+      database: tables.size ? [...tables.keys()] : "none",
+      http: { defines: [...defines], calls: [...hcalls] },
+      governing_decisions: govern.length ? govern.map((g) => `${g.id}: ${g.title}`) : "none recorded",
+      tests,
+      cached_insights: insights.length ? insights : "none",
+      next: "Pick the real target from files_to_read and call context_pack on it. Check the governing decisions before designing. Run change_check(files) before you edit.",
+    };
+  }));
+
+tool(server, "change_check",
+  "PRE-EDIT decision support: given the files you intend to touch, ONE call returning their combined blast radius, the tests to re-run, the seam warnings your edit could introduce (sole producers/consumers, drift tables, uncalled endpoints, unresolved expressions), the decisions governing them, and the assertions your edit will mark STALE. Call BEFORE proposing a diff.",
+  { files: z.array(z.string().min(1).max(500)).min(1).max(20) },
+  ({ files }) => withDb((d) => {
+    const known = [];
+    const unknown = [];
+    for (const p of files) {
+      const f = d.prepare("SELECT id, path FROM files WHERE path=?").get(p);
+      if (f) known.push(f); else unknown.push(p);
+    }
+    if (!known.length) return `None of the ${files.length} file(s) are in the index. Paths are repo-prefixed in a multi-repo workspace (module_map shows the roots).`;
+    const hasTest = d.prepare("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'").get().c;
+    const kids = known.map((f) => f.id);
+    const idMarks = kids.map(() => "?").join(",");
+    const affected = new Set();
+    const testsAffected = new Set();
+    const perFile = [];
+    for (const f of known) {
+      const b = blastData(d, f.path, 2);
+      for (const l of b.by_depth) for (const p of l) affected.add(p);
+      for (const t of b.tests_affected ?? []) testsAffected.add(t);
+      const seams = fileSeams(d, f.id);
+      perFile.push({
+        path: f.path,
+        direct_dependents: d.prepare("SELECT COUNT(*) c FROM edges WHERE dst=?").get(f.id).c,
+        ...(seams.topics.length ? { kafka: seams.topics.map((t) => `${t.direction} ${t.topic}`) } : {}),
+        ...(seams.tables.length ? { database: seams.tables.map((t) => `${t.mode} ${t.tbl}`) } : {}),
+        ...(seams.endpoints.length ? { defines_endpoints: seams.endpoints.map((e) => `${e.method} ${e.path}`) } : {}),
+      });
+    }
+    for (const f of known) affected.delete(f.path);
+    const warn = {};
+    const unresolved = d.prepare(`SELECT m.topic expression, f.path, m.line FROM msg_edges m JOIN files f ON f.id=m.file_id
+      WHERE m.resolved=0 AND m.file_id IN (${idMarks})`).all(...kids);
+    if (unresolved.length) warn.unresolved_expressions_in_these_files = unresolved.map((r) => `${r.expression} @ ${r.path}:${r.line}`);
+    // topics where a listed file is the ONLY production-side producer or consumer
+    const prodJoin = hasTest ? " AND fx.is_test=0" : "";
+    const sole = [];
+    for (const { topic } of d.prepare(`SELECT DISTINCT topic FROM msg_edges WHERE file_id IN (${idMarks})`).all(...kids)) {
+      for (const dir of ["produce", "consume"]) {
+        const sites = d.prepare(`SELECT DISTINCT m.file_id fid FROM msg_edges m JOIN files fx ON fx.id=m.file_id
+          WHERE m.topic=? AND m.direction=?${prodJoin}`).all(topic, dir).map((r) => r.fid);
+        if (sites.length && sites.every((id) => kids.includes(id))) {
+          sole.push(`${dir === "produce" ? "sole producer" : "sole consumer"} of ${topic} — a breaking change here orphans the topic`);
+        }
+      }
+    }
+    if (sole.length) warn.sole_seam_side = sole;
+    const drift = d.prepare(`SELECT DISTINCT a.tbl FROM db_access a WHERE a.file_id IN (${idMarks})
+      AND a.tbl NOT IN (SELECT tbl FROM db_defs)`).all(...kids).map((r) => r.tbl);
+    if (drift.length) warn.drift_tables_touched = drift.map((t) => `${t} — accessed here but no changeset defines it; fix the changelog with this change, or explain why not`);
+    const eps = d.prepare(`SELECT e.method, e.path, e.norm FROM http_endpoints e WHERE e.file_id IN (${idMarks})`).all(...kids);
+    if (eps.length) {
+      const calls = d.prepare(`SELECT c.method, c.norm FROM http_calls c${hasTest ? " JOIN files fx ON fx.id=c.file_id WHERE fx.is_test=0" : ""}`).all();
+      const un = eps.filter((e) => !calls.some((c) => c.method === e.method && pathsMatch(c.norm, e.norm)));
+      if (un.length) warn.endpoints_defined_here_with_no_caller = un.map((e) => `${e.method} ${e.path}`);
+    }
+    const mods = [...new Set(known.map((f) => f.path.split("/")[0]))];
+    const topicsAll = d.prepare(`SELECT DISTINCT topic FROM msg_edges WHERE file_id IN (${idMarks})`).all(...kids).map((r) => r.topic);
+    const tablesAll = d.prepare(`SELECT DISTINCT tbl FROM db_access WHERE file_id IN (${idMarks})`).all(...kids).map((r) => r.tbl);
+    const govern = governingFor(d, [...new Set([...topicsAll, ...tablesAll, ...mods])]);
+    let atRisk = [];
+    try {
+      atRisk = d.prepare(`SELECT kind, file_path, line, author FROM assertions WHERE kind!='dismissal'
+        AND file_path IN (${known.map(() => "?").join(",")})`).all(...known.map((f) => f.path))
+        .map((r) => `${r.kind} @ ${r.file_path}:${r.line} (by ${r.author})`);
+    } catch { /* assertions table may predate this build */ }
+    return {
+      files: { checked: known.map((f) => f.path), ...(unknown.length ? { not_in_index: unknown } : {}) },
+      blast_radius: { affected_total: affected.size, sample: capList([...affected].sort(), 12) },
+      tests_to_rerun: { total: testsAffected.size, files: capList([...testsAffected].sort(), 12) },
+      per_file: perFile,
+      ...(Object.keys(warn).length ? { seam_warnings: warn } : {}),
+      governing_decisions: govern.length ? govern.map((g) => `${g.id}: ${g.title} — check with decision_trace before deviating`) : "none recorded",
+      ...(atRisk.length ? { assertions_marked_stale_by_this_edit: atRisk } : {}),
+      next: "Re-run the tests listed after your edit. If a seam warning names a topic/table/endpoint, look at its other side first (message_flow/db_map/http_map).",
+    };
+  }));
+
 tool(server, "reindex",
   "Rebuild the index. mode='incremental' (changed files since last indexed commit) or 'full'. Use when index_status reports fresh=false.",
   { mode: z.enum(["incremental", "full"]).optional() },
@@ -827,6 +1092,7 @@ tool(server, "reindex",
       { cwd: REPO_ROOT, timeout: 600_000 },
       (err, stdout, stderr) => {
         try { _db?.close(); } catch {} _db = null; // pick up the fresh DB
+        notifyIndexMoved(); // subscribed resource readers refetch instead of going stale
         resolve((stdout + stderr).trim() || (err ? `reindex failed: ${err.message}` : "done"));
       });
   }));
@@ -843,6 +1109,301 @@ tool(server, "reindex",
     }
   }
 }
+
+// ---- MCP prompts: the four graph-aware recipes, rendered server-side ----
+// Hosts that support MCP prompts surface these as slash commands. Every line
+// of the rendered text comes from live queries, so the recipe carries current
+// facts (blast radius, seams, decisions), not a static template. The registry
+// must stay identical to the Python edition (suite-pinned).
+
+function dismissalsMap(d) {
+  const map = new Map();
+  try {
+    for (const r of d.prepare("SELECT payload FROM assertions WHERE kind='dismissal'").all()) {
+      try { const x = JSON.parse(r.payload); map.set(`${x.gap}|${x.key}`, { by: x.author, reason: x.reason }); } catch { /* legacy row */ }
+    }
+  } catch { /* assertions table may predate this build */ }
+  return map;
+}
+
+function staleAssertions(d) {
+  try {
+    return d.prepare(`SELECT a.kind, a.file_path, a.line, a.author FROM assertions a JOIN files f ON f.path=a.file_path
+      WHERE a.kind!='dismissal' AND a.source_hash IS NOT NULL AND a.source_hash != f.hash`).all();
+  } catch { return []; }
+}
+
+prompt(server, "aegis-impact",
+  "What am I about to break? Blast radius, tests to re-run, seams touched, and governing decisions for a target (file path, class, or method) — rendered from the live graph.",
+  { target: z.string().min(1).max(300) },
+  ({ target }) => withDb((d) => {
+    const hit = resolveTarget(d, target);
+    if (!hit) return `Target '${target}' not found in the index. Try find_symbol or search_code first, then re-run aegis-impact with the file path.`;
+    const p = hit.file.path;
+    const blast = blastData(d, p, 2);
+    const seams = fileSeams(d, hit.file.id);
+    const govern = governingFor(d, [...new Set([...seams.topics.map((t) => t.topic), ...seams.tables.map((t) => t.tbl), p.split("/")[0]])]);
+    let anchored = 0;
+    try { anchored = d.prepare("SELECT COUNT(*) c FROM assertions WHERE kind!='dismissal' AND file_path=?").get(p).c; } catch { /* pre-assertions build */ }
+    const lines = [
+      `You are about to change ${target}${p === target ? "" : ` (${p})`}. Impact, from the live graph:`,
+      "",
+      `Blast radius (depth 2): ${blast.affected_total} production file(s) depend on it.`,
+      ...capList(blast.by_depth.flat(), 10).map((x) => `  - ${x}`),
+      `Tests to re-run (${blast.tests_affected_total ?? 0}):`,
+      ...((blast.tests_affected ?? []).length
+        ? capList(blast.tests_affected, 10).map((x) => `  - ${x}`)
+        : ["  - none recorded — treat the change as untested and say so in the PR"]),
+      `Seams touched: kafka [${seams.topics.map((t) => `${t.direction} ${t.topic}`).join(", ") || "none"}]; tables [${seams.tables.map((t) => `${t.mode} ${t.tbl}`).join(", ") || "none"}]; http [${[...seams.endpoints, ...seams.calls].map((e) => `${e.method} ${e.path}`).join(", ") || "none"}].`,
+      `Governing decisions: ${govern.length ? govern.map((g) => `${g.id}: ${g.title}`).join("; ") : "none recorded"}.`,
+      ...(anchored ? [`Assertions anchored to this file: ${anchored} — your edit marks them STALE; re-affirm or retract them afterwards.`] : []),
+      "",
+      "Before writing code: (1) check the governing decisions above (decision_trace <id>) and do not silently contradict them; (2) look at the other side of every seam listed (message_flow topic:<t> / db_map table:<t> / http_map path:<p>); (3) when you know the full edit set, run change_check(files) and re-run the tests it lists.",
+    ];
+    return lines.join("\n");
+  }));
+
+prompt(server, "aegis-orient",
+  "First encounter with a module: files, the most-depended-on entry points, the seams it participates in, governing decisions, and cached insight — the reading plan before any code is read.",
+  { module: z.string().min(1).max(200) },
+  ({ module }) => withDb((d) => {
+    const rows = d.prepare("SELECT id, path, lang FROM files WHERE path LIKE ?").all(module + "/%");
+    if (!rows.length) return `No files under module '${module}'. module_map lists the modules in this workspace.`;
+    const langs = {};
+    for (const r of rows) langs[r.lang] = (langs[r.lang] ?? 0) + 1;
+    const hot = d.prepare(`SELECT f.path, COUNT(e.src) n FROM files f JOIN edges e ON e.dst=f.id
+      WHERE f.path LIKE ? GROUP BY f.id ORDER BY n DESC LIMIT 5`).all(module + "/%");
+    const topics = d.prepare(`SELECT DISTINCT m.direction || ' ' || m.topic s FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?`).all(module + "/%").map((r) => r.s);
+    const tables = d.prepare(`SELECT DISTINCT a.mode || ' ' || a.tbl s FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?`).all(module + "/%").map((r) => r.s);
+    const eps = d.prepare(`SELECT DISTINCT e.method || ' ' || e.path s FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ?`).all(module + "/%").map((r) => r.s);
+    const govern = governingFor(d, [...new Set([...topics.map((s) => s.split(" ").pop()), ...tables.map((s) => s.split(" ").pop()), module])]);
+    let insight = null;
+    try { insight = d.prepare("SELECT summary FROM insights WHERE target=?").get(module)?.summary ?? null; } catch { /* none yet */ }
+    let nTests = 0;
+    try { nTests = d.prepare("SELECT COUNT(*) c FROM files WHERE path LIKE ? AND is_test=1").get(module + "/%").c; } catch { /* pre-is_test build */ }
+    const lines = [
+      `Orientation for module ${module}: ${rows.length} files (${Object.keys(langs).sort((a, b) => langs[b] - langs[a]).slice(0, 3).join(", ")}), ${nTests} of them tests.`,
+      "",
+      "Most-depended-on files (start reading here):",
+      ...(hot.length ? hot.map((h) => `  - ${h.path} (${h.n} dependents)`) : ["  - no in-module dependency edges recorded"]),
+      `Seams: kafka [${capList(topics, 8).join(", ") || "none"}]; tables [${capList(tables, 8).join(", ") || "none"}]; http [${capList(eps, 8).join(", ") || "none"}].`,
+      `Governing decisions: ${govern.length ? govern.map((g) => `${g.id}: ${g.title}`).join("; ") : "none recorded"}.`,
+      `Cached insight: ${insight ?? "none — after you understand the module, save_insight so the next agent starts warm"}.`,
+      "",
+      `Suggested next calls: context_pack '${hot[0]?.path ?? module}' for the core file; message_flow topic:<name> for the messaging side; decisions target:${module} for the history. Do not read files the outline already answers for.`,
+    ];
+    return lines.join("\n");
+  }));
+
+prompt(server, "aegis-resolve-gap",
+  "Work the graph's to-do list: the top unresolved gap (dynamic topic, drift table, orphan seam), the investigation protocol, and the assert_edge contract for recording what you find.",
+  null,
+  () => withDb((d) => {
+    const gaps = gapsData(d, 20);
+    const dism = dismissalsMap(d);
+    const CATS = [
+      ["unresolved_topic_expressions", (g) => `${g.expression} at ${g.path}:${g.line}`, (g) => `unresolved|${g.path}:${g.line}`,
+        "a runtime-assembled topic: kind 'kafka', plus topic and direction once you have read how the value is built"],
+      ["tables_accessed_but_undefined", (g) => `table ${g.table_name} at ${g.path}:${g.line}`, (g) => `drift_table|${g.table_name}`,
+        "schema drift: kind 'db' with the real table, or a changeset fix in the code itself"],
+      ["topics_consumed_but_never_produced", (g) => `topic ${g.topic}`, (g) => `orphan_topic|${g.topic}`,
+        "a missing producer: kind 'kafka', direction 'produce', anchored at the site you find"],
+      ["topics_produced_but_never_consumed", (g) => `topic ${g.topic}`, (g) => `orphan_topic|${g.topic}`,
+        "a missing consumer: kind 'kafka', direction 'consume', anchored at the site you find"],
+      ["endpoints_with_no_caller", (g) => `endpoint ${g.endpoint}`, () => null,
+        "an external or gateway-rewritten caller: kind 'http_call' with the normalized path"],
+      ["topics_declared_in_config_but_unused", (g) => `topic ${g.topic} (declared by ${g.config_key})`, (g) => `declared_unused|${g.topic}`,
+        "config drift: either wire the topic up, remove the key, or dismiss with a reason"],
+    ];
+    let top = null;
+    const remaining = [];
+    for (const [cat, fmt, key, hint] of CATS) {
+      const live = (gaps[cat] ?? []).filter((g) => { const k = key(g); return !(k && dism.has(k)); });
+      if (live.length) {
+        if (!top) top = { cat, item: live[0], fmt, hint, rest: live.length - 1 };
+        else remaining.push(`${cat}: ${live.length}`);
+        if (top && top.cat === cat && live.length > 1) remaining.unshift(`${cat}: ${live.length - 1} more`);
+      }
+    }
+    if (!top) return "No open gaps — static analysis resolved everything it looked at, and the rest is dismissed with reasons. Nothing to do.";
+    const why = top.item.why ? ` Why the graph is blind here: ${top.item.why}.` : "";
+    return [
+      `The graph needs a human (or you) here. Top gap (${top.cat}): ${top.fmt(top.item)}.${why}`,
+      "",
+      "Protocol:",
+      "1. Read the code at the location (file_outline first; read the file only if the outline is not enough).",
+      "2. Trace how the value is built: find_callers on the enclosing method, search_code on the string fragments.",
+      `3. If you can determine the real seam, record it with assert_edge — for this gap that means ${top.hint}. Evidence must QUOTE the code that convinced you (>= 20 chars) and carry a confidence (high|medium|low).`,
+      "4. If the gap is intended (external consumer, fire-and-forget, decommissioned), dismiss it with a reason via the annotate CLI or the graph view instead of asserting.",
+      "NEVER assert from naming alone — an assertion is a fact you derived from code you read, or it does not enter the graph.",
+      "",
+      remaining.length ? `Remaining after this one: ${remaining.join("; ")}. Re-run aegis-resolve-gap for the next.` : "This is the last open gap.",
+    ].join("\n");
+  }));
+
+prompt(server, "aegis-release-check",
+  "Pre-release review from the live graph: schema drift, orphan seams, uncalled endpoints, unresolved expressions, and stale assertions — each with the tool that investigates it.",
+  null,
+  () => withDb((d) => {
+    const st = statusData();
+    const gaps = gapsData(d, 60);
+    const dism = dismissalsMap(d);
+    let dismissed = 0;
+    const live = (arr, key) => {
+      const out = [];
+      for (const g of arr ?? []) { if (key(g) && dism.has(key(g))) dismissed++; else out.push(g); }
+      return out;
+    };
+    const drift = live(gaps.tables_accessed_but_undefined, (g) => `drift_table|${g.table_name}`).map((g) => g.table_name);
+    const orphanP = live(gaps.topics_produced_but_never_consumed, (g) => `orphan_topic|${g.topic}`).map((g) => g.topic);
+    const orphanC = live(gaps.topics_consumed_but_never_produced, (g) => `orphan_topic|${g.topic}`).map((g) => g.topic);
+    const uncalled = (gaps.endpoints_with_no_caller ?? []).map((g) => g.endpoint);
+    const unresolved = live(gaps.unresolved_topic_expressions, (g) => `unresolved|${g.path}:${g.line}`);
+    const declared = live(gaps.topics_declared_in_config_but_unused, (g) => `declared_unused|${g.topic}`).map((g) => g.topic);
+    const stale = staleAssertions(d);
+    const n = drift.length + orphanP.length + orphanC.length + uncalled.length + unresolved.length + declared.length + stale.length;
+    const lines = [
+      `Pre-release review, from the live graph (index fresh: ${st.fresh}${st.fresh ? "" : " — reindex before trusting this"}):`,
+      "",
+      `1. Schema drift — code touching tables no changeset defines (${drift.length}): ${capList(drift, 10).join(", ") || "none"}. -> db_map table:<name>`,
+      `2. Orphan topics — produced but never consumed (${orphanP.length}): ${capList(orphanP, 10).join(", ") || "none"}; consumed but never produced (${orphanC.length}): ${capList(orphanC, 10).join(", ") || "none"}. -> message_flow topic:<name>`,
+      `3. Endpoints nobody calls (${uncalled.length}): ${capList(uncalled, 10).join(", ") || "none"}. -> http_map path:<fragment>`,
+      `4. Unresolved dynamic expressions (${unresolved.length}): ${capList(unresolved.map((g) => `${g.path}:${g.line}`), 6).join(", ") || "none"}. -> aegis-resolve-gap works through them one at a time`,
+      `5. Stale assertions — evidence files changed since they were asserted (${stale.length}): ${capList(stale.map((s) => `${s.kind} @ ${s.file_path}:${s.line} (by ${s.author})`), 8).join(", ") || "none"}. -> re-affirm or retract (graph view, or the annotate CLI)`,
+      `6. Topics declared in config but unused (${declared.length}): ${capList(declared, 10).join(", ") || "none"}.`,
+      ...(dismissed ? [`(${dismissed} previously triaged item(s) excluded — dismissed with reasons in docs/graph-assertions.json.)`] : []),
+      "",
+      n ? "Ship bar: every line above should be empty, fixed, or dismissed-with-a-reason. A drift table or orphan seam nobody can explain is a release blocker — investigate with the tool named on its line."
+        : "All clear: no drift, no orphan seams, no uncalled endpoints, no unresolved expressions, no stale assertions.",
+    ];
+    return lines.join("\n");
+  }));
+
+// ---- MCP resources: ariadne:// context a host can ATTACH without tool calls ----
+// URIs are the cross-edition contract (suite-pinned): graph, status, context,
+// decisions (+ per-id template), assertions. Subscribed clients get
+// notifications/resources/updated when the index moves (see the watcher below).
+
+let _exportCache = { key: null, json: null };
+function currentRun() {
+  try { return withDb((d) => d.prepare("SELECT value FROM meta WHERE key='last_run'").get()?.value ?? null); }
+  catch { return null; }
+}
+async function exportJson() {
+  const key = currentRun();
+  if (key && _exportCache.key === key && _exportCache.json) return _exportCache.json;
+  const json = await new Promise((resolve, reject) => {
+    execFile(process.execPath, [path.join(GR_DIR, "graph_export.mjs")],
+      { cwd: REPO_ROOT, timeout: 120_000, maxBuffer: 64 * 1024 * 1024 },
+      (err, stdout) => (err ? reject(new Error(String(err.message ?? err))) : resolve(stdout.trim())));
+  });
+  _exportCache = { key, json };
+  return json;
+}
+
+resource(server, "graph", "ariadne://graph",
+  { description: "The full graph-export JSON snapshot (modules, topics, tables, endpoints, gaps, annotations) — the same contract the graph view renders. Cached until the index moves.", mimeType: "application/json" },
+  () => exportJson());
+
+resource(server, "status", "ariadne://status",
+  { description: "Index freshness: counts, indexed SHA vs HEAD, payload version. The resource twin of the index_status tool.", mimeType: "application/json" },
+  () => statusData());
+
+resource(server, "context", "ariadne://context",
+  { description: "The graph-derived orientation pack for agents (docs/generated/agent-context.md): module map, seams, standing rules derived from what the graph actually contains.", mimeType: "text/markdown" },
+  () => {
+    const p = path.join(REPO_ROOT, "docs", "generated", "agent-context.md");
+    if (!fs.existsSync(p)) return "No agent-context.md yet. Generate it with: node .ariadne/docgen.mjs (the post-commit hook keeps it current once installed).";
+    return fs.readFileSync(p, "utf8");
+  });
+
+resource(server, "decisions", "ariadne://decisions",
+  { description: "The decision ledger: every ADR with status and temporal validity. Read one in full at ariadne://decisions/<id>.", mimeType: "application/json" },
+  () => withDb((d) => ({
+    decisions: d.prepare("SELECT id, title, status, decided_at, valid_until, superseded_by FROM decisions ORDER BY decided_at DESC").all()
+      .map((r) => ({ id: r.id, title: r.title, status: r.status, decided: r.decided_at,
+        ...(r.valid_until ? { valid_until: r.valid_until, superseded_by: r.superseded_by } : {}) })),
+    note: "Read one ADR in full at ariadne://decisions/<id>.",
+  })));
+
+resource(server, "decision", new ResourceTemplate("ariadne://decisions/{id}", { list: undefined }),
+  { description: "One architectural decision record, as markdown: the git-versioned source file when present, else the indexed summary with its supersession chain.", mimeType: "text/markdown" },
+  ({ id }) => withDb((d) => {
+    const rec = d.prepare("SELECT * FROM decisions WHERE id=?").get(String(id).toUpperCase());
+    if (!rec) return `No decision '${id}'. ariadne://decisions lists what exists.`;
+    if (rec.source_path) {
+      const p = path.join(REPO_ROOT, rec.source_path);
+      if (fs.existsSync(p)) return fs.readFileSync(p, "utf8");
+    }
+    const links = d.prepare("SELECT kind, target FROM decision_links WHERE decision_id=?").all(rec.id);
+    return `# ${rec.id}: ${rec.title}\n\nStatus: ${rec.status}\nDate: ${rec.decided_at ?? "?"}\n` +
+      (rec.valid_until ? `Valid until: ${rec.valid_until} (superseded by ${rec.superseded_by})\n` : "") +
+      (links.length ? `Governs: ${links.map((l) => `${l.kind}:${l.target}`).join(", ")}\n` : "") +
+      `\n${rec.summary ?? ""}\n`;
+  }));
+
+resource(server, "assertions", "ariadne://assertions",
+  { description: "The human knowledge layer: docs/graph-assertions.json with a computed stale flag per assertion (evidence file changed since it was recorded).", mimeType: "application/json" },
+  () => {
+    const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
+    if (!fs.existsSync(af)) return { assertions: [], note: "No graph-assertions.json yet — assert_edge (or the graph view) creates it." };
+    let list;
+    try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
+    catch (e) { return `docs/graph-assertions.json exists but is not valid JSON (${e.message}). Fix it by hand; nothing here will overwrite it.`; }
+    if (!Array.isArray(list)) return "docs/graph-assertions.json is not a JSON array. Fix it by hand; nothing here will overwrite it.";
+    try {
+      withDb((d) => {
+        const h = d.prepare("SELECT hash FROM files WHERE path=?");
+        for (const a of list) {
+          if (a && a.kind !== "dismissal" && a.source_hash && a.file) {
+            const cur = h.get(a.file)?.hash;
+            if (cur && cur !== a.source_hash) a.stale = true;
+          }
+        }
+      });
+    } catch { /* no index yet: serve the raw ledger */ }
+    return { assertions: list, note: "stale=true means the evidence file changed since the assertion was recorded — re-affirm or retract it." };
+  });
+
+// ---- updated-notifications: the agent-side twin of the graph view's watcher.
+// Hooks and agents reindex outside this process, so subscribed clients poll
+// nothing: while subscriptions exist, meta.last_run is checked every 2s (a
+// microsecond read) and a move fans out notifications/resources/updated per
+// subscribed URI plus one resources/list_changed (the decision list may have
+// grown). The reindex tool short-circuits the wait by notifying on completion.
+const subscriptions = new Set();
+let watchTimer = null;
+let lastNotifiedRun = null;
+
+function notifyIndexMoved() {
+  try {
+    for (const uri of subscriptions) server.server.sendResourceUpdated({ uri });
+    server.server.sendResourceListChanged();
+  } catch { /* not connected yet */ }
+  lastNotifiedRun = currentRun();
+}
+
+function checkIndexMoved() {
+  const run = currentRun();
+  if (run && lastNotifiedRun && run !== lastNotifiedRun) notifyIndexMoved();
+  else if (run && !lastNotifiedRun) lastNotifiedRun = run;
+}
+
+server.server.registerCapabilities({ resources: { subscribe: true, listChanged: true } });
+server.server.setRequestHandler(SubscribeRequestSchema, async (req) => {
+  subscriptions.add(req.params.uri);
+  if (!watchTimer) {
+    lastNotifiedRun = currentRun();
+    watchTimer = setInterval(checkIndexMoved, 2000);
+    watchTimer.unref(); // never keep the process alive for the watcher
+  }
+  return {};
+});
+server.server.setRequestHandler(UnsubscribeRequestSchema, async (req) => {
+  subscriptions.delete(req.params.uri);
+  if (!subscriptions.size && watchTimer) { clearInterval(watchTimer); watchTimer = null; }
+  return {};
+});
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

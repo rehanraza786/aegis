@@ -11,6 +11,7 @@ Run (stdio): python3 server.py
 Requires: pip install "mcp[cli]"
 """
 
+import asyncio
 import functools
 import inspect
 import json
@@ -25,6 +26,9 @@ import time
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.lowlevel import NotificationOptions
+from mcp.types import ToolAnnotations
+from pydantic import AnyUrl
 
 REPO_ROOT = Path(
     subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
@@ -33,6 +37,13 @@ REPO_ROOT = Path(
 DB_PATH = Path(os.environ.get("ARIADNE_HOME", REPO_ROOT)) / ".ariadne" / "index.db"
 
 mcp = FastMCP("ariadne")
+
+# ---- MCP tool annotations: free metadata that lets hosts parallelize reads
+# and gate writes. RO/WR mirror the Node edition exactly (suite-pinned).
+# Extension tools are NOT annotated: their read/write behavior is unknown here,
+# and a wrong hint is worse than no hint.
+RO = ToolAnnotations(readOnlyHint=True)
+WR = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
 
 # ---- result budget: no single tool call may flood the model's context ----
 try:
@@ -179,9 +190,9 @@ def _payload_version():
         return "unknown"
 
 
-@mcp.tool()
-def index_status() -> str:
-    """Check index freshness: file/symbol/edge counts and the git SHA the index was built at. Call this first if results seem stale."""
+def _status_data():
+    """Shared with the ariadne://status resource and the release-check prompt:
+    one implementation of "how fresh is the graph", never three drifting copies."""
     con = db()
     f = con.execute("SELECT COUNT(*) c FROM files").fetchone()["c"]
     s = con.execute("SELECT COUNT(*) c FROM symbols").fetchone()["c"]
@@ -194,7 +205,13 @@ def index_status() -> str:
             "fresh": indexed == head, "payload_version": _payload_version()}
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
+def index_status() -> str:
+    """Check index freshness: file/symbol/edge counts and the git SHA the index was built at. Call this first if results seem stale."""
+    return _status_data()
+
+
+@mcp.tool(annotations=RO)
 def search_code(query: str, limit: int = 8) -> str:
     """Full-text search over all code. Returns matching chunks with path and start line. Use for 'where is X handled/configured/used' questions instead of reading files."""
     con = db()
@@ -216,10 +233,9 @@ def search_code(query: str, limit: int = 8) -> str:
     return out if out else "No matches."
 
 
-@mcp.tool()
-def context_pack(target: str) -> str:
-    """ONE call that assembles everything relevant to working on a target (file path, class, or method): outline, callers, blast radius, the Kafka topics / DB tables / HTTP endpoints it touches, the decisions governing those, and any cached insight. Use INSTEAD of six separate lookups when starting work."""
-    con = db()
+def _resolve_target(con, target):
+    """Resolve a target (file path, symbol name, or fragment) to a file row —
+    shared by context_pack and the /aegis-impact prompt."""
     file = con.execute("SELECT id, path FROM files WHERE path=?", (target,)).fetchone()
     symbol = None
     if not file:
@@ -232,8 +248,17 @@ def context_pack(target: str) -> str:
             file = {"id": sym["fid"], "path": sym["path"]}
     if not file:
         file = con.execute("SELECT id, path FROM files WHERE path LIKE ? LIMIT 1", (f"%{target}%",)).fetchone()
-    if not file:
+    return (file, symbol) if file else None
+
+
+@mcp.tool(annotations=RO)
+def context_pack(target: str) -> str:
+    """ONE call that assembles everything relevant to working on a target (file path, class, or method): outline, callers, blast radius, the Kafka topics / DB tables / HTTP endpoints it touches, the decisions governing those, and any cached insight. Use INSTEAD of six separate lookups when starting work."""
+    con = db()
+    hit = _resolve_target(con, target)
+    if not hit:
         return f"Target '{target}' not found. Try find_symbol or search_code first."
+    file, symbol = hit
 
     fid, fpath = file["id"], file["path"]
     mod = fpath.split("/")[0]
@@ -311,7 +336,7 @@ def context_pack(target: str) -> str:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def find_symbol(name: str, exact: bool = False) -> str:
     """Look up functions/classes/types by name (substring by default). Returns kind, signature, file, and line, enough to reference or jump to it without reading the file."""
     con = db()
@@ -324,7 +349,7 @@ def find_symbol(name: str, exact: bool = False) -> str:
     return fmt(rows) if rows else "No symbol found."
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def file_outline(path: str) -> str:
     """Get a file's skeleton: language, line count, all symbols with signatures, plus its imports and importers. Use INSTEAD of reading the file when you only need its structure."""
     con = db()
@@ -343,17 +368,16 @@ def file_outline(path: str) -> str:
             "imported_by": [d["path"] for d in dependents]}
 
 
-@mcp.tool()
-def blast_radius(path: str, depth: int = 2) -> str:
-    """Find everything that transitively depends on a file (reverse dependency BFS up to `depth`). Call BEFORE modifying shared code to know what to re-test."""
-    con = db()
+def _blast_data(con, path, depth):
+    """Reverse-dependency BFS — shared by the blast_radius tool, the
+    /aegis-impact prompt, and change_check. None when the file is not indexed."""
     f = con.execute("SELECT id FROM files WHERE path=?", (path,)).fetchone()
     if not f:
-        return "File not in index."
+        return None
     has_test = con.execute("SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='is_test'").fetchone()[0]
     frontier, seen, levels = {f["id"]}, {f["id"]}, []
     tests_affected = set()
-    for _ in range(max(1, min(depth, 5))):
+    for _ in range(depth):
         if not frontier:
             break
         marks = ",".join("?" * len(frontier))
@@ -377,7 +401,14 @@ def blast_radius(path: str, depth: int = 2) -> str:
     return out
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
+def blast_radius(path: str, depth: int = 2) -> str:
+    """Find everything that transitively depends on a file (reverse dependency BFS up to `depth`). Call BEFORE modifying shared code to know what to re-test."""
+    con = db()
+    return _blast_data(con, path, max(1, min(depth, 5))) or "File not in index."
+
+
+@mcp.tool(annotations=RO)
 def dependencies(path: str) -> str:
     """List what a file imports (its direct dependencies in this repo)."""
     con = db()
@@ -387,7 +418,7 @@ def dependencies(path: str) -> str:
     return [r["path"] for r in rows] if rows else "No in-repo dependencies found."
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def module_map(prefix: str = "") -> str:
     """Directory-level overview: for each top-level directory (or under `prefix`), file count, main languages, and symbol count. Use as the first call to orient in an unfamiliar repo."""
     con = db()
@@ -405,7 +436,7 @@ def module_map(prefix: str = "") -> str:
             for k, v in sorted(agg.items())]
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def hotspots(limit: int = 10) -> str:
     """The most-depended-on files in the repo (highest in-degree). These are the highest-risk files to change and the best places to start understanding the architecture."""
     con = db()
@@ -415,7 +446,7 @@ def hotspots(limit: int = 10) -> str:
     return fmt(rows)
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def find_callers(name: str, limit: int = 40) -> str:
     """AST-based: who calls this function/method? Heuristic (matched by name); for compiler-resolved precision use find_references (SCIP)."""
     con = db()
@@ -426,7 +457,7 @@ def find_callers(name: str, limit: int = 40) -> str:
     return fmt(rows) if rows else "No callers recorded (AST may not cover this language; try find_references)."
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def find_callees(name: str) -> str:
     """AST-based: what does this function/method call? Heuristic (by name)."""
     con = db()
@@ -436,7 +467,7 @@ def find_callees(name: str) -> str:
     return fmt(rows) if rows else "No callees recorded for that symbol."
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def find_references(name: str, limit: int = 40) -> str:
     """COMPILER-GRADE (requires SCIP ingest): find every place a symbol is actually used, resolved by the compiler, not text matching. Give a function/class/method name. Returns definition site + all reference sites."""
     con = db()
@@ -459,7 +490,7 @@ def find_references(name: str, limit: int = 40) -> str:
     return out
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def goto_definition(name: str) -> str:
     """COMPILER-GRADE (requires SCIP ingest): jump to the exact definition of a symbol, with its doc comment. More precise than find_symbol for overloaded/common names."""
     con = db()
@@ -471,7 +502,7 @@ def goto_definition(name: str) -> str:
     return fmt(rows) if rows else "Not found in SCIP index; try find_symbol."
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def explain(target: str) -> str:
     """Cached LLM insight for a module or file: intent, responsibilities, system connections, gotchas. Hash-cached, regenerated only when content changes."""
     con = db()
@@ -490,7 +521,7 @@ def explain(target: str) -> str:
     return f"{row['kind']} {row['target']} (model: {row['model']}){stale}\n\n{row['summary']}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def decisions(query: str = "", target: str = "", status: str = "", as_of: str = "") -> str:
     """Decision memory (Mnemosyne): query architectural decisions with temporal validity. Filter by text, governed target (topic/table/module), status, or as_of (YYYY-MM-DD) for time-travel."""
     con = db()
@@ -521,7 +552,7 @@ def decisions(query: str = "", target: str = "", status: str = "", as_of: str = 
     return out
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def decision_trace(id: str) -> str:
     """Full lineage of one decision: supersession chain plus governed artifacts with existence check (flags decision drift)."""
     con = db()
@@ -548,7 +579,7 @@ def decision_trace(id: str) -> str:
         "governs": governs, "summary": rec["summary"], "source": rec["source_path"]}
 
 
-@mcp.tool()
+@mcp.tool(annotations=WR)
 def save_decision(title: str, decision: str, rationale: str, alternatives: str = "", supersedes: str = "") -> str:
     """Capture a decision made in this conversation: writes a git-versioned ADR file (docs/adr/) AND indexes it immediately. Use when an architectural/design choice is settled."""
     import datetime
@@ -586,7 +617,7 @@ def save_decision(title: str, decision: str, rationale: str, alternatives: str =
     return f"{did} saved to {file.relative_to(root)} (git-versioned) and indexed; commit the file to share it."
 
 
-@mcp.tool()
+@mcp.tool(annotations=WR)
 def save_insight(target: str, kind: str, summary: str) -> str:
     """Persist a derived insight for a module or file into the graph (served by explain, hash-keyed so it auto-stales when content changes). kind: 'module' or 'file'. Use after synthesizing understanding from the graph tools."""
     if kind not in ("module", "file") or len(summary) < 40:
@@ -609,12 +640,10 @@ def save_insight(target: str, kind: str, summary: str) -> str:
     return f"Insight saved for {kind} '{target}'."
 
 
-@mcp.tool()
-def graph_gaps(limit: int = 20) -> str:
-    """Where static analysis is BLIND, the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, and drift tables, each with file:line. Investigate, then record what you work out with assert_edge. This is how the graph gets better instead of staying wrong."""
+def _gaps_data(con, n):
+    """The gap worklist — shared by the graph_gaps tool and the
+    /aegis-resolve-gap and /aegis-release-check prompts (one computation)."""
     from http_extract import paths_match as _pm
-    con = db()
-    n = min(max(limit, 1), 60)
 
     def q(sql, *a):
         try:
@@ -686,7 +715,13 @@ def graph_gaps(limit: int = 20) -> str:
         **gaps}
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
+def graph_gaps(limit: int = 20) -> str:
+    """Where static analysis is BLIND, the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, and drift tables, each with file:line. Investigate, then record what you work out with assert_edge. This is how the graph gets better instead of staying wrong."""
+    return _gaps_data(db(), min(max(limit, 1), 60))
+
+
+@mcp.tool(annotations=WR)
 def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str = "medium",
                 topic: str = "", direction: str = "", table: str = "", mode: str = "rw",
                 method: str = "GET", path: str = "") -> str:
@@ -740,7 +775,7 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
             f"if {file} changes. Commit the file to share it with the team.")
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def message_flow(topic: str = "") -> str:
     """Messaging topology (Kafka, plus RabbitMQ/JMS/SQS/NATS labeled by system): correlate inbound/outbound message handling across modules. No args = full topic map (producers/consumers per topic with file:line, plus orphan warnings). Topics resolved from literals, constants, and application.yaml placeholders."""
     con = db()
@@ -846,7 +881,7 @@ def message_flow(topic: str = "") -> str:
     return out
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def db_map(table: str = "") -> str:
     """Database topology (Spring Boot + Liquibase): correlate each table with the changesets that shaped it AND every code site touching it (entities, repositories, @Query, JdbcTemplate) with read/write mode. Includes drift warnings. Pass table for one table."""
     con = db()
@@ -918,7 +953,7 @@ def db_map(table: str = "") -> str:
     return out
 
 
-@mcp.tool()
+@mcp.tool(annotations=RO)
 def http_map(path: str = "") -> str:
     """Full-stack HTTP seam: correlate REST endpoints (Spring controllers) with every caller (TS/React fetch/axios, Java RestTemplate/WebClient/Feign) matched on method + normalized path. Includes orphan endpoints and unmatched calls."""
     from http_extract import paths_match
@@ -996,7 +1031,224 @@ def http_map(path: str = "") -> str:
     return out
 
 
-@mcp.tool()
+# ---- composite decision tools: the session-opening dance, server-side ----
+STOPWORDS = {"the", "and", "for", "with", "from", "that", "this", "then", "than", "when", "where",
+             "which", "into", "onto", "over", "under", "about", "after", "before", "should", "would", "could", "will",
+             "must", "make", "made", "need", "needs", "want", "wants", "add", "use", "using", "used", "new", "our",
+             "are", "was", "were", "has", "have", "had", "not", "but", "all", "any", "can", "its", "also", "only",
+             "just", "some", "how", "why", "what", "who", "each", "per", "via", "one", "two", "code", "file", "files"}
+
+
+def _task_terms(task):
+    """Must match the Node edition token-for-token: same stopwords, same cap."""
+    words = [w for w in re.findall(r"[a-z0-9_.$-]{3,}", task.lower()) if w not in STOPWORDS]
+    out = []
+    for w in words:
+        if w not in out:
+            out.append(w)
+    return out[:8]
+
+
+def _file_seams(con, fid):
+    return {
+        "topics": con.execute("SELECT DISTINCT topic, direction FROM msg_edges WHERE file_id=?", (fid,)).fetchall(),
+        "tables": con.execute("SELECT DISTINCT tbl, mode FROM db_access WHERE file_id=?", (fid,)).fetchall(),
+        "endpoints": con.execute("SELECT method, path FROM http_endpoints WHERE file_id=? LIMIT 15", (fid,)).fetchall(),
+        "calls": con.execute("SELECT method, path FROM http_calls WHERE file_id=? LIMIT 15", (fid,)).fetchall(),
+    }
+
+
+def _governing(con, targets):
+    if not targets:
+        return []
+    try:
+        marks = ",".join("?" * len(targets))
+        return con.execute(
+            f"SELECT DISTINCT dc.id, dc.title FROM decision_links dl JOIN decisions dc ON dc.id=dl.decision_id "
+            f"WHERE dl.target IN ({marks}) AND dc.valid_until IS NULL", list(targets)).fetchall()
+    except sqlite3.Error:
+        return []
+
+
+def _cap_list(a, n=10):
+    return (a[:n] + [f"…and {len(a) - n} more"]) if len(a) > n else a
+
+
+@mcp.tool(annotations=RO)
+def plan_context(task: str) -> str:
+    """When you have a TASK but no target yet: ONE call that finds the starting set server-side — full-text and symbol matches for the task's terms, the files they concentrate in, the Kafka topics / DB tables / HTTP endpoints those files touch, the decisions governing them, and the tests that cover them. Use INSTEAD of the 3-5 exploratory search calls at session start; then context_pack the target you choose."""
+    con = db()
+    terms = _task_terms(task)
+    if not terms:
+        return "Could not extract search terms from the task; describe it with a few concrete words (component, topic, table, endpoint)."
+    score, why = {}, {}
+
+    def bump(p, n, w):
+        score[p] = score.get(p, 0) + n
+        why.setdefault(p, [])
+        if w not in why[p]:
+            why[p].append(w)
+
+    try:
+        fts_q = " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
+        for i, r in enumerate(con.execute(
+                "SELECT path FROM chunks WHERE chunks MATCH ? ORDER BY rank LIMIT 40", (fts_q,))):
+            bump(r["path"], 40 - i, "text match")
+    except sqlite3.Error:
+        pass  # FTS syntax edge: symbols still cover us
+    symbols = []
+    for t in terms[:6]:
+        for s in con.execute(
+                "SELECT s.name, s.kind, s.parent, f.path, s.line FROM symbols s JOIN files f ON f.id=s.file_id "
+                "WHERE s.name LIKE ? ORDER BY LENGTH(s.name) LIMIT 4", (f"%{t}%",)):
+            symbols.append(f"{(s['parent'] + '.') if s['parent'] else ''}{s['name']} ({s['kind']}) {s['path']}:{s['line']}")
+            bump(s["path"], 25, f"symbol {s['name']}")
+    if not score:
+        return f"Nothing in the graph matches [{', '.join(terms)}]. Try search_code with different words, or module_map to orient."
+    seeds = [p for p, _ in sorted(score.items(), key=lambda kv: -kv[1])[:8]]
+    marks = ",".join("?" * len(seeds))
+    topics, tables, defines, hcalls = {}, {}, [], []
+    for f in con.execute(f"SELECT id, path FROM files WHERE path IN ({marks})", seeds):
+        s = _file_seams(con, f["id"])
+        for t in s["topics"]:
+            topics[f"{t['direction']} {t['topic']}"] = t["topic"]
+        for t in s["tables"]:
+            tables[f"{t['mode']} {t['tbl']}"] = t["tbl"]
+        for e in s["endpoints"]:
+            if f"{e['method']} {e['path']}" not in defines:
+                defines.append(f"{e['method']} {e['path']}")
+        for c in s["calls"]:
+            if f"{c['method']} {c['path']}" not in hcalls:
+                hcalls.append(f"{c['method']} {c['path']}")
+    mods = list(dict.fromkeys(p.split("/")[0] for p in seeds))
+    govern = _governing(con, list(dict.fromkeys(list(topics.values()) + list(tables.values()) + mods)))
+    # tests that import any seed file, and the behaviors they assert
+    tests = "none found — no test imports these files"
+    try:
+        tf = [r["path"] for r in con.execute(
+            f"SELECT DISTINCT f2.path FROM edges e JOIN files f2 ON f2.id=e.src JOIN files f ON f.id=e.dst "
+            f"WHERE f.path IN ({marks}) AND f2.is_test=1 LIMIT 6", seeds)]
+        if tf:
+            decamel = lambda s: s if " " in s else re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s).replace("_", " ").lower()  # noqa: E731
+            tm = ",".join("?" * len(tf))
+            tests = {"files": tf, "behaviors": [decamel(r["name"]) for r in con.execute(
+                f"SELECT tc.name FROM test_cases tc JOIN files f2 ON f2.id=tc.file_id WHERE f2.path IN ({tm}) LIMIT 6", tf)]}
+    except sqlite3.Error:
+        pass  # files.is_test / test_cases may predate this index build
+    insights = []
+    try:
+        insights = [f"{r['target']}: {str(r['summary'])[:150]}" for r in con.execute(
+            f"SELECT target, summary FROM insights WHERE target IN ({','.join('?' * len(mods))})", mods)]
+    except sqlite3.Error:
+        pass  # no insights yet
+    return {
+        "task_terms": terms,
+        "files_to_read": [{"path": p, "matched": why.get(p, [])[:4]} for p in seeds],
+        "symbols": _cap_list(symbols, 12),
+        "kafka": list(topics) or "none",
+        "database": list(tables) or "none",
+        "http": {"defines": defines, "calls": hcalls},
+        "governing_decisions": [f"{g['id']}: {g['title']}" for g in govern] or "none recorded",
+        "tests": tests,
+        "cached_insights": insights or "none",
+        "next": "Pick the real target from files_to_read and call context_pack on it. Check the governing decisions before designing. Run change_check(files) before you edit.",
+    }
+
+
+@mcp.tool(annotations=RO)
+def change_check(files: list[str]) -> str:
+    """PRE-EDIT decision support: given the files you intend to touch, ONE call returning their combined blast radius, the tests to re-run, the seam warnings your edit could introduce (sole producers/consumers, drift tables, uncalled endpoints, unresolved expressions), the decisions governing them, and the assertions your edit will mark STALE. Call BEFORE proposing a diff."""
+    from http_extract import paths_match
+    con = db()
+    files = [f for f in files if f][:20]
+    if not files:
+        return "Pass the list of files you intend to edit."
+    known, unknown = [], []
+    for p in files:
+        f = con.execute("SELECT id, path FROM files WHERE path=?", (p,)).fetchone()
+        (known if f else unknown).append(f or p)
+    if not known:
+        return (f"None of the {len(files)} file(s) are in the index. Paths are repo-prefixed "
+                "in a multi-repo workspace (module_map shows the roots).")
+    has_test = con.execute("SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='is_test'").fetchone()[0]
+    kids = [f["id"] for f in known]
+    id_marks = ",".join("?" * len(kids))
+    affected, tests_affected = set(), set()
+    per_file = []
+    for f in known:
+        b = _blast_data(con, f["path"], 2)
+        for lvl in b["by_depth"]:
+            affected.update(lvl)
+        tests_affected.update(b.get("tests_affected", []))
+        seams = _file_seams(con, f["id"])
+        entry = {"path": f["path"],
+                 "direct_dependents": con.execute("SELECT COUNT(*) c FROM edges WHERE dst=?", (f["id"],)).fetchone()["c"]}
+        if seams["topics"]:
+            entry["kafka"] = [f"{t['direction']} {t['topic']}" for t in seams["topics"]]
+        if seams["tables"]:
+            entry["database"] = [f"{t['mode']} {t['tbl']}" for t in seams["tables"]]
+        if seams["endpoints"]:
+            entry["defines_endpoints"] = [f"{e['method']} {e['path']}" for e in seams["endpoints"]]
+        per_file.append(entry)
+    affected -= {f["path"] for f in known}
+    warn = {}
+    unresolved = con.execute(
+        f"SELECT m.topic expression, f.path, m.line FROM msg_edges m JOIN files f ON f.id=m.file_id "
+        f"WHERE m.resolved=0 AND m.file_id IN ({id_marks})", kids).fetchall()
+    if unresolved:
+        warn["unresolved_expressions_in_these_files"] = [f"{r['expression']} @ {r['path']}:{r['line']}" for r in unresolved]
+    # topics where a listed file is the ONLY production-side producer or consumer
+    prod_join = " AND fx.is_test=0" if has_test else ""
+    sole = []
+    for r in con.execute(f"SELECT DISTINCT topic FROM msg_edges WHERE file_id IN ({id_marks})", kids):
+        for direction in ("produce", "consume"):
+            sites = [x["fid"] for x in con.execute(
+                f"SELECT DISTINCT m.file_id fid FROM msg_edges m JOIN files fx ON fx.id=m.file_id "
+                f"WHERE m.topic=? AND m.direction=?{prod_join}", (r["topic"], direction))]
+            if sites and all(s in kids for s in sites):
+                side = "sole producer" if direction == "produce" else "sole consumer"
+                sole.append(f"{side} of {r['topic']} — a breaking change here orphans the topic")
+    if sole:
+        warn["sole_seam_side"] = sole
+    drift = [r["tbl"] for r in con.execute(
+        f"SELECT DISTINCT a.tbl FROM db_access a WHERE a.file_id IN ({id_marks}) "
+        f"AND a.tbl NOT IN (SELECT tbl FROM db_defs)", kids)]
+    if drift:
+        warn["drift_tables_touched"] = [
+            f"{t} — accessed here but no changeset defines it; fix the changelog with this change, or explain why not" for t in drift]
+    eps = con.execute(f"SELECT e.method, e.path, e.norm FROM http_endpoints e WHERE e.file_id IN ({id_marks})", kids).fetchall()
+    if eps:
+        calls = con.execute("SELECT c.method, c.norm FROM http_calls c"
+                            + (" JOIN files fx ON fx.id=c.file_id WHERE fx.is_test=0" if has_test else "")).fetchall()
+        un = [e for e in eps if not any(c["method"] == e["method"] and paths_match(c["norm"], e["norm"]) for c in calls)]
+        if un:
+            warn["endpoints_defined_here_with_no_caller"] = [f"{e['method']} {e['path']}" for e in un]
+    mods = list(dict.fromkeys(f["path"].split("/")[0] for f in known))
+    topics_all = [r["topic"] for r in con.execute(f"SELECT DISTINCT topic FROM msg_edges WHERE file_id IN ({id_marks})", kids)]
+    tables_all = [r["tbl"] for r in con.execute(f"SELECT DISTINCT tbl FROM db_access WHERE file_id IN ({id_marks})", kids)]
+    govern = _governing(con, list(dict.fromkeys(topics_all + tables_all + mods)))
+    at_risk = []
+    try:
+        pmarks = ",".join("?" * len(known))
+        at_risk = [f"{r['kind']} @ {r['file_path']}:{r['line']} (by {r['author']})" for r in con.execute(
+            f"SELECT kind, file_path, line, author FROM assertions WHERE kind!='dismissal' "
+            f"AND file_path IN ({pmarks})", [f["path"] for f in known])]
+    except sqlite3.Error:
+        pass  # assertions table may predate this build
+    out = {
+        "files": {"checked": [f["path"] for f in known], **({"not_in_index": unknown} if unknown else {})},
+        "blast_radius": {"affected_total": len(affected), "sample": _cap_list(sorted(affected), 12)},
+        "tests_to_rerun": {"total": len(tests_affected), "files": _cap_list(sorted(tests_affected), 12)},
+        "per_file": per_file,
+        **({"seam_warnings": warn} if warn else {}),
+        "governing_decisions": [f"{g['id']}: {g['title']} — check with decision_trace before deviating" for g in govern] or "none recorded",
+        **({"assertions_marked_stale_by_this_edit": at_risk} if at_risk else {}),
+        "next": "Re-run the tests listed after your edit. If a seam warning names a topic/table/endpoint, look at its other side first (message_flow/db_map/http_map).",
+    }
+    return out
+
+
+@mcp.tool(annotations=WR)
 async def reindex(mode: str = "incremental") -> str:
     """Rebuild the index. mode='incremental' (changed files since last indexed commit) or 'full'. Use when index_status reports fresh=false."""
     flag = "--full" if mode == "full" else "--incremental"
@@ -1013,7 +1265,9 @@ async def reindex(mode: str = "incremental") -> str:
     # stalling pings and every concurrent request until the client gives up
     # and kills the server. The node edition is async for the same reason.
     import anyio
-    return await anyio.to_thread.run_sync(_run)
+    out = await anyio.to_thread.run_sync(_run)
+    await _notify_after_reindex()  # subscribed resource readers refetch instead of going stale
+    return out
 
 
 def _load_tool_extensions():
@@ -1042,8 +1296,471 @@ def _load_tool_extensions():
 _load_tool_extensions()
 
 
+# ---- MCP prompts: the four graph-aware recipes, rendered server-side ----
+# Hosts that support MCP prompts surface these as slash commands. Every line
+# of the rendered text comes from live queries, so the recipe carries current
+# facts (blast radius, seams, decisions), not a static template. The registry
+# must stay identical to the Node edition (suite-pinned).
+
+def _prompt_guard(fn):
+    """Errors become messages, never crashes — the same contract as the tools."""
+    @functools.wraps(fn)
+    def inner(*a, **k):
+        try:
+            return fn(*a, **k)
+        except Exception as e:  # noqa: BLE001
+            return f"Error in {fn.__name__}: {e}"
+    return inner
+
+
+def _dismissals(con):
+    out = {}
+    try:
+        for r in con.execute("SELECT payload FROM assertions WHERE kind='dismissal'"):
+            try:
+                d = json.loads(r["payload"])
+                out[f"{d.get('gap')}|{d.get('key')}"] = {"by": d.get("author"), "reason": d.get("reason")}
+            except Exception:  # noqa: BLE001
+                pass  # legacy row
+    except sqlite3.Error:
+        pass  # assertions table may predate this build
+    return out
+
+
+def _stale_assertions(con):
+    try:
+        return con.execute(
+            "SELECT a.kind, a.file_path, a.line, a.author FROM assertions a JOIN files f ON f.path=a.file_path "
+            "WHERE a.kind!='dismissal' AND a.source_hash IS NOT NULL AND a.source_hash != f.hash").fetchall()
+    except sqlite3.Error:
+        return []
+
+
+@mcp.prompt(name="aegis-impact",
+            description="What am I about to break? Blast radius, tests to re-run, seams touched, and governing decisions for a target (file path, class, or method) — rendered from the live graph.")
+@_prompt_guard
+def aegis_impact(target: str) -> str:
+    con = db()
+    hit = _resolve_target(con, target)
+    if not hit:
+        return (f"Target '{target}' not found in the index. Try find_symbol or search_code first, "
+                "then re-run aegis-impact with the file path.")
+    file, _sym = hit
+    p = file["path"]
+    blast = _blast_data(con, p, 2)
+    seams = _file_seams(con, file["id"])
+    govern = _governing(con, list(dict.fromkeys(
+        [t["topic"] for t in seams["topics"]] + [t["tbl"] for t in seams["tables"]] + [p.split("/")[0]])))
+    anchored = 0
+    try:
+        anchored = con.execute("SELECT COUNT(*) c FROM assertions WHERE kind!='dismissal' AND file_path=?",
+                               (p,)).fetchone()["c"]
+    except sqlite3.Error:
+        pass  # pre-assertions build
+    kafka = ", ".join(f"{t['direction']} {t['topic']}" for t in seams["topics"]) or "none"
+    tables = ", ".join(f"{t['mode']} {t['tbl']}" for t in seams["tables"]) or "none"
+    http = ", ".join(f"{e['method']} {e['path']}" for e in list(seams["endpoints"]) + list(seams["calls"])) or "none"
+    lines = [
+        f"You are about to change {target}" + ("" if p == target else f" ({p})") + ". Impact, from the live graph:",
+        "",
+        f"Blast radius (depth 2): {blast['affected_total']} production file(s) depend on it.",
+        *[f"  - {x}" for x in _cap_list([x for lvl in blast["by_depth"] for x in lvl], 10)],
+        f"Tests to re-run ({blast.get('tests_affected_total', 0)}):",
+        *([f"  - {x}" for x in _cap_list(blast.get("tests_affected", []), 10)] if blast.get("tests_affected")
+          else ["  - none recorded — treat the change as untested and say so in the PR"]),
+        f"Seams touched: kafka [{kafka}]; tables [{tables}]; http [{http}].",
+        "Governing decisions: " + ("; ".join(f"{g['id']}: {g['title']}" for g in govern) if govern else "none recorded") + ".",
+        *([f"Assertions anchored to this file: {anchored} — your edit marks them STALE; re-affirm or retract them afterwards."]
+          if anchored else []),
+        "",
+        "Before writing code: (1) check the governing decisions above (decision_trace <id>) and do not silently "
+        "contradict them; (2) look at the other side of every seam listed (message_flow topic:<t> / db_map table:<t> "
+        "/ http_map path:<p>); (3) when you know the full edit set, run change_check(files) and re-run the tests it lists.",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.prompt(name="aegis-orient",
+            description="First encounter with a module: files, the most-depended-on entry points, the seams it participates in, governing decisions, and cached insight — the reading plan before any code is read.")
+@_prompt_guard
+def aegis_orient(module: str) -> str:
+    con = db()
+    rows = con.execute("SELECT id, path, lang FROM files WHERE path LIKE ?", (module + "/%",)).fetchall()
+    if not rows:
+        return f"No files under module '{module}'. module_map lists the modules in this workspace."
+    langs = {}
+    for r in rows:
+        langs[r["lang"]] = langs.get(r["lang"], 0) + 1
+    hot = con.execute(
+        "SELECT f.path, COUNT(e.src) n FROM files f JOIN edges e ON e.dst=f.id "
+        "WHERE f.path LIKE ? GROUP BY f.id ORDER BY n DESC LIMIT 5", (module + "/%",)).fetchall()
+    topics = [r[0] for r in con.execute(
+        "SELECT DISTINCT m.direction || ' ' || m.topic FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?", (module + "/%",))]
+    tables = [r[0] for r in con.execute(
+        "SELECT DISTINCT a.mode || ' ' || a.tbl FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?", (module + "/%",))]
+    eps = [r[0] for r in con.execute(
+        "SELECT DISTINCT e.method || ' ' || e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ?", (module + "/%",))]
+    govern = _governing(con, list(dict.fromkeys(
+        [s.split(" ")[-1] for s in topics] + [s.split(" ")[-1] for s in tables] + [module])))
+    insight = None
+    try:
+        row = con.execute("SELECT summary FROM insights WHERE target=?", (module,)).fetchone()
+        insight = row["summary"] if row else None
+    except sqlite3.Error:
+        pass  # none yet
+    n_tests = 0
+    try:
+        n_tests = con.execute("SELECT COUNT(*) c FROM files WHERE path LIKE ? AND is_test=1",
+                              (module + "/%",)).fetchone()["c"]
+    except sqlite3.Error:
+        pass  # pre-is_test build
+    top_langs = ", ".join(sorted(langs, key=langs.get, reverse=True)[:3])
+    lines = [
+        f"Orientation for module {module}: {len(rows)} files ({top_langs}), {n_tests} of them tests.",
+        "",
+        "Most-depended-on files (start reading here):",
+        *([f"  - {h['path']} ({h['n']} dependents)" for h in hot] if hot
+          else ["  - no in-module dependency edges recorded"]),
+        f"Seams: kafka [{', '.join(_cap_list(topics, 8)) or 'none'}]; tables [{', '.join(_cap_list(tables, 8)) or 'none'}]; "
+        f"http [{', '.join(_cap_list(eps, 8)) or 'none'}].",
+        "Governing decisions: " + ("; ".join(f"{g['id']}: {g['title']}" for g in govern) if govern else "none recorded") + ".",
+        "Cached insight: " + (insight or "none — after you understand the module, save_insight so the next agent starts warm") + ".",
+        "",
+        f"Suggested next calls: context_pack '{hot[0]['path'] if hot else module}' for the core file; "
+        f"message_flow topic:<name> for the messaging side; decisions target:{module} for the history. "
+        "Do not read files the outline already answers for.",
+    ]
+    return "\n".join(lines)
+
+
+_GAP_CATS = [
+    ("unresolved_topic_expressions",
+     lambda g: f"{g['expression']} at {g['path']}:{g['line']}",
+     lambda g: f"unresolved|{g['path']}:{g['line']}",
+     "a runtime-assembled topic: kind 'kafka', plus topic and direction once you have read how the value is built"),
+    ("tables_accessed_but_undefined",
+     lambda g: f"table {g['table_name']} at {g['path']}:{g['line']}",
+     lambda g: f"drift_table|{g['table_name']}",
+     "schema drift: kind 'db' with the real table, or a changeset fix in the code itself"),
+    ("topics_consumed_but_never_produced",
+     lambda g: f"topic {g['topic']}",
+     lambda g: f"orphan_topic|{g['topic']}",
+     "a missing producer: kind 'kafka', direction 'produce', anchored at the site you find"),
+    ("topics_produced_but_never_consumed",
+     lambda g: f"topic {g['topic']}",
+     lambda g: f"orphan_topic|{g['topic']}",
+     "a missing consumer: kind 'kafka', direction 'consume', anchored at the site you find"),
+    ("endpoints_with_no_caller",
+     lambda g: f"endpoint {g['endpoint']}",
+     lambda g: None,
+     "an external or gateway-rewritten caller: kind 'http_call' with the normalized path"),
+    ("topics_declared_in_config_but_unused",
+     lambda g: f"topic {g['topic']} (declared by {g['config_key']})",
+     lambda g: f"declared_unused|{g['topic']}",
+     "config drift: either wire the topic up, remove the key, or dismiss with a reason"),
+]
+
+
+@mcp.prompt(name="aegis-resolve-gap",
+            description="Work the graph's to-do list: the top unresolved gap (dynamic topic, drift table, orphan seam), the investigation protocol, and the assert_edge contract for recording what you find.")
+@_prompt_guard
+def aegis_resolve_gap() -> str:
+    con = db()
+    gaps = _gaps_data(con, 20)
+    dism = _dismissals(con)
+    top = None
+    remaining = []
+    for cat, fmt, key, hint in _GAP_CATS:
+        live = [g for g in gaps.get(cat, []) if not (key(g) and key(g) in dism)]
+        if live:
+            if not top:
+                top = {"cat": cat, "item": live[0], "fmt": fmt, "hint": hint}
+                if len(live) > 1:
+                    remaining.append(f"{cat}: {len(live) - 1} more")
+            else:
+                remaining.append(f"{cat}: {len(live)}")
+    if not top:
+        return ("No open gaps — static analysis resolved everything it looked at, and the rest is "
+                "dismissed with reasons. Nothing to do.")
+    why = f" Why the graph is blind here: {top['item']['why']}." if top["item"].get("why") else ""
+    return "\n".join([
+        f"The graph needs a human (or you) here. Top gap ({top['cat']}): {top['fmt'](top['item'])}.{why}",
+        "",
+        "Protocol:",
+        "1. Read the code at the location (file_outline first; read the file only if the outline is not enough).",
+        "2. Trace how the value is built: find_callers on the enclosing method, search_code on the string fragments.",
+        f"3. If you can determine the real seam, record it with assert_edge — for this gap that means {top['hint']}. "
+        "Evidence must QUOTE the code that convinced you (>= 20 chars) and carry a confidence (high|medium|low).",
+        "4. If the gap is intended (external consumer, fire-and-forget, decommissioned), dismiss it with a reason "
+        "via the annotate CLI or the graph view instead of asserting.",
+        "NEVER assert from naming alone — an assertion is a fact you derived from code you read, or it does not enter the graph.",
+        "",
+        f"Remaining after this one: {'; '.join(remaining)}. Re-run aegis-resolve-gap for the next."
+        if remaining else "This is the last open gap.",
+    ])
+
+
+@mcp.prompt(name="aegis-release-check",
+            description="Pre-release review from the live graph: schema drift, orphan seams, uncalled endpoints, unresolved expressions, and stale assertions — each with the tool that investigates it.")
+@_prompt_guard
+def aegis_release_check() -> str:
+    con = db()
+    st = _status_data()
+    gaps = _gaps_data(con, 60)
+    dism = _dismissals(con)
+    dismissed = 0
+
+    def live(arr, key):
+        nonlocal dismissed
+        out = []
+        for g in arr or []:
+            if key(g) and key(g) in dism:
+                dismissed += 1
+            else:
+                out.append(g)
+        return out
+
+    drift = [g["table_name"] for g in live(gaps.get("tables_accessed_but_undefined"), lambda g: f"drift_table|{g['table_name']}")]
+    orphan_p = [g["topic"] for g in live(gaps.get("topics_produced_but_never_consumed"), lambda g: f"orphan_topic|{g['topic']}")]
+    orphan_c = [g["topic"] for g in live(gaps.get("topics_consumed_but_never_produced"), lambda g: f"orphan_topic|{g['topic']}")]
+    uncalled = [g["endpoint"] for g in gaps.get("endpoints_with_no_caller", [])]
+    unresolved = live(gaps.get("unresolved_topic_expressions"), lambda g: f"unresolved|{g['path']}:{g['line']}")
+    declared = [g["topic"] for g in live(gaps.get("topics_declared_in_config_but_unused"), lambda g: f"declared_unused|{g['topic']}")]
+    stale = _stale_assertions(con)
+    n = len(drift) + len(orphan_p) + len(orphan_c) + len(uncalled) + len(unresolved) + len(declared) + len(stale)
+    lines = [
+        f"Pre-release review, from the live graph (index fresh: {str(st['fresh']).lower()}"
+        + ("" if st["fresh"] else " — reindex before trusting this") + "):",
+        "",
+        f"1. Schema drift — code touching tables no changeset defines ({len(drift)}): "
+        + (", ".join(_cap_list(drift, 10)) or "none") + ". -> db_map table:<name>",
+        f"2. Orphan topics — produced but never consumed ({len(orphan_p)}): " + (", ".join(_cap_list(orphan_p, 10)) or "none")
+        + f"; consumed but never produced ({len(orphan_c)}): " + (", ".join(_cap_list(orphan_c, 10)) or "none")
+        + ". -> message_flow topic:<name>",
+        f"3. Endpoints nobody calls ({len(uncalled)}): " + (", ".join(_cap_list(uncalled, 10)) or "none") + ". -> http_map path:<fragment>",
+        f"4. Unresolved dynamic expressions ({len(unresolved)}): "
+        + (", ".join(_cap_list([f"{g['path']}:{g['line']}" for g in unresolved], 6)) or "none")
+        + ". -> aegis-resolve-gap works through them one at a time",
+        f"5. Stale assertions — evidence files changed since they were asserted ({len(stale)}): "
+        + (", ".join(_cap_list([f"{s['kind']} @ {s['file_path']}:{s['line']} (by {s['author']})" for s in stale], 8)) or "none")
+        + ". -> re-affirm or retract (graph view, or the annotate CLI)",
+        f"6. Topics declared in config but unused ({len(declared)}): " + (", ".join(_cap_list(declared, 10)) or "none") + ".",
+        *([f"({dismissed} previously triaged item(s) excluded — dismissed with reasons in docs/graph-assertions.json.)"]
+          if dismissed else []),
+        "",
+        "Ship bar: every line above should be empty, fixed, or dismissed-with-a-reason. A drift table or orphan seam "
+        "nobody can explain is a release blocker — investigate with the tool named on its line."
+        if n else
+        "All clear: no drift, no orphan seams, no uncalled endpoints, no unresolved expressions, no stale assertions.",
+    ]
+    return "\n".join(lines)
+
+
+# ---- MCP resources: ariadne:// context a host can ATTACH without tool calls ----
+# URIs are the cross-edition contract (suite-pinned): graph, status, context,
+# decisions (+ per-id template), assertions. Subscribed clients get
+# notifications/resources/updated when the index moves (see the watcher below).
+
+_export_cache = {"key": None, "json": None}
+
+
+def _current_run():
+    try:
+        row = db().execute("SELECT value FROM meta WHERE key='last_run'").fetchone()
+        return row["value"] if row else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@mcp.resource("ariadne://graph", name="graph", mime_type="application/json",
+              description="The full graph-export JSON snapshot (modules, topics, tables, endpoints, gaps, annotations) — the same contract the graph view renders. Cached until the index moves.")
+async def resource_graph() -> str:
+    key = _current_run()
+    if key and _export_cache["key"] == key and _export_cache["json"]:
+        return _export_cache["json"]
+
+    def _run():
+        r = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "graph_export.py")],
+                           capture_output=True, text=True, cwd=REPO_ROOT, timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout).strip()[-300:] or "graph export failed")
+        return r.stdout.strip().splitlines()[-1]
+
+    import anyio
+    try:
+        out = await anyio.to_thread.run_sync(_run)
+    except Exception as e:  # noqa: BLE001
+        return f"Error reading graph: {e}"
+    _export_cache.update(key=key, json=out)
+    return out
+
+
+@mcp.resource("ariadne://status", name="status", mime_type="application/json",
+              description="Index freshness: counts, indexed SHA vs HEAD, payload version. The resource twin of the index_status tool.")
+def resource_status() -> str:
+    try:
+        return json.dumps(_status_data(), indent=1)
+    except Exception as e:  # noqa: BLE001
+        return f"Error reading status: {e}"
+
+
+@mcp.resource("ariadne://context", name="context", mime_type="text/markdown",
+              description="The graph-derived orientation pack for agents (docs/generated/agent-context.md): module map, seams, standing rules derived from what the graph actually contains.")
+def resource_context() -> str:
+    p = REPO_ROOT / "docs" / "generated" / "agent-context.md"
+    if not p.exists():
+        return ("No agent-context.md yet. Generate it with: python3 .ariadne/docgen.py "
+                "(the post-commit hook keeps it current once installed).")
+    return p.read_text(encoding="utf-8")
+
+
+@mcp.resource("ariadne://decisions", name="decisions", mime_type="application/json",
+              description="The decision ledger: every ADR with status and temporal validity. Read one in full at ariadne://decisions/<id>.")
+def resource_decisions() -> str:
+    try:
+        con = db()
+        rows = []
+        for r in con.execute("SELECT id, title, status, decided_at, valid_until, superseded_by FROM decisions ORDER BY decided_at DESC"):
+            e = {"id": r["id"], "title": r["title"], "status": r["status"], "decided": r["decided_at"]}
+            if r["valid_until"]:
+                e["valid_until"], e["superseded_by"] = r["valid_until"], r["superseded_by"]
+            rows.append(e)
+        return json.dumps({"decisions": rows, "note": "Read one ADR in full at ariadne://decisions/<id>."}, indent=1)
+    except Exception as e:  # noqa: BLE001
+        return f"Error reading decisions: {e}"
+
+
+@mcp.resource("ariadne://decisions/{id}", name="decision", mime_type="text/markdown",
+              description="One architectural decision record, as markdown: the git-versioned source file when present, else the indexed summary with its supersession chain.")
+def resource_decision(id: str) -> str:
+    try:
+        con = db()
+        rec = con.execute("SELECT * FROM decisions WHERE id=?", (id.upper(),)).fetchone()
+        if not rec:
+            return f"No decision '{id}'. ariadne://decisions lists what exists."
+        if rec["source_path"]:
+            p = REPO_ROOT / rec["source_path"]
+            if p.exists():
+                return p.read_text(encoding="utf-8")
+        links = con.execute("SELECT kind, target FROM decision_links WHERE decision_id=?", (rec["id"],)).fetchall()
+        return (f"# {rec['id']}: {rec['title']}\n\nStatus: {rec['status']}\nDate: {rec['decided_at'] or '?'}\n"
+                + (f"Valid until: {rec['valid_until']} (superseded by {rec['superseded_by']})\n" if rec["valid_until"] else "")
+                + (("Governs: " + ", ".join(f"{li['kind']}:{li['target']}" for li in links) + "\n") if links else "")
+                + f"\n{rec['summary'] or ''}\n")
+    except Exception as e:  # noqa: BLE001
+        return f"Error reading decision: {e}"
+
+
+@mcp.resource("ariadne://assertions", name="assertions", mime_type="application/json",
+              description="The human knowledge layer: docs/graph-assertions.json with a computed stale flag per assertion (evidence file changed since it was recorded).")
+def resource_assertions() -> str:
+    af = REPO_ROOT / "docs" / "graph-assertions.json"
+    if not af.exists():
+        return json.dumps({"assertions": [], "note": "No graph-assertions.json yet — assert_edge (or the graph view) creates it."}, indent=1)
+    try:
+        lst = json.loads(af.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return f"docs/graph-assertions.json exists but is not valid JSON ({e}). Fix it by hand; nothing here will overwrite it."
+    if not isinstance(lst, list):
+        return "docs/graph-assertions.json is not a JSON array. Fix it by hand; nothing here will overwrite it."
+    try:
+        con = db()
+        for a in lst:
+            if isinstance(a, dict) and a.get("kind") != "dismissal" and a.get("source_hash") and a.get("file"):
+                cur = con.execute("SELECT hash FROM files WHERE path=?", (a["file"],)).fetchone()
+                if cur and cur["hash"] != a["source_hash"]:
+                    a["stale"] = True
+    except Exception:  # noqa: BLE001
+        pass  # no index yet: serve the raw ledger
+    return json.dumps({"assertions": lst,
+                       "note": "stale=true means the evidence file changed since the assertion was recorded — re-affirm or retract it."}, indent=1)
+
+
+# ---- updated-notifications: the agent-side twin of the graph view's watcher.
+# Hooks and agents reindex outside this process, so subscribed clients poll
+# nothing: while subscriptions exist, meta.last_run is checked every 2s (a
+# microsecond read) and a move fans out notifications/resources/updated per
+# subscribed URI plus one resources/list_changed (the decision list may have
+# grown). The reindex tool short-circuits the wait by notifying on completion.
+
+_subs = []  # (session, uri) pairs, one per active subscription
+_watch_task = None
+_last_notified_run = None
+
+
+async def _notify_index_moved():
+    global _last_notified_run
+    dead = []
+    for pair in list(_subs):
+        session, uri = pair
+        try:
+            await session.send_resource_updated(AnyUrl(uri))
+        except Exception:  # noqa: BLE001
+            dead.append(pair)
+    for session in {p[0] for p in _subs if p not in dead}:
+        try:
+            await session.send_resource_list_changed()
+        except Exception:  # noqa: BLE001
+            pass
+    for p in dead:
+        if p in _subs:
+            _subs.remove(p)
+    _last_notified_run = _current_run()
+
+
+async def _notify_after_reindex():
+    await _notify_index_moved()
+    if not _subs:
+        # no subscriptions, but the calling session still gets list_changed
+        try:
+            await mcp.get_context().session.send_resource_list_changed()
+        except Exception:  # noqa: BLE001
+            pass  # module-surface call: no live session
+
+
+async def _watch_index():
+    global _last_notified_run
+    while True:
+        await asyncio.sleep(2)
+        if not _subs:
+            continue
+        run = _current_run()
+        if run and _last_notified_run and run != _last_notified_run:
+            await _notify_index_moved()
+        elif run and not _last_notified_run:
+            _last_notified_run = run
+
+
+@mcp._mcp_server.subscribe_resource()
+async def _on_subscribe(uri) -> None:
+    global _watch_task, _last_notified_run
+    _subs.append((mcp._mcp_server.request_context.session, str(uri)))
+    if _watch_task is None:
+        _last_notified_run = _current_run()
+        _watch_task = asyncio.get_running_loop().create_task(_watch_index())
+
+
+@mcp._mcp_server.unsubscribe_resource()
+async def _on_unsubscribe(uri) -> None:
+    sess = mcp._mcp_server.request_context.session
+    _subs[:] = [p for p in _subs if not (p[0] is sess and p[1] == str(uri))]
+
+
 def main():
     """Console entry point (aegis-ariadne) and script entry alike."""
+    # The SDK computes the resources capability with subscribe hardcoded False
+    # even when subscribe handlers are registered, and notification options
+    # default everything off; declare what this server actually implements
+    # (subscribe + list_changed), the Node edition's registerCapabilities twin.
+    _orig_cio = mcp._mcp_server.create_initialization_options
+
+    def _cio(notification_options=None, experimental_capabilities=None, **kw):
+        opts = _orig_cio(NotificationOptions(resources_changed=True), experimental_capabilities or {}, **kw)
+        if opts.capabilities.resources:
+            opts.capabilities.resources.subscribe = True
+        return opts
+
+    mcp._mcp_server.create_initialization_options = _cio
     mcp.run()
 
 
