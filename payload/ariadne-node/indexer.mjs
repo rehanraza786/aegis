@@ -17,12 +17,17 @@ import { extractJavaHttp, extractTsHttp, extractTsEndpoints, extractPyHttp, norm
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import { pathToFileURL } from "node:url";
+import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
 import { approvedFiles, approveAll, LOCK_NAME } from "./trust.mjs";
 import path from "node:path";
 import process from "node:process";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
+// set by connect() when a pre-v6 chunks table was migrated: the FTS index is
+// derived data, so the migration IS a forced full rebuild (see main).
+let CHUNKS_MIGRATED = false;
 
 // ---------------------------------------------------------------- utilities
 function git(args, opts = {}) {
@@ -86,12 +91,13 @@ const DEFAULTS = {
   extraExtensions: {},
   testPathPatterns: [],
   prodPathPatterns: [],
+  workers: null, // parallel extract: null = auto (cores-1, capped 8); 1 = sequential
 };
 let config = DEFAULTS;
 try {
   const userCfg = JSON.parse(fs.readFileSync(path.join(GR_DIR, "config.json"), "utf8"));
   config = { ...DEFAULTS, ...userCfg, skipDirs: [...new Set([...DEFAULTS.skipDirs, ...(userCfg.skipDirs ?? [])])] };
-  log("INFO", "Loaded .ariadne/config.json overrides");
+  if (isMainThread) log("INFO", "Loaded .ariadne/config.json overrides");
 } catch { /* no config file: defaults */ }
 
 const LANG_BY_EXT = {
@@ -280,7 +286,7 @@ function acquireLock() {
 function releaseLock() { try { fs.unlinkSync(LOCK_PATH); } catch { /* already gone */ } }
 
 // ----------------------------------------------------------------- storage
-function connect() {
+function connect(forIndexing = false) {
   fs.mkdirSync(GR_DIR, { recursive: true });
   let db;
   try {
@@ -363,8 +369,6 @@ function connect() {
       src INTEGER REFERENCES files(id) ON DELETE CASCADE,
       dst INTEGER REFERENCES files(id) ON DELETE CASCADE,
       kind TEXT DEFAULT 'import', UNIQUE(src, dst, kind));
-    CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
-      path, start_line UNINDEXED, content, tokenize='trigram');
     -- FK indexes: every child table is cascade-deleted per changed file on every
     -- reindex; without these each DELETE FROM files full-scans each child table,
     -- making incremental reindex quadratic in changed files. edges(dst) also
@@ -401,6 +405,37 @@ function connect() {
   if (v && Number(v.value) > SCHEMA_VERSION) {
     throw new Error(`Index schema v${v.value} is newer than this indexer (v${SCHEMA_VERSION}). Update the toolkit.`);
   }
+  // ---- schema v6: FTS moves to external content. chunk_text holds the corpus
+  // ONCE; the chunks FTS table keeps only the trigram index and reads row
+  // content through content= on demand (snippet()/rank keep working) — roughly
+  // halving index.db. Per-file chunk deletes become a plain B-tree DELETE on
+  // chunk_text (the triggers emit the FTS 'delete' ops). The old contentful
+  // table is detected by its DDL, migrated only when actually INDEXING (a
+  // status open of a pre-v6 DB must not wipe the search index), and the
+  // migration forces a one-time full rebuild: chunks are derived data, so the
+  // rebuild IS the migration. Parity: SCHEMA/CHUNK_SCHEMA (Python edition).
+  const chunksSql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks'").get()?.sql ?? "";
+  const oldChunks = !!chunksSql && !chunksSql.includes("content='chunk_text'");
+  if (oldChunks && !forIndexing) return db; // read-side open of a pre-v6 DB: leave shapes and version alone
+  if (oldChunks) {
+    db.exec("DROP TABLE chunks;");
+    CHUNKS_MIGRATED = true;
+    log("INFO", `Index schema v${v?.value ?? "?"} -> v${SCHEMA_VERSION}: chunks move to FTS external content; one-time full rebuild`);
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chunk_text(
+      id INTEGER PRIMARY KEY, path TEXT, start_line INTEGER, content TEXT);
+    CREATE INDEX IF NOT EXISTS idx_chunktext_path ON chunk_text(path);
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+      path, start_line UNINDEXED, content, tokenize='trigram',
+      content='chunk_text', content_rowid='id');
+    CREATE TRIGGER IF NOT EXISTS chunk_text_ai AFTER INSERT ON chunk_text BEGIN
+      INSERT INTO chunks(rowid, path, start_line, content) VALUES (new.id, new.path, new.start_line, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS chunk_text_ad AFTER DELETE ON chunk_text BEGIN
+      INSERT INTO chunks(chunks, rowid, path, start_line, content) VALUES('delete', old.id, old.path, old.start_line, old.content);
+    END;
+  `);
   db.prepare("INSERT OR REPLACE INTO meta VALUES('schema_version', ?)").run(String(SCHEMA_VERSION));
   return db;
 }
@@ -428,46 +463,53 @@ function stmts(db) {
     s = {
       selPrev: db.prepare("SELECT hash, size, mtime FROM files WHERE path=?"),
       updStat: db.prepare("UPDATE files SET size=?, mtime=? WHERE path=?"),
-      // FTS5 can't index a plain WHERE path=? — it full-scans the whole chunk
-      // table PER FILE (measured 37.5ms at 100k chunks). The trigram tokenizer
-      // serves LIKE from the index (plan L0, 1.06ms, 35×); the AND path=? keeps
-      // exactness because `_`/`%` in real paths are LIKE wildcards and a bare
-      // LIKE over-matches sibling files. Bind the same path to both params.
-      delChunksByPath: db.prepare("DELETE FROM chunks WHERE path LIKE ? AND path=?"),
+      // v6 external content: deletes ride a plain B-tree index on chunk_text
+      // (exact by construction — no LIKE, no wildcard hazard); the AFTER DELETE
+      // trigger emits the matching FTS 'delete' ops. This replaces the v5
+      // trigram-LIKE fast path, which existed because FTS5 could not index a
+      // plain WHERE path=? on a contentful table.
+      delChunksByPath: db.prepare("DELETE FROM chunk_text WHERE path=?"),
       selOldId: db.prepare("SELECT id FROM files WHERE path=?"),
-      selKeptEdges: db.prepare("SELECT src, dst, kind FROM edges WHERE (src=? OR dst=?) AND kind != 'import'"),
+      // Carry ALL edge kinds across the file-row swap. Outgoing import edges
+      // are cleared and rebuilt from fresh imports by rebuildEdges right after;
+      // INCOMING import edges (their src file unchanged, so still valid) have
+      // no other owner — the old `kind != 'import'` filter dropped them, so
+      // every incremental quietly thinned reverse dependencies (blast_radius,
+      // context_pack's tests, hotspots) for any file that got reindexed.
+      selKeptEdges: db.prepare("SELECT src, dst, kind FROM edges WHERE src=? OR dst=?"),
       delFileByPath: db.prepare("DELETE FROM files WHERE path=?"),
       insFile: db.prepare("INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime, is_test) VALUES(?,?,?,?,?,?,?,?)"),
       insEdge: db.prepare("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,?)"),
       insSym: db.prepare("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,?)"),
       insCall: db.prepare("INSERT INTO calls(src_symbol, callee, line) VALUES(?,?,?)"),
       insTc: db.prepare("INSERT INTO test_cases(file_id, name, line) VALUES(?,?,?)"),
-      insChunk: db.prepare("INSERT INTO chunks(path, start_line, content) VALUES(?,?,?)"),
+      insChunk: db.prepare("INSERT INTO chunk_text(path, start_line, content) VALUES(?,?,?)"),
     };
     STMT_CACHE.set(db, s);
   }
   return s;
 }
 
-async function indexFile(db, relpath, force = false) {
-  const S = stmts(db);
+// ------------------------------------------------------------- file pipeline
+// Split on the single-writer boundary: computeFile does I/O + hash + parse +
+// extract with NO database access (so it can run in worker threads), and
+// applyFile owns every write. The sequential path and the worker pool share
+// computeFile, so parallel mode cannot drift from sequential mode.
+async function computeFile(relpath, prev, force = false) {
   const full = absPath(relpath);
   let text;
   let st;
+  let hash;
   try {
     st = fs.statSync(full);
     if (st.size > config.maxFileBytes) { log("DEBUG", `skip large: ${relpath}`); return null; }
-    const prev = S.selPrev.get(relpath);
     // fast path 1: identical stat -> already indexed, nothing to do (PDFs seen once stay seen)
-    if (!force && prev && prev.size === st.size && prev.mtime === st.mtimeMs) return "unchanged";
+    if (!force && prev && prev.size === st.size && prev.mtime === st.mtimeMs) return { relpath, status: "unchanged" };
     // checksum of RAW BYTES, computed before any extraction: a touched-but-identical
     // file (incl. PDFs) is detected here without paying extraction cost
     const buf = fs.readFileSync(full);
-    var hash = createHash("sha1").update(buf).digest("hex");
-    if (!force && prev && prev.hash === hash) {
-      S.updStat.run(st.size, st.mtimeMs, relpath);
-      return "unchanged";
-    }
+    hash = createHash("sha1").update(buf).digest("hex");
+    if (!force && prev && prev.hash === hash) return { relpath, status: "statOnly", size: st.size, mtime: st.mtimeMs };
     if (relpath.toLowerCase().endsWith(".pdf")) {
       try {
         const { extractText } = await import("unpdf");
@@ -483,35 +525,22 @@ async function indexFile(db, relpath, force = false) {
   const isTest = isTestPath(relpath) ? 1 : 0;
   const lines = text.split("\n"); // split once; reused for the line count and chunking
 
-  S.delChunksByPath.run(relpath, relpath);
-  const old = S.selOldId.get(relpath);
-  // Non-import edges (e.g. SCIP-derived 'ref') are owned by other passes; the
-  // file-row swap below cascade-deletes them, so carry them over to the new id.
-  const keptEdges = old ? S.selKeptEdges.all(old.id, old.id) : [];
-  S.delFileByPath.run(relpath);
-  const fid = S.insFile.run(relpath, lang, hash, lines.length, Date.now() / 1000, st.size, st.mtimeMs, isTest).lastInsertRowid;
-  for (const e of keptEdges) S.insEdge.run(e.src === old.id ? fid : e.src, e.dst === old.id ? fid : e.dst, e.kind);
-
   const ext = path.extname(full).toLowerCase();
   let ast = null;
   if (AST_LANGS.has(lang)) {
-    if (!astReady) { await initAst(log); astReady = true; }  // lazy: only when a code file actually changed
+    if (!astReady) { await initAst(log); astReady = true; }  // lazy: only when a code file actually changed (per thread)
     try { ast = await extractAst(lang, ext, text); } catch (e) { log("DEBUG", `AST failed for ${relpath}: ${e.message}`); }
   }
+  let symbols;
+  let calls = [];
   if (ast) {
-    const idByName = new Map();
-    for (const s of ast.symbols) {
-      const r = S.insSym.run(fid, s.name, s.kind, s.line, s.sig ?? "", s.parent ?? null);
-      if (!idByName.has(s.name)) idByName.set(s.name, r.lastInsertRowid);
-    }
-    for (const c of ast.calls) {
-      const src = c.caller ? idByName.get(c.caller) : null;
-      if (src) S.insCall.run(src, c.callee, c.line);
-    }
+    symbols = ast.symbols.map((s) => ({ name: s.name, kind: s.kind, line: s.line, sig: s.sig ?? "", parent: s.parent ?? null }));
+    calls = ast.calls.map((c) => ({ caller: c.caller ?? null, callee: c.callee, line: c.line }));
   } else {
-    for (const s of extractSymbols(lang, text)) S.insSym.run(fid, s.name, s.kind, s.line, s.sig, null);
+    symbols = extractSymbols(lang, text).map((s) => ({ name: s.name, kind: s.kind, line: s.line, sig: s.sig, parent: null }));
   }
 
+  const testCases = [];
   if (isTest) {
     // behaviors, not helpers: annotation-gated for JUnit, so a @KafkaListener
     // method inside a test class never lands here
@@ -522,15 +551,121 @@ async function indexFile(db, relpath, force = false) {
         : lang === "python" ? /^\s*def\s+(test_\w+)\s*\(/gm : null;
     if (tcRe) {
       const lineAt = makeLineAt(text);
-      for (const m of text.matchAll(tcRe)) S.insTc.run(fid, m[1], lineAt(m.index));
+      for (const m of text.matchAll(tcRe)) testCases.push({ name: m[1], line: lineAt(m.index) });
     }
   }
 
+  const chunks = [];
   for (let start = 0; start < lines.length; start += config.chunkLines) {
     const chunk = lines.slice(start, start + config.chunkLines).join("\n");
-    if (chunk.trim()) S.insChunk.run(relpath, start + 1, chunk);
+    if (chunk.trim()) chunks.push({ start: start + 1, content: chunk });
   }
-  return { fid, lang, text, relpath };
+  return { relpath, status: "indexed", hash, size: st.size, mtime: st.mtimeMs, lang, isTest,
+    lineCount: lines.length, symbols, calls, testCases, chunks, imports: [...extractImports(lang, text)] };
+}
+
+function applyFile(db, r) {
+  const S = stmts(db);
+  if (r.status === "statOnly") { S.updStat.run(r.size, r.mtime, r.relpath); return null; }
+  S.delChunksByPath.run(r.relpath);
+  const old = S.selOldId.get(r.relpath);
+  // The file-row swap below cascade-deletes every edge touching the old id;
+  // carry them ALL to the new id (see selKeptEdges for why import edges too).
+  const keptEdges = old ? S.selKeptEdges.all(old.id, old.id) : [];
+  S.delFileByPath.run(r.relpath);
+  const fid = S.insFile.run(r.relpath, r.lang, r.hash, r.lineCount, Date.now() / 1000, r.size, r.mtime, r.isTest).lastInsertRowid;
+  for (const e of keptEdges) S.insEdge.run(e.src === old.id ? fid : e.src, e.dst === old.id ? fid : e.dst, e.kind);
+  const idByName = new Map();
+  for (const s of r.symbols) {
+    const res = S.insSym.run(fid, s.name, s.kind, s.line, s.sig, s.parent);
+    if (!idByName.has(s.name)) idByName.set(s.name, res.lastInsertRowid);
+  }
+  for (const c of r.calls) {
+    const src = c.caller ? idByName.get(c.caller) : null;
+    if (src) S.insCall.run(src, c.callee, c.line);
+  }
+  for (const t of r.testCases) S.insTc.run(fid, t.name, t.line);
+  for (const ch of r.chunks) S.insChunk.run(r.relpath, ch.start, ch.content);
+  return { fid, relpath: r.relpath, imports: r.imports };
+}
+
+const WORKERS_FLAG = (() => {
+  const i = process.argv.indexOf("--workers");
+  return i > -1 ? Math.max(1, Number(process.argv[i + 1]) || 1) : null;
+})();
+
+function decideWorkers(nFiles) {
+  const explicit = WORKERS_FLAG ?? config.workers ?? null;
+  const auto = Math.max(1, Math.min((os.availableParallelism?.() ?? os.cpus().length) - 1, 8));
+  const n = explicit ?? auto;
+  if (n <= 1) return 1;
+  // pool startup (a WASM parser set per worker) beats its win on small batches;
+  // an EXPLICIT --workers/config value engages regardless (the suite relies on it)
+  if (explicit == null && nFiles < 100) return 1;
+  return n;
+}
+
+/** Compute every file — in worker threads when it pays — and apply results on
+ *  THIS thread in submission order: the single-writer rule and deterministic
+ *  insertion order both survive parallelism. onApplied sees each computeFile
+ *  result exactly once, in the order of `files`. A worker failure degrades to
+ *  sequential for the unapplied remainder — correctness never depends on the
+ *  pool. Parity: compute_and_apply (Python edition, ProcessPoolExecutor there
+ *  because py-tree-sitter holds the GIL during parse). */
+async function computeAndApply(db, files, force, onApplied) {
+  const prev = new Map(db.prepare("SELECT path, hash, size, mtime FROM files").all().map((r) => [r.path, r]));
+  const n = decideWorkers(files.length);
+  if (n <= 1 || !files.length) {
+    for (const rel of files) onApplied(await computeFile(rel, prev.get(rel) ?? null, force));
+    return;
+  }
+  log("INFO", `Parallel extract: ${n} workers over ${files.length} files`);
+  await new Promise((resolve, reject) => {
+    const workers = [];
+    const pending = new Map(); // result index -> rec, held until its turn
+    let next = 0;              // next file to hand out
+    let applied = 0;           // next result index to apply (in submission order)
+    let dead = false;
+    const finish = () => { for (const w of workers) w.terminate().catch?.(() => {}); };
+    const drain = () => {
+      try {
+        while (pending.has(applied)) {
+          const rec = pending.get(applied);
+          pending.delete(applied);
+          applied++;
+          onApplied(rec);
+        }
+      } catch (e) { dead = true; finish(); reject(e); return; }
+      if (applied >= files.length) { finish(); resolve(); }
+    };
+    const sequentialRemainder = async () => {
+      try {
+        for (; applied < files.length; applied++) {
+          onApplied(await computeFile(files[applied], prev.get(files[applied]) ?? null, force));
+        }
+        resolve();
+      } catch (e) { reject(e); }
+    };
+    const assign = (w) => {
+      if (dead || next >= files.length) return;
+      const i = next++;
+      w.postMessage({ i, rel: files[i], prev: prev.get(files[i]) ?? null, force });
+    };
+    for (let k = 0; k < Math.min(n, files.length); k++) {
+      const w = new Worker(new URL(import.meta.url), { workerData: { ariadneExtractWorker: true } });
+      workers.push(w);
+      w.on("message", (m) => { if (dead) return; pending.set(m.i, m.rec); assign(w); drain(); });
+      w.on("error", (err) => {
+        if (dead) return;
+        dead = true;
+        log("WARN", `parallel extract worker failed (${err.message}); finishing sequentially`);
+        finish();
+        pending.clear();
+        sequentialRemainder();
+      });
+      assign(w);
+    }
+  });
 }
 
 function rebuildEdges(db, touched) {
@@ -542,7 +677,7 @@ function rebuildEdges(db, touched) {
   const ins = db.prepare("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,'import')");
   for (const t of touched) {
     del.run(t.fid);
-    for (const mod of extractImports(t.lang, t.text)) {
+    for (const mod of t.imports) { // precomputed by computeFile (possibly in a worker)
       const dst = resolveImport(mod, t.relpath, index);
       if (dst && dst !== t.relpath && idByPath.has(dst)) ins.run(t.fid, idByPath.get(dst));
     }
@@ -602,6 +737,33 @@ async function kafkaPass(db, scopePrefixes = null) {
   let mapsChanged = cfgFp !== prevFp;
   db.prepare("INSERT OR REPLACE INTO meta VALUES('config_fp', ?)").run(cfgFp);
 
+  // ---- config-delta scoping: a semantic change used to widen extraction to
+  // EVERY candidate file (one edited topic constant re-extracted a whole 50k
+  // repo). Instead, collect the changed KEYS — config keys, constant names,
+  // entity names — and widen only to files whose text mentions one, plus the
+  // hash-changed files themselves. Falls back to the full widen when the
+  // changed-key set is large (>50) or the previous config map is unknown, so
+  // correctness never depends on the optimization. Parity: kafka_pass (py).
+  const changedTokens = new Set();
+  let widen = false;
+  if (mapsChanged) {
+    const prevMapJson = db.prepare("SELECT value FROM meta WHERE key='config_map'").get()?.value;
+    if (prevMapJson) {
+      try {
+        const prevMap = JSON.parse(prevMapJson);
+        const curMap = Object.fromEntries(configMap);
+        for (const k of new Set([...Object.keys(prevMap), ...Object.keys(curMap)])) {
+          if (prevMap[k] !== curMap[k]) changedTokens.add(k);
+        }
+      } catch { widen = true; }
+    } else { widen = true; } // no previous map to diff against (first v6 run)
+  }
+  {
+    const mapJson = JSON.stringify(Object.fromEntries(configMap));
+    if (mapJson.length <= 200_000) db.prepare("INSERT OR REPLACE INTO meta VALUES('config_map', ?)").run(mapJson);
+    else { db.prepare("DELETE FROM meta WHERE key='config_map'").run(); if (mapsChanged) widen = true; }
+  }
+
   // ---- global maps (constants + entities) from per-file cache; recompute only on hash miss ----
   const javaish = tracked.filter((p) => /\.(java|kts?)$/.test(p));
   // Snapshot of what we last EXTRACTED, taken before the map loop updates it.
@@ -647,9 +809,16 @@ async function kafkaPass(db, scopePrefixes = null) {
       consts = Object.fromEntries(loadConstants([{ text }]));
       ents = Object.fromEntries(extractEntities(text));
       const cj = JSON.stringify(consts), ej = JSON.stringify(ents);
-      // only a *semantic* delta forces the full pass; a mere hash change with
+      // only a *semantic* delta forces the wider pass; a mere hash change with
       // identical constants/entities keeps scoping intact
-      if (!c || c.constants !== cj || c.entities !== ej) mapsChanged = true;
+      if (!c || c.constants !== cj || c.entities !== ej) {
+        mapsChanged = true;
+        // the changed KEYS drive token-scoped widening below
+        const oldC = c ? JSON.parse(c.constants) : {};
+        const oldE = c ? JSON.parse(c.entities) : {};
+        for (const k of new Set([...Object.keys(oldC), ...Object.keys(consts)])) if (oldC[k] !== consts[k]) changedTokens.add(k);
+        for (const k of new Set([...Object.keys(oldE), ...Object.keys(ents)])) if (oldE[k] !== ents[k]) changedTokens.add(k);
+      }
       putCache.run(rel, fh ?? "", cj, ej);
     }
     // test files are cached like any other (the semantic-delta trigger stays
@@ -666,26 +835,39 @@ async function kafkaPass(db, scopePrefixes = null) {
   // A global change (config value, topic constant, entity mapping) can alter how
   // every other file resolves, so that widens automatically to a full re-extract.
   const candidates = tracked.filter((p) => /\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs|py|rb|prisma)$/.test(p) || inExtFiles(p));
+  // token-scoped: a semantic change with a small, known key set widens only to
+  // files that MENTION a changed key — extraction output for a file that never
+  // references any changed constant/entity/config key is invariant under the
+  // map change, so it keeps its rows and its cache stamp
+  const tokenScoped = mapsChanged && !widen && changedTokens.size <= 50;
+  const fullWiden = mapsChanged && !tokenScoped;
   const dirty = new Set();
-  if (mapsChanged) {
+  for (const p of candidates) {
+    const cur = idByPath.get(p)?.hash;
+    const seen = extractedAt.get(p);
+    if (!seen || seen !== cur) dirty.add(p);
+  }
+  if (fullWiden) {
     for (const p of candidates) dirty.add(p);
-  } else {
+  } else if (tokenScoped && changedTokens.size) {
+    const toks = [...changedTokens];
     for (const p of candidates) {
-      const cur = idByPath.get(p)?.hash;
-      const seen = extractedAt.get(p);
-      if (!seen || seen !== cur) dirty.add(p);
+      if (dirty.has(p)) continue;
+      const t = readText(p);
+      if (t != null && toks.some((k) => t.includes(k))) dirty.add(p);
     }
+    log("INFO", `Config-delta scoping: ${changedTokens.size} changed key(s) widened extraction to ${dirty.size}/${candidates.length} files`);
   }
   const inScope = (rel) => dirty.has(rel);
   const delRows = (table) => {
-    if (mapsChanged) { db.exec(`DELETE FROM ${table}`); return; }
+    if (fullWiden) { db.exec(`DELETE FROM ${table}`); return; }
     const st = db.prepare(`DELETE FROM ${table} WHERE file_id IN (SELECT id FROM files WHERE path=?)`);
     for (const p of dirty) st.run(p);
   };
   const scopedDelete = delRows;
   // remember what we extracted, so an unchanged file is never re-read next time
   const markExtracted = db.prepare("INSERT OR REPLACE INTO extract_cache(path, hash, constants, entities) VALUES(?,?,COALESCE((SELECT constants FROM extract_cache WHERE path=?),'{}'),COALESCE((SELECT entities FROM extract_cache WHERE path=?),'{}'))");
-  if (!mapsChanged && dirty.size < candidates.length) {
+  if (!fullWiden && dirty.size < candidates.length) {
     log("INFO", `Extraction scoped to ${dirty.size}/${candidates.length} changed files`);
   }
   // a test file's own constants/entities overlay the global maps (own wins): a
@@ -1015,7 +1197,7 @@ async function fullIndex(db, rebuild = false) {
     // Deleting files cascade-wipes every correlation row, so the extraction cache
     // MUST go too, otherwise the passes compare hashes, conclude "nothing changed",
     // and rebuild into an empty graph.
-    db.exec("DELETE FROM files; DELETE FROM chunks;");
+    db.exec("DELETE FROM files; DELETE FROM chunk_text;");
     try { db.exec("DELETE FROM extract_cache"); db.exec("DELETE FROM meta WHERE key='config_fp'"); } catch { /* fresh db */ }
   }
   const tracked = new Set(files);
@@ -1025,17 +1207,18 @@ async function fullIndex(db, rebuild = false) {
   for (const { path: p } of db.prepare("SELECT path FROM files").all()) {
     if (!tracked.has(p)) {
       S.delFileByPath.run(p);
-      S.delChunksByPath.run(p, p);
+      S.delChunksByPath.run(p);
       removed++;
     }
   }
   const touched = [];
   let skipped = 0;
-  for (const rel of files) {
-    const r = await indexFile(db, rel, rebuild);
-    if (r === "unchanged") skipped++;
-    else if (r) touched.push(r);
-  }
+  await computeAndApply(db, files, rebuild, (rec) => {
+    if (!rec) return;
+    if (rec.status === "unchanged") { skipped++; return; }
+    if (rec.status === "statOnly") { applyFile(db, rec); skipped++; return; }
+    touched.push(applyFile(db, rec));
+  });
   rebuildEdges(db, touched);
   await kafkaPass(db, null);
   stamp(db);
@@ -1083,10 +1266,16 @@ async function incrementalIndex(db) {
   const S = stmts(db);
   for (const p of deleted) {
     S.delFileByPath.run(p);
-    S.delChunksByPath.run(p, p);
+    S.delChunksByPath.run(p);
   }
   const touched = [];
-  for (const p of relevant) { const r = await indexFile(db, p); if (r) touched.push(r); }
+  // (also aligns with the Python edition: "unchanged" results never enter
+  // `touched` — the old loop pushed the bare string in)
+  await computeAndApply(db, relevant, false, (rec) => {
+    if (!rec || rec.status === "unchanged") return;
+    if (rec.status === "statOnly") { applyFile(db, rec); return; }
+    touched.push(applyFile(db, rec));
+  });
   rebuildEdges(db, touched);
   await kafkaPass(db, null);
   stamp(db);
@@ -1101,7 +1290,21 @@ function status(db) {
     `edges=${q("SELECT COUNT(*) c FROM edges").c} last_sha=${sha.slice(0, 12)} db=${DB_PATH}`);
 }
 
+// ---------------------------------------------------------- worker entry
+// Parallel extract workers re-import this module; they only ever compute
+// (computeFile has no DB access) and post results back. The CLI block below
+// is main-thread-only, so a worker never tries to index on its own.
+if (!isMainThread && workerData?.ariadneExtractWorker) {
+  parentPort.on("message", async (t) => {
+    let rec = null;
+    try { rec = await computeFile(t.rel, t.prev, t.force); }
+    catch (e) { log("DEBUG", `worker compute failed for ${t.rel}: ${e.message}`); rec = null; }
+    parentPort.postMessage({ i: t.i, rec });
+  });
+}
+
 // -------------------------------------------------------------------- main
+if (isMainThread) {
 if (MULTI) log("INFO", `Workspace mode: ${ROOTS.length} repos: ${ROOTS.map(r=>path.basename(r)).join(", ")}`);
 const mode = process.argv[2] ?? "--status";
 if (mode === "--status") {
@@ -1114,8 +1317,9 @@ if (mode === "--status") {
 } else if (mode === "--full" || mode === "--incremental" || mode === "--rebuild") {
   if (!acquireLock()) { log("INFO", "Another indexer run is in progress; exiting cleanly."); process.exit(0); }
   try {
-    const db = connect();
-    mode === "--incremental" ? await incrementalIndex(db) : await fullIndex(db, mode === "--rebuild");
+    const db = connect(true);
+    if (CHUNKS_MIGRATED) await fullIndex(db, true); // derived index: rebuild IS the migration
+    else mode === "--incremental" ? await incrementalIndex(db) : await fullIndex(db, mode === "--rebuild");
     // keep the query planner's stats current as the graph grows; near-zero cost
     try { db.pragma("optimize"); } catch { /* never fatal */ }
   } catch (e) {
@@ -1125,6 +1329,7 @@ if (mode === "--status") {
     releaseLock();
   }
 } else {
-  console.log("Usage: node indexer.mjs --full | --incremental | --rebuild | --status | --approve-extensions");
+  console.log("Usage: node indexer.mjs --full | --incremental | --rebuild | --status | --approve-extensions [--workers N]");
   process.exitCode = 2;
+}
 }
