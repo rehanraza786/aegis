@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import re
 import sqlite3
@@ -27,7 +28,14 @@ import time
 from bisect import bisect_left
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+# True in parallel-extract worker processes (spawn re-imports this module):
+# workers compute only — no DB, no lock, no log rotation, no chatty INFO lines.
+_IS_CHILD = multiprocessing.parent_process() is not None
+
+SCHEMA_VERSION = 6
+# set by connect() when a pre-v6 chunks table was migrated: the FTS index is
+# derived data, so the migration IS a forced full rebuild (see main).
+CHUNKS_MIGRATED = False
 
 def _discover_roots():
     env = os.environ.get("ARIADNE_ROOTS")
@@ -70,7 +78,8 @@ log = logging.getLogger("ariadne")
 _cfg = {}
 try:
     _cfg = json.loads((DB_DIR / "config.json").read_text(encoding="utf-8"))
-    log.info("Loaded .ariadne/config.json overrides")
+    if not _IS_CHILD:
+        log.info("Loaded .ariadne/config.json overrides")
 except (OSError, json.JSONDecodeError):
     pass
 ALIAS_PREFIXES = tuple(_cfg.get("aliasPrefixes", ["@/", "~/"]))
@@ -309,8 +318,6 @@ CREATE TABLE IF NOT EXISTS edges(
   src INTEGER REFERENCES files(id) ON DELETE CASCADE,
   dst INTEGER REFERENCES files(id) ON DELETE CASCADE,
   kind TEXT DEFAULT 'import', UNIQUE(src, dst, kind));
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
-  path, start_line UNINDEXED, content, tokenize='trigram');
 -- FK indexes: every child table is cascade-deleted per changed file on every
 -- reindex; without these each DELETE FROM files full-scans each child table,
 -- making incremental reindex quadratic in changed files. edges(dst) also
@@ -326,6 +333,26 @@ CREATE INDEX IF NOT EXISTS idx_testcases_file ON test_cases(file_id);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
 """
 
+# FTS, external content (schema v6): the corpus lives ONCE in chunk_text; the
+# chunks FTS table holds only the trigram index and reads row content through
+# content= on demand (snippet()/rank keep working) — roughly halving index.db.
+# Per-file chunk deletes become a plain B-tree DELETE on chunk_text (the
+# triggers emit the FTS 'delete' ops). Parity: connect() (Node edition).
+CHUNK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chunk_text(
+  id INTEGER PRIMARY KEY, path TEXT, start_line INTEGER, content TEXT);
+CREATE INDEX IF NOT EXISTS idx_chunktext_path ON chunk_text(path);
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+  path, start_line UNINDEXED, content, tokenize='trigram',
+  content='chunk_text', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS chunk_text_ai AFTER INSERT ON chunk_text BEGIN
+  INSERT INTO chunks(rowid, path, start_line, content) VALUES (new.id, new.path, new.start_line, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS chunk_text_ad AFTER DELETE ON chunk_text BEGIN
+  INSERT INTO chunks(chunks, rowid, path, start_line, content) VALUES('delete', old.id, old.path, old.start_line, old.content);
+END;
+"""
+
 
 def _rotate_log():
     try:
@@ -337,10 +364,11 @@ def _rotate_log():
         pass
 
 
-_rotate_log()
+if not _IS_CHILD:
+    _rotate_log()
 
 
-def connect():
+def connect(for_indexing=False):
     try:
         con = sqlite3.connect(DB_PATH, timeout=10)
         con.execute("PRAGMA quick_check")
@@ -407,6 +435,21 @@ def connect():
     row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     if row and int(row[0]) > SCHEMA_VERSION:
         raise SystemExit(f"Index schema v{row[0]} is newer than this indexer (v{SCHEMA_VERSION}). Update the toolkit.")
+    # ---- schema v6: FTS external content. The old contentful chunks table is
+    # detected by its DDL, migrated only when actually INDEXING (a --status open
+    # of a pre-v6 DB must not wipe the search index), and the migration forces a
+    # one-time full rebuild: chunks are derived data, rebuild IS the migration.
+    global CHUNKS_MIGRATED
+    cs = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone()
+    old_chunks = bool(cs and cs[0]) and "content='chunk_text'" not in cs[0]
+    if old_chunks and not for_indexing:
+        return con  # read-side open of a pre-v6 DB: leave shapes and version alone
+    if old_chunks:
+        con.execute("DROP TABLE chunks")
+        CHUNKS_MIGRATED = True
+        log.info("Index schema v%s -> v%d: chunks move to FTS external content; one-time full rebuild",
+                 row[0] if row else "?", SCHEMA_VERSION)
+    con.executescript(CHUNK_SCHEMA)
     con.execute("INSERT OR REPLACE INTO meta VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
     return con
 
@@ -448,17 +491,22 @@ def repo_files():
                 yield f"{prefix}/{line}" if prefix else line
 
 
-def index_file(con, relpath, force=False):
+# ------------------------------------------------------------- file pipeline
+# Split on the single-writer boundary: compute_file does I/O + hash + parse +
+# extract with NO database access (so it can run in worker processes), and
+# apply_file owns every write. The sequential path and the process pool share
+# compute_file, so parallel mode cannot drift from sequential mode.
+def compute_file(relpath, prev, force=False):
+    """prev = (hash, size, mtime) from the files table, or None."""
     full = abs_path(relpath)
     if not full.exists():
         return None
     st = full.stat()
     if st.st_size > MAX_FILE_BYTES:
         return None
-    prev = con.execute("SELECT hash, size, mtime FROM files WHERE path=?", (relpath,)).fetchone()
     # fast path 1: identical stat -> nothing to do (PDFs seen once stay seen)
     if not force and prev and prev[1] == st.st_size and prev[2] == st.st_mtime:
-        return "unchanged"
+        return {"relpath": relpath, "status": "unchanged"}
     try:
         buf = full.read_bytes()
     except OSError:
@@ -467,8 +515,7 @@ def index_file(con, relpath, force=False):
     # file (incl. PDFs) is caught here without paying extraction cost
     h = hashlib.sha1(buf).hexdigest()
     if not force and prev and prev[0] == h:
-        con.execute("UPDATE files SET size=?, mtime=? WHERE path=?", (st.st_size, st.st_mtime, relpath))
-        return "unchanged"
+        return {"relpath": relpath, "status": "statOnly", "size": st.st_size, "mtime": st.st_mtime}
     if full.suffix.lower() == ".pdf":
         try:
             import io
@@ -484,32 +531,9 @@ def index_file(con, relpath, force=False):
     lang = LANG_BY_EXT.get(full.suffix.lower(), "other")
     is_test = 1 if is_test_path(relpath) else 0
 
-    # FTS5 can't index a plain WHERE path=? — it full-scans the whole chunk table
-    # PER FILE (measured 37.5ms at 100k chunks). The trigram tokenizer serves
-    # LIKE from the index (35×); AND path=? keeps exactness because `_`/`%` in
-    # real paths are LIKE wildcards. Same path bound to both params.
-    con.execute("DELETE FROM chunks WHERE path LIKE ? AND path=?", (relpath, relpath))
-    old = con.execute("SELECT id FROM files WHERE path=?", (relpath,)).fetchone()
-    # Non-import edges (e.g. SCIP-derived 'ref') are owned by other passes; the
-    # file-row swap below cascade-deletes them, so carry them over to the new id.
-    kept_edges = []
-    if old:
-        kept_edges = con.execute(
-            "SELECT src, dst, kind FROM edges WHERE (src=? OR dst=?) AND kind != 'import'",
-            (old[0], old[0])).fetchall()
-        con.execute("DELETE FROM files WHERE id=?", (old[0],))
-    cur = con.execute(
-        "INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime, is_test) VALUES(?,?,?,?,?,?,?,?)",
-        (relpath, lang, h, text.count("\n") + 1, time.time(), st.st_size, st.st_mtime, is_test))
-    fid = cur.lastrowid
-    if kept_edges:
-        con.executemany("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,?)",
-                        [(fid if src == old[0] else src, fid if dst == old[0] else dst, kind)
-                         for src, dst, kind in kept_edges])
-
     ast_result = None
     if lang in AST_LANGS and AST_EXTRACT is None and not globals().get("_ast_tried"):
-        globals()["_ast_tried"] = True          # lazy: skip WASM/grammar load on docs-only commits
+        globals()["_ast_tried"] = True          # lazy: skip WASM/grammar load on docs-only commits (per process)
         from ast_extract import get_ast_extractor
         globals()["AST_EXTRACT"] = get_ast_extractor()
     if AST_EXTRACT is not None:
@@ -517,26 +541,15 @@ def index_file(con, relpath, force=False):
             ast_result = AST_EXTRACT(lang, full.suffix.lower(), text)
         except Exception as e:  # noqa: BLE001 - AST must never break indexing
             log.debug("AST failed for %s: %s", relpath, e)
-    # executemany: the row loop runs in C, one statement compile — row-at-a-time
-    # con.execute() per symbol/call/chunk dominated per-file cost on the cold path
     if ast_result:
-        con.executemany("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,?)",
-                        [(fid, s_["name"], s_["kind"], s_["line"], s_.get("sig", ""), s_.get("parent"))
-                         for s_ in ast_result["symbols"]])
-        id_by_name = {}
-        for sid, name in con.execute("SELECT id, name FROM symbols WHERE file_id=? ORDER BY id", (fid,)):
-            id_by_name.setdefault(name, sid)  # first inserted id per name, as before
-        call_rows = []
-        for c in ast_result["calls"]:
-            src = id_by_name.get(c["caller"]) if c["caller"] else None
-            if src:
-                call_rows.append((src, c["callee"], c["line"]))
-        if call_rows:
-            con.executemany("INSERT INTO calls(src_symbol, callee, line) VALUES(?,?,?)", call_rows)
+        symbols = [(s_["name"], s_["kind"], s_["line"], s_.get("sig", ""), s_.get("parent"))
+                   for s_ in ast_result["symbols"]]
+        calls = [(c["caller"], c["callee"], c["line"]) for c in ast_result["calls"]]
     else:
-        con.executemany("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,NULL)",
-                        [(fid, name, kind, line, sig) for name, kind, line, sig in extract_symbols(lang, text)])
+        symbols = [(name, kind, line, sig, None) for name, kind, line, sig in extract_symbols(lang, text)]
+        calls = []
 
+    test_cases = []
     if is_test:
         # behaviors, not helpers: annotation-gated for JUnit, so a @KafkaListener
         # method inside a test class never lands here
@@ -550,31 +563,134 @@ def index_file(con, relpath, force=False):
             tc_re = None
         if tc_re:
             line_at = make_line_at(text)
-            con.executemany("INSERT INTO test_cases(file_id, name, line) VALUES(?,?,?)",
-                            [(fid, m.group(1), line_at(m.start())) for m in tc_re.finditer(text)])
+            test_cases = [(m.group(1), line_at(m.start())) for m in tc_re.finditer(text)]
 
     lines = text.splitlines()
     chunk_rows = []
     for start in range(0, len(lines), CHUNK_LINES):
         chunk = "\n".join(lines[start:start + CHUNK_LINES])
         if chunk.strip():
-            chunk_rows.append((relpath, start + 1, chunk))
-    if chunk_rows:
-        con.executemany("INSERT INTO chunks(path, start_line, content) VALUES(?,?,?)", chunk_rows)
-    return fid, lang, text, relpath
+            chunk_rows.append((start + 1, chunk))
+    return {"relpath": relpath, "status": "indexed", "hash": h, "size": st.st_size, "mtime": st.st_mtime,
+            "lang": lang, "is_test": is_test, "line_count": text.count("\n") + 1,
+            "symbols": symbols, "calls": calls, "test_cases": test_cases, "chunks": chunk_rows,
+            "imports": list(extract_imports(lang, text))}
+
+
+def apply_file(con, r):
+    if r["status"] == "statOnly":
+        con.execute("UPDATE files SET size=?, mtime=? WHERE path=?", (r["size"], r["mtime"], r["relpath"]))
+        return None
+    relpath = r["relpath"]
+    # v6 external content: deletes ride a plain B-tree index on chunk_text
+    # (exact by construction); the AFTER DELETE trigger emits the FTS ops.
+    con.execute("DELETE FROM chunk_text WHERE path=?", (relpath,))
+    old = con.execute("SELECT id FROM files WHERE path=?", (relpath,)).fetchone()
+    # The file-row swap below cascade-deletes every edge touching the old id;
+    # carry them ALL to the new id. Outgoing import edges are cleared and
+    # rebuilt from fresh imports by rebuild_edges right after; INCOMING import
+    # edges (their src file unchanged, so still valid) have no other owner —
+    # the old `kind != 'import'` filter dropped them, so every incremental
+    # quietly thinned reverse dependencies for any file that got reindexed.
+    kept_edges = []
+    if old:
+        kept_edges = con.execute(
+            "SELECT src, dst, kind FROM edges WHERE src=? OR dst=?",
+            (old[0], old[0])).fetchall()
+        con.execute("DELETE FROM files WHERE id=?", (old[0],))
+    cur = con.execute(
+        "INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime, is_test) VALUES(?,?,?,?,?,?,?,?)",
+        (relpath, r["lang"], r["hash"], r["line_count"], time.time(), r["size"], r["mtime"], r["is_test"]))
+    fid = cur.lastrowid
+    if kept_edges:
+        con.executemany("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,?)",
+                        [(fid if src == old[0] else src, fid if dst == old[0] else dst, kind)
+                         for src, dst, kind in kept_edges])
+    # executemany: the row loop runs in C, one statement compile
+    con.executemany("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,?)",
+                    [(fid, name, kind, line, sig, parent) for name, kind, line, sig, parent in r["symbols"]])
+    if r["calls"]:
+        id_by_name = {}
+        for sid, name in con.execute("SELECT id, name FROM symbols WHERE file_id=? ORDER BY id", (fid,)):
+            id_by_name.setdefault(name, sid)  # first inserted id per name, as before
+        call_rows = []
+        for caller, callee, line in r["calls"]:
+            sid = id_by_name.get(caller) if caller else None
+            if sid:
+                call_rows.append((sid, callee, line))
+        if call_rows:
+            con.executemany("INSERT INTO calls(src_symbol, callee, line) VALUES(?,?,?)", call_rows)
+    if r["test_cases"]:
+        con.executemany("INSERT INTO test_cases(file_id, name, line) VALUES(?,?,?)",
+                        [(fid, name, line) for name, line in r["test_cases"]])
+    if r["chunks"]:
+        con.executemany("INSERT INTO chunk_text(path, start_line, content) VALUES(?,?,?)",
+                        [(relpath, start, chunk) for start, chunk in r["chunks"]])
+    return (fid, relpath, r["imports"])
+
+
+def _compute_task(t):
+    rel, prev, force = t
+    return compute_file(rel, prev, force)
+
+
+WORKERS_FLAG = None  # set by main() from --workers
+
+
+def _decide_workers(n_files):
+    explicit = WORKERS_FLAG if WORKERS_FLAG is not None else _cfg.get("workers")
+    explicit = max(1, int(explicit)) if explicit is not None else None
+    auto = max(1, min((os.cpu_count() or 2) - 1, 8))
+    n = explicit if explicit is not None else auto
+    if n <= 1:
+        return 1
+    # pool startup (an interpreter + parser set per process) beats its win on
+    # small batches; an EXPLICIT --workers/config value engages regardless
+    # (the suite relies on it)
+    if explicit is None and n_files < 100:
+        return 1
+    return n
+
+
+def compute_and_apply(con, files, force, apply_cb):
+    """Compute every file — in worker PROCESSES when it pays (py-tree-sitter
+    holds the GIL during parse, so threads would serialize) — and apply results
+    on THIS process in submission order: the single-writer rule and
+    deterministic insertion order both survive parallelism. A pool failure
+    degrades to sequential for the unapplied remainder — correctness never
+    depends on the pool. Parity: computeAndApply (Node, worker_threads there)."""
+    prev = {r[0]: (r[1], r[2], r[3]) for r in con.execute("SELECT path, hash, size, mtime FROM files")}
+    n = _decide_workers(len(files))
+    if n <= 1 or not files:
+        for rel in files:
+            apply_cb(compute_file(rel, prev.get(rel), force))
+        return
+    log.info("Parallel extract: %d workers over %d files", n, len(files))
+    from concurrent.futures import ProcessPoolExecutor
+    applied = 0
+    try:
+        with ProcessPoolExecutor(max_workers=n) as ex:
+            # ex.map yields results in submission order with the loop in C
+            for rec in ex.map(_compute_task, [(rel, prev.get(rel), force) for rel in files], chunksize=16):
+                apply_cb(rec)
+                applied += 1
+    except Exception as e:  # noqa: BLE001 - pool infrastructure failure only
+        log.warning("parallel extract failed (%s); finishing sequentially", e)
+        for rel in files[applied:]:
+            apply_cb(compute_file(rel, prev.get(rel), force))
 
 
 def rebuild_edges(con, touched):
-    """(Re)build import edges for the given file records (fid, lang, text, relpath)."""
+    """(Re)build import edges for the given file records (fid, relpath, imports)."""
     all_paths = [r[0] for r in con.execute("SELECT path FROM files")]
     id_by_path = {r[1]: r[0] for r in con.execute("SELECT id, path FROM files")}
     index = build_import_index(all_paths)  # once per rebuild, not per import
     # only import edges are ours to clear; kind='ref' rows belong to scip_ingest
     con.executemany("DELETE FROM edges WHERE src=? AND kind='import'",
-                    [(fid,) for fid, _lang, _text, _rel in touched])
+                    [(fid,) for fid, _rel, _imp in touched])
     edge_rows = []
-    for fid, lang, text, relpath in touched:
-        for mod in extract_imports(lang, text):
+    for fid, relpath, imports in touched:
+        for mod in imports:  # precomputed by compute_file (possibly in a worker)
             dst = resolve_import(mod, relpath, index)
             if dst and dst != relpath and dst in id_by_path:
                 edge_rows.append((fid, id_by_path[dst]))
@@ -657,6 +773,36 @@ def kafka_pass(con, scope_prefixes=None):
     maps_changed = (not prev) or prev[0] != cfg_fp
     con.execute("INSERT OR REPLACE INTO meta VALUES('config_fp', ?)", (cfg_fp,))
 
+    # ---- config-delta scoping: a semantic change used to widen extraction to
+    # EVERY candidate file (one edited topic constant re-extracted a whole 50k
+    # repo). Instead, collect the changed KEYS — config keys, constant names,
+    # entity names — and widen only to files whose text mentions one, plus the
+    # hash-changed files themselves. Falls back to the full widen when the
+    # changed-key set is large (>50) or the previous config map is unknown, so
+    # correctness never depends on the optimization. Parity: kafkaPass (Node).
+    changed_tokens = set()
+    widen = False
+    if maps_changed:
+        prev_map_row = con.execute("SELECT value FROM meta WHERE key='config_map'").fetchone()
+        if prev_map_row:
+            try:
+                prev_map = _json.loads(prev_map_row[0])
+                cur_map = dict(cfg)
+                for k in set(prev_map) | set(cur_map):
+                    if prev_map.get(k) != cur_map.get(k):
+                        changed_tokens.add(k)
+            except Exception:  # noqa: BLE001
+                widen = True
+        else:
+            widen = True  # no previous map to diff against (first v6 run)
+    map_json = _json.dumps(dict(cfg), sort_keys=True)
+    if len(map_json) <= 200_000:
+        con.execute("INSERT OR REPLACE INTO meta VALUES('config_map', ?)", (map_json,))
+    else:
+        con.execute("DELETE FROM meta WHERE key='config_map'")
+        if maps_changed:
+            widen = True
+
     javaish = [p for p in tracked if p.endswith((".java", ".kt", ".kts"))]
     # Snapshot of what we last EXTRACTED, taken before the map loop updates it. Files whose
     # content hash has moved on are the ones needing re-extraction. Reindexing a file cascades
@@ -702,6 +848,15 @@ def kafka_pass(con, scope_prefixes=None):
             cj, ej = _json.dumps(consts, sort_keys=True), _json.dumps(ents, sort_keys=True)
             if not c or c[1] != cj or c[2] != ej:
                 maps_changed = True
+                # the changed KEYS drive token-scoped widening below
+                old_c = _json.loads(c[1]) if c else {}
+                old_e = _json.loads(c[2]) if c else {}
+                for k in set(old_c) | set(consts):
+                    if old_c.get(k) != consts.get(k):
+                        changed_tokens.add(k)
+                for k in set(old_e) | set(ents):
+                    if old_e.get(k) != ents.get(k):
+                        changed_tokens.add(k)
             con.execute("INSERT OR REPLACE INTO extract_cache(path, hash, constants, entities) VALUES(?,?,?,?)",
                         (rel, fh or "", cj, ej))
         # test files are cached like any other (the semantic-delta trigger stays
@@ -718,21 +873,36 @@ def kafka_pass(con, scope_prefixes=None):
 
     candidates = [p for p in tracked
                   if re.search(r"\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs|py|rb|prisma)$", p) or in_ext_files(p)]
-    if maps_changed:
+    # token-scoped: a semantic change with a small, known key set widens only to
+    # files that MENTION a changed key — extraction output for a file that never
+    # references any changed constant/entity/config key is invariant under the
+    # map change, so it keeps its rows and its cache stamp
+    token_scoped = maps_changed and not widen and len(changed_tokens) <= 50
+    full_widen = maps_changed and not token_scoped
+    dirty = {p for p in candidates if extracted_at.get(p) != hash_by_path.get(p)}
+    if full_widen:
         dirty = set(candidates)
-    else:
-        dirty = {p for p in candidates if extracted_at.get(p) != hash_by_path.get(p)}
+    elif token_scoped and changed_tokens:
+        toks = list(changed_tokens)
+        for p in candidates:
+            if p in dirty:
+                continue
+            t = read_text(p)
+            if t is not None and any(k in t for k in toks):
+                dirty.add(p)
+        log.info("Config-delta scoping: %d changed key(s) widened extraction to %d/%d files",
+                 len(changed_tokens), len(dirty), len(candidates))
 
     def in_scope(rel):
         return rel in dirty
 
     def scoped_delete(table):
-        if maps_changed:
+        if full_widen:
             con.execute(f"DELETE FROM {table}")
         else:
             for p in dirty:
                 con.execute(f"DELETE FROM {table} WHERE file_id IN (SELECT id FROM files WHERE path=?)", (p,))
-    if not maps_changed and len(dirty) < len(candidates):
+    if not full_widen and len(dirty) < len(candidates):
         log.info("Extraction scoped to %d/%d changed files", len(dirty), len(candidates))
 
     # a test file's own constants/entities overlay the global maps (own wins): a
@@ -1139,7 +1309,7 @@ def full_index(con, rebuild=False):
         # must go too, otherwise the passes compare hashes, conclude "nothing changed",
         # and rebuild into an empty graph.
         con.execute("DELETE FROM files")
-        con.execute("DELETE FROM chunks")
+        con.execute("DELETE FROM chunk_text")
         try:
             con.execute("DELETE FROM extract_cache")
             con.execute("DELETE FROM meta WHERE key='config_fp'")
@@ -1160,15 +1330,22 @@ def full_index(con, rebuild=False):
     for (p,) in con.execute("SELECT path FROM files").fetchall():
         if p not in tracked:
             con.execute("DELETE FROM files WHERE path=?", (p,))
-            con.execute("DELETE FROM chunks WHERE path LIKE ? AND path=?", (p, p))
+            con.execute("DELETE FROM chunk_text WHERE path=?", (p,))
             removed += 1
     touched, skipped = [], 0
-    for rel in files:
-        rec = index_file(con, rel, force=rebuild)
-        if rec == "unchanged":
+
+    def _apply(rec):
+        nonlocal skipped
+        if not rec:
+            return
+        if rec["status"] == "unchanged":
             skipped += 1
-        elif rec:
-            touched.append(rec)
+        elif rec["status"] == "statOnly":
+            apply_file(con, rec)
+            skipped += 1
+        else:
+            touched.append(apply_file(con, rec))
+    compute_and_apply(con, files, rebuild, _apply)
     rebuild_edges(con, touched)
     kafka_pass(con, None)
     stamp_all(con)
@@ -1220,12 +1397,17 @@ def incremental_index(con):
         return full_index(con)
     for p in deleted:
         con.execute("DELETE FROM files WHERE path=?", (p,))
-        con.execute("DELETE FROM chunks WHERE path LIKE ? AND path=?", (p, p))
+        con.execute("DELETE FROM chunk_text WHERE path=?", (p,))
     touched = []
-    for p in changed:
-        rec = index_file(con, p)
-        if rec and rec != "unchanged":
-            touched.append(rec)
+
+    def _apply(rec):
+        if not rec or rec["status"] == "unchanged":
+            return
+        if rec["status"] == "statOnly":
+            apply_file(con, rec)
+        else:
+            touched.append(apply_file(con, rec))
+    compute_and_apply(con, changed, False, _apply)
     rebuild_edges(con, touched)
     changed_prefixes = {(p.split("/")[0] if MULTI else "") for p in (changed + deleted)}
     kafka_pass(con, changed_prefixes)
@@ -1251,7 +1433,11 @@ def main():
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--rebuild", action="store_true")
     ap.add_argument("--approve-extensions", action="store_true")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="parallel extract processes (default: auto; 1 = sequential)")
     args = ap.parse_args()
+    global WORKERS_FLAG
+    WORKERS_FLAG = args.workers
     if args.approve_extensions:
         from trust import approve_all, LOCK_NAME
         r = approve_all(DB_DIR / "extensions")
@@ -1270,8 +1456,11 @@ def main():
             log.info("Another indexer run is in progress; exiting cleanly.")
             sys.exit(0)
         try:
-            con = connect()
-            incremental_index(con) if args.incremental else full_index(con, rebuild=args.rebuild)
+            con = connect(True)
+            if CHUNKS_MIGRATED:
+                full_index(con, rebuild=True)  # derived index: rebuild IS the migration
+            else:
+                incremental_index(con) if args.incremental else full_index(con, rebuild=args.rebuild)
             # keep the query planner's stats current as the graph grows
             try:
                 con.execute("PRAGMA optimize")
