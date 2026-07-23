@@ -1,0 +1,44 @@
+# Packaging for the Python edition, so any MCP client gets Ariadne with
+#   uvx aegis-ariadne        (server)   /   pipx install aegis-ariadne
+# The same flat files keep working when vendored into a repo as .ariadne/
+# (the payload model): the console entry points route through ariadne_cli.py,
+# which puts this directory on sys.path so the modules' flat sibling imports
+# resolve identically in both modes. The install target is the uniquely named
+# package dir `aegis_ariadne` (never `ariadne` — that name belongs to the
+# GraphQL library on PyPI and would collide in site-packages).
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aegis-ariadne"
+version = "0.2.0"
+description = "Ariadne: the AEGIS codebase-graph MCP server (Python edition). Indexes code, Kafka topics, DB schema drift, and HTTP seams into SQLite; serves 24 MCP tools to Copilot, Claude, Cursor, or any MCP client."
+readme = { text = "Ariadne (Python edition) — see https://github.com/rehanraza786/aegis", content-type = "text/markdown" }
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.2.0",
+    "protobuf>=7.35",
+    "tree-sitter>=0.23",
+    # <1 is load-bearing: the 1.x line downloads grammars from GitHub at
+    # runtime, which breaks offline environments and violates the project's
+    # zero-egress promise. The 0.x line vendors every grammar in the wheel.
+    "tree-sitter-language-pack>=0.7,<1",
+    "pypdf>=4",
+]
+
+[project.urls]
+Homepage = "https://github.com/rehanraza786/aegis"
+Repository = "https://github.com/rehanraza786/aegis"
+
+[project.scripts]
+aegis-ariadne = "aegis_ariadne.ariadne_cli:server_main"
+aegis-ariadne-index = "aegis_ariadne.ariadne_cli:indexer_main"
+aegis-ariadne-docgen = "aegis_ariadne.ariadne_cli:docgen_main"
+
+[tool.setuptools]
+packages = ["aegis_ariadne"]
+
+[tool.setuptools.package-dir]
+aegis_ariadne = "."

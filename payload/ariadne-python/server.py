@@ -143,6 +143,18 @@ def fmt(rows):
     return [dict(r) for r in rows]
 
 
+def _payload_version():
+    """The payload's version identity (from pyproject.toml beside this file),
+    surfaced by index_status so 'which Ariadne is this workspace running?' is
+    a tool call, not archaeology."""
+    try:
+        m = re.search(r'^version\s*=\s*"([^"]+)"',
+                      (Path(__file__).resolve().parent / "pyproject.toml").read_text(encoding="utf-8"), re.M)
+        return m.group(1) if m else "unknown"
+    except OSError:
+        return "unknown"
+
+
 @mcp.tool()
 def index_status() -> str:
     """Check index freshness: file/symbol/edge counts and the git SHA the index was built at. Call this first if results seem stale."""
@@ -155,7 +167,7 @@ def index_status() -> str:
     indexed = sha["value"] if sha else None
     return {"files": f, "symbols": s, "edges": e,
             "indexed_sha": indexed, "head_sha": head,
-            "fresh": indexed == head}
+            "fresh": indexed == head, "payload_version": _payload_version()}
 
 
 @mcp.tool()
@@ -976,5 +988,11 @@ def _load_tool_extensions():
 
 _load_tool_extensions()
 
-if __name__ == "__main__":
+
+def main():
+    """Console entry point (aegis-ariadne) and script entry alike."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

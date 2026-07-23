@@ -1077,7 +1077,8 @@ def status(con):
     print(f"files={f} symbols={s} edges={e} last_sha={sha[:12]} db={DB_PATH}")
 
 
-if __name__ == "__main__":
+def main():
+    """Console entry point (aegis-ariadne-index) and script entry alike."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--incremental", action="store_true")
@@ -1112,3 +1113,7 @@ if __name__ == "__main__":
             release_lock()
     else:
         status(connect())
+
+
+if __name__ == "__main__":
+    main()
