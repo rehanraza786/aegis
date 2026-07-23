@@ -1131,6 +1131,10 @@ await c.close();
     check("payload version identity agrees (npm == pypi == CHANGELOG)",
           pym and chm and node_ver == pym.group(1) == chm.group(1),
           f"npm={node_ver} pypi={pym and pym.group(1)} changelog={chm and chm.group(1)}")
+    # the tool reference must document every registered tool (and no ghosts)
+    tools_doc = (TOOLKIT / "docs" / "TOOLS.md").read_text(encoding="utf-8")
+    undocumented = sorted(t for t in node_reg if f"`{t}`" not in tools_doc)
+    check("docs/TOOLS.md documents all 24 registered tools", not undocumented, str(undocumented))
     # the two constitution templates must never drift apart again
     check("constitution templates are identical (payload/ vs spec-driven-artifacts/)",
           (TOOLKIT / "payload" / "constitution-template.md").read_bytes()

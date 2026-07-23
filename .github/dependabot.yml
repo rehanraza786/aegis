@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /payload/ariadne-node
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+  - package-ecosystem: npm
+    directory: /extension
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+  - package-ecosystem: pip
+    directory: /payload/ariadne-python
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    # tree-sitter-language-pack <1 is load-bearing (offline grammars); do not
+    # accept a major bump without reading the CHANGELOG note about it
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }

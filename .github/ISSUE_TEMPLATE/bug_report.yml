@@ -1,0 +1,29 @@
+name: Bug report
+description: Something extracted wrong, crashed, or a tool answered incorrectly
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Payload version
+      description: index_status reports payload_version; or the tag/package version you installed
+      placeholder: "0.2.0"
+    validations: { required: true }
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Runtime edition
+      options: [node, python, both, extension/graph view, installer]
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: For extraction bugs, include the smallest code snippet that indexes wrong and the row/warning you got vs expected.
+    validations: { required: true }
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: .ariadne/index.log lines, tool output, or the AEGIS output channel. Redact anything private — logs never leave your machine otherwise.
+      render: text

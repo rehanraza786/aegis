@@ -1,0 +1,15 @@
+name: Feature request
+description: A seam, framework, host, or tool the graph should understand
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What should the graph understand or do?
+      description: For new frameworks/seams, include a representative code snippet and what rows/warnings you'd expect. Extractor PRs are very welcome — CONTRIBUTING.md documents the pattern.
+    validations: { required: true }
+  - type: input
+    id: stack
+    attributes:
+      label: Your stack
+      placeholder: "e.g. Go + chi + NATS + Atlas migrations"

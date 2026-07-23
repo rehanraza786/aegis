@@ -49,6 +49,15 @@ The post-review release. Highlights, roughly in the order they landed:
   `core.hooksPath`, chaining, space-safe, repo-move-safe), no hard python3
   dependency, atomic config writes. The Python installer is now `bootstrap.py`
   (a `setup.py` beside `pyproject.toml` would be executed by build tooling).
+- **Multi-host prompt layer:** `install.sh --host=copilot|claude|cursor|agents|all`
+  delivers skills/agents/routing/MCP config to Claude Code (`.claude/`,
+  `CLAUDE.md`, `.mcp.json`), Cursor (`.cursor/`), and generic `AGENTS.md`
+  hosts; standing rules in `agent-context.md` are derived from what the graph
+  detected instead of asserted universally.
+- **Project hygiene:** CONTRIBUTING (with the extractor-PR path), SECURITY
+  policy and threat model, issue/PR templates, CODEOWNERS, dependabot, CI
+  badge, `docs/ARCHITECTURE.md`, and `docs/TOOLS.md` (suite-pinned to the
+  live tool registry).
 
 ## 0.1.0
 
