@@ -176,13 +176,32 @@ const IMPORT_PATTERNS = {
   php: [S(String.raw`^use\s+(?<mod>[\w\\]+)`)],
 };
 
+/** O(n) newline scan once, then O(log n) per lookup. The old shape —
+ *  text.slice(0, idx).split("\n") per match — re-scanned the whole prefix for
+ *  every match, O(text × matches) on big files. Parity: line_at (Python). */
+function makeLineAt(text) {
+  let offs = null;
+  return (idx) => {
+    if (!offs) {
+      offs = [];
+      for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) offs.push(i);
+    }
+    let lo = 0, hi = offs.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (offs[mid] < idx) lo = mid + 1; else hi = mid;
+    }
+    return lo + 1; // newlines strictly before idx, + 1
+  };
+}
+
 function extractSymbols(lang, text) {
   const out = [];
+  const lineAt = makeLineAt(text);
   for (const [pattern, kind] of SYMBOL_PATTERNS[lang] ?? []) {
     pattern.lastIndex = 0;
     for (const m of text.matchAll(pattern)) {
-      const line = text.slice(0, m.index).split("\n").length;
-      out.push({ name: m.groups.name, kind, line, sig: (m.groups.sig ?? "").slice(0, 200) });
+      out.push({ name: m.groups.name, kind, line: lineAt(m.index), sig: (m.groups.sig ?? "").slice(0, 200) });
     }
   }
   return out;
@@ -200,7 +219,26 @@ function extractImports(lang, text) {
   return mods;
 }
 
-function resolveImport(mod, srcPath, allPaths) {
+/** Precomputed index for resolveImport: built ONCE per edge rebuild instead of
+ *  scanning every path per import (the old O(imports × paths) hot spot). For a
+ *  stem a/b/c it registers every segment-boundary suffix (c, b/c, a/b/c); the
+ *  first path in iteration order claims a suffix, preserving first-match
+ *  semantics. Boundary-only matching also stops the old false edges where
+ *  tail "foo/bar" matched mid-segment inside "xfoo/bar". Parity: build_import_index. */
+function buildImportIndex(allPaths) {
+  const bySuffix = new Map();
+  for (const p of allPaths) {
+    const segs = p.replace(/\.[^.]+$/, "").split("/");
+    let suf = "";
+    for (let i = segs.length - 1; i >= 0; i--) {
+      suf = suf ? `${segs[i]}/${suf}` : segs[i];
+      if (!bySuffix.has(suf)) bySuffix.set(suf, p);
+    }
+  }
+  return { paths: allPaths, bySuffix };
+}
+
+function resolveImport(mod, srcPath, index) {
   if (mod.startsWith(".")) {
     const base = path.dirname(absPath(srcPath));
     const raw = path.resolve(base, mod);
@@ -211,7 +249,7 @@ function resolveImport(mod, srcPath, allPaths) {
         let rel = path.relative(root, raw + suffix).replaceAll("\\", "/");
         if (rel.startsWith("..")) continue;
         rel = p ? `${p}/${rel}` : rel;
-        if (allPaths.has(rel)) return rel;
+        if (index.paths.has(rel)) return rel;
       }
     }
     return null;
@@ -219,11 +257,7 @@ function resolveImport(mod, srcPath, allPaths) {
   let m = mod;
   for (const prefix of config.aliasPrefixes) if (m.startsWith(prefix)) m = m.slice(prefix.length);
   const tail = m.replaceAll(".", "/").replaceAll("::", "/").replaceAll("\\", "/");
-  for (const p of allPaths) {
-    const stem = p.replace(/\.[^.]+$/, "");
-    if (stem.endsWith(tail)) return p;
-  }
-  return null;
+  return (tail && index.bySuffix.get(tail)) || null;
 }
 
 // -------------------------------------------------------------------- lock
@@ -385,14 +419,40 @@ function repoFiles() {
   return out;
 }
 
+// Prepared statements at connection lifetime. indexFile used to db.prepare()
+// ~10 statements per FILE — a SQL compile each, dominating small-file cost.
+const STMT_CACHE = new WeakMap();
+function stmts(db) {
+  let s = STMT_CACHE.get(db);
+  if (!s) {
+    s = {
+      selPrev: db.prepare("SELECT hash, size, mtime FROM files WHERE path=?"),
+      updStat: db.prepare("UPDATE files SET size=?, mtime=? WHERE path=?"),
+      delChunksByPath: db.prepare("DELETE FROM chunks WHERE path=?"),
+      selOldId: db.prepare("SELECT id FROM files WHERE path=?"),
+      selKeptEdges: db.prepare("SELECT src, dst, kind FROM edges WHERE (src=? OR dst=?) AND kind != 'import'"),
+      delFileByPath: db.prepare("DELETE FROM files WHERE path=?"),
+      insFile: db.prepare("INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime, is_test) VALUES(?,?,?,?,?,?,?,?)"),
+      insEdge: db.prepare("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,?)"),
+      insSym: db.prepare("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,?)"),
+      insCall: db.prepare("INSERT INTO calls(src_symbol, callee, line) VALUES(?,?,?)"),
+      insTc: db.prepare("INSERT INTO test_cases(file_id, name, line) VALUES(?,?,?)"),
+      insChunk: db.prepare("INSERT INTO chunks(path, start_line, content) VALUES(?,?,?)"),
+    };
+    STMT_CACHE.set(db, s);
+  }
+  return s;
+}
+
 async function indexFile(db, relpath, force = false) {
+  const S = stmts(db);
   const full = absPath(relpath);
   let text;
   let st;
   try {
     st = fs.statSync(full);
     if (st.size > config.maxFileBytes) { log("DEBUG", `skip large: ${relpath}`); return null; }
-    const prev = db.prepare("SELECT hash, size, mtime FROM files WHERE path=?").get(relpath);
+    const prev = S.selPrev.get(relpath);
     // fast path 1: identical stat -> already indexed, nothing to do (PDFs seen once stay seen)
     if (!force && prev && prev.size === st.size && prev.mtime === st.mtimeMs) return "unchanged";
     // checksum of RAW BYTES, computed before any extraction: a touched-but-identical
@@ -400,7 +460,7 @@ async function indexFile(db, relpath, force = false) {
     const buf = fs.readFileSync(full);
     var hash = createHash("sha1").update(buf).digest("hex");
     if (!force && prev && prev.hash === hash) {
-      db.prepare("UPDATE files SET size=?, mtime=? WHERE path=?").run(st.size, st.mtimeMs, relpath);
+      S.updStat.run(st.size, st.mtimeMs, relpath);
       return "unchanged";
     }
     if (relpath.toLowerCase().endsWith(".pdf")) {
@@ -416,23 +476,17 @@ async function indexFile(db, relpath, force = false) {
   } catch (e) { log("DEBUG", `skip unreadable: ${relpath} (${e.code ?? e.message})`); return null; }
   const lang = LANG_BY_EXT[path.extname(full).toLowerCase()] ?? "other";
   const isTest = isTestPath(relpath) ? 1 : 0;
+  const lines = text.split("\n"); // split once; reused for the line count and chunking
 
-  db.prepare("DELETE FROM chunks WHERE path=?").run(relpath);
-  const old = db.prepare("SELECT id FROM files WHERE path=?").get(relpath);
+  S.delChunksByPath.run(relpath);
+  const old = S.selOldId.get(relpath);
   // Non-import edges (e.g. SCIP-derived 'ref') are owned by other passes; the
   // file-row swap below cascade-deletes them, so carry them over to the new id.
-  const keptEdges = old
-    ? db.prepare("SELECT src, dst, kind FROM edges WHERE (src=? OR dst=?) AND kind != 'import'").all(old.id, old.id)
-    : [];
-  db.prepare("DELETE FROM files WHERE path=?").run(relpath);
-  const fid = db.prepare(
-    "INSERT INTO files(path, lang, hash, lines, indexed_at, size, mtime, is_test) VALUES(?,?,?,?,?,?,?,?)"
-).run(relpath, lang, hash, text.split("\n").length, Date.now() / 1000, st.size, st.mtimeMs, isTest).lastInsertRowid;
-  const insKept = db.prepare("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,?)");
-  for (const e of keptEdges) insKept.run(e.src === old.id ? fid : e.src, e.dst === old.id ? fid : e.dst, e.kind);
+  const keptEdges = old ? S.selKeptEdges.all(old.id, old.id) : [];
+  S.delFileByPath.run(relpath);
+  const fid = S.insFile.run(relpath, lang, hash, lines.length, Date.now() / 1000, st.size, st.mtimeMs, isTest).lastInsertRowid;
+  for (const e of keptEdges) S.insEdge.run(e.src === old.id ? fid : e.src, e.dst === old.id ? fid : e.dst, e.kind);
 
-  const insSym = db.prepare("INSERT INTO symbols(file_id, name, kind, line, signature, parent) VALUES(?,?,?,?,?,?)");
-  const insCall = db.prepare("INSERT INTO calls(src_symbol, callee, line) VALUES(?,?,?)");
   const ext = path.extname(full).toLowerCase();
   let ast = null;
   if (AST_LANGS.has(lang)) {
@@ -442,47 +496,49 @@ async function indexFile(db, relpath, force = false) {
   if (ast) {
     const idByName = new Map();
     for (const s of ast.symbols) {
-      const r = insSym.run(fid, s.name, s.kind, s.line, s.sig ?? "", s.parent ?? null);
+      const r = S.insSym.run(fid, s.name, s.kind, s.line, s.sig ?? "", s.parent ?? null);
       if (!idByName.has(s.name)) idByName.set(s.name, r.lastInsertRowid);
     }
     for (const c of ast.calls) {
       const src = c.caller ? idByName.get(c.caller) : null;
-      if (src) insCall.run(src, c.callee, c.line);
+      if (src) S.insCall.run(src, c.callee, c.line);
     }
   } else {
-    for (const s of extractSymbols(lang, text)) insSym.run(fid, s.name, s.kind, s.line, s.sig, null);
+    for (const s of extractSymbols(lang, text)) S.insSym.run(fid, s.name, s.kind, s.line, s.sig, null);
   }
 
   if (isTest) {
     // behaviors, not helpers: annotation-gated for JUnit, so a @KafkaListener
     // method inside a test class never lands here
-    const insTc = db.prepare("INSERT INTO test_cases(file_id, name, line) VALUES(?,?,?)");
     const tcRe = lang === "java" || lang === "kotlin"
       ? /@(?:Test|ParameterizedTest|RepeatedTest|TestFactory)\b[\s\S]{0,300}?(?:void|fun)\s+(\w+)\s*\(/g
       : lang === "typescript" || lang === "javascript"
         ? /\b(?:it|test)(?:\.each\([^)]*\))?\s*\(\s*[`'"]([^`'"]{1,200})[`'"]/g
         : lang === "python" ? /^\s*def\s+(test_\w+)\s*\(/gm : null;
-    if (tcRe) for (const m of text.matchAll(tcRe)) insTc.run(fid, m[1], text.slice(0, m.index).split("\n").length);
+    if (tcRe) {
+      const lineAt = makeLineAt(text);
+      for (const m of text.matchAll(tcRe)) S.insTc.run(fid, m[1], lineAt(m.index));
+    }
   }
 
-  const lines = text.split("\n");
-  const insChunk = db.prepare("INSERT INTO chunks(path, start_line, content) VALUES(?,?,?)");
   for (let start = 0; start < lines.length; start += config.chunkLines) {
     const chunk = lines.slice(start, start + config.chunkLines).join("\n");
-    if (chunk.trim()) insChunk.run(relpath, start + 1, chunk);
+    if (chunk.trim()) S.insChunk.run(relpath, start + 1, chunk);
   }
   return { fid, lang, text, relpath };
 }
 
 function rebuildEdges(db, touched) {
-  const allPaths = new Set(db.prepare("SELECT path FROM files").all().map((r) => r.path));
-  const idByPath = new Map(db.prepare("SELECT id, path FROM files").all().map((r) => [r.path, r.id]));
+  const rows = db.prepare("SELECT id, path FROM files").all();
+  const allPaths = new Set(rows.map((r) => r.path));
+  const idByPath = new Map(rows.map((r) => [r.path, r.id]));
+  const index = buildImportIndex(allPaths); // once per rebuild, not per import
   const del = db.prepare("DELETE FROM edges WHERE src=? AND kind='import'");
   const ins = db.prepare("INSERT OR IGNORE INTO edges(src, dst, kind) VALUES(?,?,'import')");
   for (const t of touched) {
     del.run(t.fid);
     for (const mod of extractImports(t.lang, t.text)) {
-      const dst = resolveImport(mod, t.relpath, allPaths);
+      const dst = resolveImport(mod, t.relpath, index);
       if (dst && dst !== t.relpath && idByPath.has(dst)) ins.run(t.fid, idByPath.get(dst));
     }
   }
@@ -551,12 +607,28 @@ async function kafkaPass(db, scopePrefixes = null) {
   const putCache = db.prepare("INSERT OR REPLACE INTO extract_cache(path, hash, constants, entities) VALUES(?,?,?,?)");
   const constants = new Map();
   const entityTables = new Map();
+  // LRU-bounded text cache. Unbounded (the old shape), the whole tracked corpus
+  // lives in RSS for the entire pass — a 100 MB SQL dump included. Over the cap,
+  // the least-recently-used texts fall out and are re-read on next use.
+  const TEXT_MEMO_CAP = 64 * 1024 * 1024; // chars ≈ bytes for code
   const textMemo = new Map();
+  let memoChars = 0;
   const readText = (rel) => {
-    if (!textMemo.has(rel)) {
-      try { textMemo.set(rel, fs.readFileSync(absPath(rel), "utf8")); } catch { textMemo.set(rel, null); }
+    if (textMemo.has(rel)) {
+      const v = textMemo.get(rel);
+      textMemo.delete(rel); textMemo.set(rel, v); // refresh recency
+      return v;
     }
-    return textMemo.get(rel);
+    let t = null;
+    try { t = fs.readFileSync(absPath(rel), "utf8"); } catch { t = null; }
+    textMemo.set(rel, t);
+    memoChars += t?.length ?? 0;
+    while (memoChars > TEXT_MEMO_CAP && textMemo.size > 1) {
+      const [k, v] = textMemo.entries().next().value; // oldest = least recently used
+      textMemo.delete(k);
+      memoChars -= v?.length ?? 0;
+    }
+    return t;
   };
   for (const rel of javaish) {
     const fh = idByPath.get(rel)?.hash;
@@ -942,12 +1014,13 @@ async function fullIndex(db, rebuild = false) {
     try { db.exec("DELETE FROM extract_cache"); db.exec("DELETE FROM meta WHERE key='config_fp'"); } catch { /* fresh db */ }
   }
   const tracked = new Set(files);
+  const S = stmts(db);
   // prune files no longer tracked
   let removed = 0;
   for (const { path: p } of db.prepare("SELECT path FROM files").all()) {
     if (!tracked.has(p)) {
-      db.prepare("DELETE FROM files WHERE path=?").run(p);
-      db.prepare("DELETE FROM chunks WHERE path=?").run(p);
+      S.delFileByPath.run(p);
+      S.delChunksByPath.run(p);
       removed++;
     }
   }
@@ -961,6 +1034,11 @@ async function fullIndex(db, rebuild = false) {
   rebuildEdges(db, touched);
   await kafkaPass(db, null);
   stamp(db);
+  if (touched.length > 200) {
+    // merge FTS b-trees after a bulk load; per-file inserts leave many small
+    // segments that slow every MATCH until merged
+    try { db.exec("INSERT INTO chunks(chunks) VALUES('optimize')"); } catch { /* never fatal */ }
+  }
   log("INFO", `Full index: ${touched.length} (re)indexed, ${skipped} unchanged (cached), ${removed} removed of ${files.length} tracked in ${Date.now() - t0}ms`);
   });
 }
@@ -993,9 +1071,10 @@ async function incrementalIndex(db) {
   if (relevant.length > Math.max(50, 0.4 * total)) { log("INFO", "Diff too large; full reindex"); return fullIndex(db); }
 
   return inTx(db, async () => {
+  const S = stmts(db);
   for (const p of deleted) {
-    db.prepare("DELETE FROM files WHERE path=?").run(p);
-    db.prepare("DELETE FROM chunks WHERE path=?").run(p);
+    S.delFileByPath.run(p);
+    S.delChunksByPath.run(p);
   }
   const touched = [];
   for (const p of relevant) { const r = await indexFile(db, p); if (r) touched.push(r); }
