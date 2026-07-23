@@ -29,8 +29,8 @@ try { a = JSON.parse(process.argv[2] ?? ""); } catch { die("annotate expects one
 const author = a.author || "human";
 
 if (a.action === "insight") {
-  if (!["module", "file"].includes(a.kind) || !(a.summary?.length >= 40) || !a.target) {
-    die("insight needs target, kind (module|file), and a summary of at least 40 chars.");
+  if (!["module", "file", "topic", "table"].includes(a.kind) || !(a.summary?.length >= 40) || !a.target) {
+    die("insight needs target, kind (module|file|topic|table), and a summary of at least 40 chars.");
   }
   const db = new Database(DB_PATH);
   try {
@@ -40,10 +40,10 @@ if (a.action === "insight") {
     if (a.kind === "file") {
       h = db.prepare("SELECT hash FROM files WHERE path=?").get(a.target)?.hash ?? "";
       if (!h) die(`File '${a.target}' is not in the index (paths are repo-prefixed in a multi-repo workspace).`);
-    } else {
+    } else if (a.kind === "module") {
       const hs = db.prepare("SELECT hash FROM files WHERE path LIKE ? ORDER BY path").all(a.target + "/%").map((r) => r.hash ?? "");
       h = crypto.createHash("sha1").update(hs.join("|")).digest("hex");
-    }
+    } // topic/table notes have no single backing file; they don't auto-stale
     db.prepare("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)")
       .run(a.target, a.kind, h, a.summary.slice(0, 4000), `${author}:graph-view`, Date.now() / 1000);
   } finally { db.close(); }

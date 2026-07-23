@@ -353,7 +353,19 @@ function showDetails(d) {
       ${t.config_keys ? `<div class="muted">declared in config: ${t.config_keys.map(esc).join(", ")}</div>` : ""}
       <h4>Producers</h4>${(t.producers.items || []).map((s) => siteRow(s)).join("") || '<div class="muted">none</div>'}${moreRow(t.producers)}
       <h4>Consumers</h4>${(t.consumers.items || []).map((s) => siteRow(s)).join("") || '<div class="muted">none</div>'}${moreRow(t.consumers)}
-      ${t.test_sites ? `<h4>Test usage</h4>${(t.test_sites.items || []).map((s) => siteRow(s)).join("")}` : ""}`;
+      ${t.test_sites ? `<h4>Test usage</h4>${(t.test_sites.items || []).map((s) => siteRow(s)).join("")}` : ""}
+      <h4>Annotate</h4>${noteForm(t.topic, "topic")}
+      ${(() => {
+        const anchor = (t.producers.items || [])[0] || (t.consumers.items || [])[0];
+        return anchor ? `<h4>Assert a missing producer/consumer</h4>
+        <form class="annotate" data-assert='${esc(JSON.stringify({ kind: "kafka", topic: t.topic, file: anchor.path, line: anchor.line }))}'>
+          <select name="direction"><option>produce</option><option>consume</option></select>
+          <textarea name="evidence" placeholder="Evidence (≥20 chars): quote the code that convinced you"></textarea>
+          <select name="confidence"><option>high</option><option selected>medium</option><option>low</option></select>
+          <button type="submit">Assert into graph</button>
+          <div class="hint">Anchored to ${esc(anchor.path)}:${anchor.line} — git-versioned, provenance “human”.</div>
+        </form>` : "";
+      })()}`;
   } else if (d.type === "table") {
     const t = d.ref;
     const w = t.warnings || {};
@@ -369,7 +381,8 @@ function showDetails(d) {
           <select name="confidence"><option>high</option><option selected>medium</option><option>low</option></select>
           <button type="submit">Assert into graph</button>
           <div class="hint">Writes docs/graph-assertions.json — git-versioned, PR-reviewed, provenance “human”.</div>
-        </form>` : ""}`;
+        </form>` : ""}
+      <h4>Annotate</h4>${noteForm(t.table, "table")}`;
   } else if (d.type === "endpoint") {
     const e = d.ref;
     const w = e.warnings || {};
@@ -461,6 +474,7 @@ function bindDetailHandlers(root) {
       if (evidence.length < 20) { toast("Evidence must be at least 20 characters, quote the code that convinced you.", true); return; }
       const payload = { action: "assert", ...base, evidence, confidence: (fd.get("confidence") || "medium").toString() };
       if (fd.get("topic")) payload.topic = fd.get("topic").toString().trim();
+      if (fd.get("direction")) payload.direction = fd.get("direction").toString();
       vscode.postMessage({ type: "annotate", payload });
     }
   }));

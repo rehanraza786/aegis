@@ -31,7 +31,10 @@ The post-review release. Highlights, roughly in the order they landed:
   entries floating to the top as a re-verification worklist, backed by two new
   annotate actions — `retract` and `reaffirm` (source_hash moves to the
   evidence file's current hash) — in both editions, suite-pinned; module
-  notes show their text in details.
+  notes show their text in details. Notes attach to topics and tables too
+  (insight kinds widened past module|file), and a topic node offers a
+  directional assert form anchored to a real site — the graph is editable
+  wherever it makes a claim.
   Then the viewing pass: search over every node (`/`, arrows, Enter jumps and
   focuses), click-to-focus dims everything outside the neighborhood (Esc
   restores), the HTTP-endpoint layer finally renders (green tags, serves/calls
