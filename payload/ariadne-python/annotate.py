@@ -105,5 +105,45 @@ elif a.get("action") == "assert":
           f"It enters the graph on the next index, marked STALE automatically if {a['file']} changes. "
           "Commit the file to share it.")
 
+elif a.get("action") in ("retract", "reaffirm"):
+    # lifecycle for existing assertions, keyed by the same natural key the
+    # no-duplicate filter uses. retract removes; reaffirm re-verifies: the
+    # source_hash moves to the evidence file's CURRENT hash, clearing STALE.
+    af = ROOT / "docs" / "graph-assertions.json"
+    if not af.exists():
+        die("docs/graph-assertions.json does not exist; nothing to modify.")
+    try:
+        alist = json.loads(af.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        die(f"docs/graph-assertions.json is not valid JSON ({e}). Fix it first.")
+    if not isinstance(alist, list):
+        die("docs/graph-assertions.json is not a JSON array. Fix it first.")
+
+    def key(x):
+        return "|".join(str(v) for v in (x.get("kind"), x.get("file"), x.get("line", 0),
+                                         x.get("topic", ""), x.get("table", ""), x.get("path", "")))
+    target = key(a)
+    hits = [x for x in alist if key(x) == target]
+    if not hits:
+        die("No matching assertion found in docs/graph-assertions.json (key: kind+file+line+topic/table/path).")
+    if a["action"] == "retract":
+        alist = [x for x in alist if key(x) != target]
+        af.write_text(json.dumps(alist, indent=2) + "\n", encoding="utf-8")
+        print(f"Retracted {len(hits)} assertion(s) (by: {author}); {len(alist)} remain. "
+              "Reindex removes it from the graph; commit the file to share.")
+    else:
+        con = sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)
+        row = con.execute("SELECT hash FROM files WHERE path=?", (a.get("file"),)).fetchone()
+        con.close()
+        if not row or not row[0]:
+            die(f"File '{a.get('file')}' is not in the index; cannot reaffirm against it.")
+        for x in alist:
+            if key(x) == target:
+                x["source_hash"] = row[0]
+                x["reaffirmed_at"] = datetime.date.today().isoformat()
+                x["reaffirmed_by"] = author
+        af.write_text(json.dumps(alist, indent=2) + "\n", encoding="utf-8")
+        print(f"Reaffirmed {len(hits)} assertion(s) against the current {a.get('file')} (by: {author}). "
+              "STALE clears on the next index.")
 else:
-    die('action must be "insight" or "assert".')
+    die('action must be "insight", "assert", "retract", or "reaffirm".')

@@ -941,6 +941,37 @@ await c.close();
     check("annotate: asserted edge enters the graph with human provenance",
           srow is not None and srow[0] == "asserted:human", str(srow))
 
+    # ---- assertion lifecycle: stale -> reaffirm clears it; retract removes it ----
+    seg = gap_row[0].split("/")[0]
+    gp = ws / gap_row[0]
+    gp.write_text(gp.read_text(encoding="utf-8") + "// evidence file moved on\n", encoding="utf-8")
+    git(["add", "-A"], ws / seg)
+    git(["commit", "-qm", "touch evidence file"], ws / seg)
+    run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    cur_hash = db.execute("SELECT hash FROM files WHERE path=?", (gap_row[0],)).fetchone()[0]
+    a_hash = db.execute("SELECT source_hash FROM assertions WHERE kind='kafka' AND file_path=?",
+                        (gap_row[0],)).fetchone()[0]
+    db.close()
+    check("assertion goes stale when its evidence file changes", a_hash != cur_hash)
+    code, orf = run(exe + [an, json.dumps({"action": "reaffirm", "kind": "kafka", "file": gap_row[0],
+                                           "line": 601, "topic": "orders.created.manual"})], ws)
+    alist = json.loads((ws / "docs" / "graph-assertions.json").read_text(encoding="utf-8"))
+    hit = [x for x in alist if x.get("topic") == "orders.created.manual"]
+    check("annotate: reaffirm moves source_hash to the file's current hash",
+          code == 0 and hit and hit[0].get("source_hash") == cur_hash
+          and hit[0].get("reaffirmed_by") == "human", orf[-200:])
+    code, ort = run(exe + [an, json.dumps({"action": "retract", "kind": "kafka", "file": gap_row[0],
+                                           "line": 601, "topic": "orders.created.manual"})], ws)
+    alist = json.loads((ws / "docs" / "graph-assertions.json").read_text(encoding="utf-8"))
+    check("annotate: retract removes the assertion from the source of truth",
+          code == 0 and not any(x.get("topic") == "orders.created.manual" for x in alist), ort[-200:])
+    run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("retracted assertion leaves the graph on reindex",
+          db.execute("SELECT 1 FROM msg_edges WHERE topic='orders.created.manual'").fetchone() is None)
+    db.close()
+
     # ---- non-JVM seams: endpoints, migrations, brokers, config-declared topics ----
     db = sqlite3.connect(ws / ".ariadne" / "index.db")
     db.row_factory = sqlite3.Row

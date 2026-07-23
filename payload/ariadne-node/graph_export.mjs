@@ -175,13 +175,20 @@ const gaps = {
 const fileHash = new Map(q("SELECT path, hash FROM files").map((r) => [r.path, r.hash]));
 const annotations = {
   insights: has("insights")
-    ? q("SELECT target, kind, model, hash FROM insights ORDER BY target").slice(0, MAX_ITEMS)
-        .map((r) => ({ target: r.target, kind: r.kind, by: r.model }))
+    ? q("SELECT target, kind, model, hash, summary FROM insights ORDER BY target").slice(0, MAX_ITEMS)
+        .map((r) => ({ target: r.target, kind: r.kind, by: r.model, summary: String(r.summary ?? "").slice(0, 300) }))
     : [],
   assertions: has("assertions")
-    ? q("SELECT kind, file_path, line, confidence, author, source_hash FROM assertions ORDER BY file_path").slice(0, MAX_ITEMS)
-        .map((r) => ({ kind: r.kind, file: r.file_path, line: r.line, confidence: r.confidence, author: r.author,
-                       ...(r.source_hash && fileHash.get(r.file_path) !== r.source_hash ? { stale: true } : {}) }))
+    ? q("SELECT kind, payload, file_path, line, confidence, author, source_hash FROM assertions ORDER BY file_path").slice(0, MAX_ITEMS)
+        .map((r) => {
+          let p = {};
+          try { p = JSON.parse(r.payload ?? "{}"); } catch { /* legacy row */ }
+          return { kind: r.kind, file: r.file_path, line: r.line, confidence: r.confidence, author: r.author,
+            ...(p.topic ? { topic: p.topic } : {}), ...(p.direction ? { direction: p.direction } : {}),
+            ...(p.table ? { table: p.table } : {}), ...(p.path ? { path: p.path } : {}),
+            ...(p.evidence ? { evidence: String(p.evidence).slice(0, 200) } : {}),
+            ...(r.source_hash && fileHash.get(r.file_path) !== r.source_hash ? { stale: true } : {}) };
+        })
     : [],
 };
 
