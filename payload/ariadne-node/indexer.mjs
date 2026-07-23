@@ -428,7 +428,12 @@ function stmts(db) {
     s = {
       selPrev: db.prepare("SELECT hash, size, mtime FROM files WHERE path=?"),
       updStat: db.prepare("UPDATE files SET size=?, mtime=? WHERE path=?"),
-      delChunksByPath: db.prepare("DELETE FROM chunks WHERE path=?"),
+      // FTS5 can't index a plain WHERE path=? — it full-scans the whole chunk
+      // table PER FILE (measured 37.5ms at 100k chunks). The trigram tokenizer
+      // serves LIKE from the index (plan L0, 1.06ms, 35×); the AND path=? keeps
+      // exactness because `_`/`%` in real paths are LIKE wildcards and a bare
+      // LIKE over-matches sibling files. Bind the same path to both params.
+      delChunksByPath: db.prepare("DELETE FROM chunks WHERE path LIKE ? AND path=?"),
       selOldId: db.prepare("SELECT id FROM files WHERE path=?"),
       selKeptEdges: db.prepare("SELECT src, dst, kind FROM edges WHERE (src=? OR dst=?) AND kind != 'import'"),
       delFileByPath: db.prepare("DELETE FROM files WHERE path=?"),
@@ -478,7 +483,7 @@ async function indexFile(db, relpath, force = false) {
   const isTest = isTestPath(relpath) ? 1 : 0;
   const lines = text.split("\n"); // split once; reused for the line count and chunking
 
-  S.delChunksByPath.run(relpath);
+  S.delChunksByPath.run(relpath, relpath);
   const old = S.selOldId.get(relpath);
   // Non-import edges (e.g. SCIP-derived 'ref') are owned by other passes; the
   // file-row swap below cascade-deletes them, so carry them over to the new id.
@@ -1005,7 +1010,7 @@ async function fullIndex(db, rebuild = false) {
       return;
     }
   }
-  return inTx(db, async () => {
+  const r = await inTx(db, async () => {
   if (rebuild) {
     // Deleting files cascade-wipes every correlation row, so the extraction cache
     // MUST go too, otherwise the passes compare hashes, conclude "nothing changed",
@@ -1020,7 +1025,7 @@ async function fullIndex(db, rebuild = false) {
   for (const { path: p } of db.prepare("SELECT path FROM files").all()) {
     if (!tracked.has(p)) {
       S.delFileByPath.run(p);
-      S.delChunksByPath.run(p);
+      S.delChunksByPath.run(p, p);
       removed++;
     }
   }
@@ -1041,6 +1046,10 @@ async function fullIndex(db, rebuild = false) {
   }
   log("INFO", `Full index: ${touched.length} (re)indexed, ${skipped} unchanged (cached), ${removed} removed of ${files.length} tracked in ${Date.now() - t0}ms`);
   });
+  // outside the tx (a checkpoint inside one is a no-op): the mega-transaction
+  // balloons the -wal file to ~DB size and it then sits on disk indefinitely
+  try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* never fatal */ }
+  return r;
 }
 
 async function incrementalIndex(db) {
@@ -1074,7 +1083,7 @@ async function incrementalIndex(db) {
   const S = stmts(db);
   for (const p of deleted) {
     S.delFileByPath.run(p);
-    S.delChunksByPath.run(p);
+    S.delChunksByPath.run(p, p);
   }
   const touched = [];
   for (const p of relevant) { const r = await indexFile(db, p); if (r) touched.push(r); }
@@ -1107,6 +1116,8 @@ if (mode === "--status") {
   try {
     const db = connect();
     mode === "--incremental" ? await incrementalIndex(db) : await fullIndex(db, mode === "--rebuild");
+    // keep the query planner's stats current as the graph grows; near-zero cost
+    try { db.pragma("optimize"); } catch { /* never fatal */ }
   } catch (e) {
     log("ERROR", e.stack ?? String(e));
     process.exitCode = 1;

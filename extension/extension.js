@@ -207,13 +207,11 @@ async function enrichViaCopilot(context) {
   const models = await vscode.lm.selectChatModels({ vendor: "copilot" });
   if (!models.length) { vscode.window.showWarningMessage("AEGIS: no Copilot chat model available (is Copilot signed in?)."); return; }
   const model = models[0];
-  const cp = require("child_process");
   const os = require("os");
-  const exe = runtime === "node" ? "node" : (process.platform === "win32" ? "python" : "python3");
-  const script = path.join(root, ".ariadne", runtime === "node" ? "enrich.mjs" : "enrich.py");
+  const script = runtime === "node" ? "enrich.mjs" : "enrich.py";
   let plan;
   try {
-    plan = JSON.parse(cp.execFileSync(exe, [script, "--plan"], { cwd: root, env: { ...process.env, ...workspaceEnv() }, encoding: "utf8" }));
+    plan = JSON.parse(await runtimeExec(root, runtime, script, ["--plan"]));
   } catch (err) { vscode.window.showErrorMessage(`AEGIS enrich --plan failed: ${err.message}`); return; }
   if (!plan.length) { vscode.window.showInformationMessage("AEGIS: all insights are current (hash-cached), nothing to enrich."); return; }
   const results = [];
@@ -235,7 +233,7 @@ async function enrichViaCopilot(context) {
   const tmp = path.join(os.tmpdir(), `aegis-insights-${Date.now()}.json`);
   fs.writeFileSync(tmp, JSON.stringify(results));
   try {
-    cp.execFileSync(exe, [script, "--apply", tmp], { cwd: root, env: { ...process.env, ...workspaceEnv() } });
+    await runtimeExec(root, runtime, script, ["--apply", tmp]);
     vscode.window.showInformationMessage(`AEGIS: ${results.length} insights saved (Copilot). Agents can read them via the explain tool.`);
   } catch (err) { vscode.window.showErrorMessage(`AEGIS apply failed: ${err.message}`); }
   finally { try { fs.unlinkSync(tmp); } catch { /* ignore */ } }
@@ -246,11 +244,17 @@ async function enrichViaCopilot(context) {
  *  annotate.mjs/.py, the same provenance-preserving paths agents use, so a
  *  human's note or assertion is labeled as human, git-versioned, and consumable
  *  by every agent via explain/context_pack/message_flow. */
+/** Async exec: the graph panel used execFileSync here, which froze the ENTIRE
+ *  extension host for the duration of every export/annotate on big repos.
+ *  Same contract (resolves stdout), but the editor stays responsive. */
 function runtimeExec(root, runtime, script, args = []) {
   const cp = require("child_process");
   const exe = runtime === "node" ? "node" : (process.platform === "win32" ? "python" : "python3");
-  return cp.execFileSync(exe, [path.join(root, ".ariadne", script), ...args],
-    { cwd: root, env: { ...process.env, ...workspaceEnv() }, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  return new Promise((resolve, reject) => {
+    cp.execFile(exe, [path.join(root, ".ariadne", script), ...args],
+      { cwd: root, env: { ...process.env, ...workspaceEnv() }, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+      (err, stdout, stderr) => (err ? reject(Object.assign(err, { stderr })) : resolve(stdout)));
+  });
 }
 
 function openGraphPanel(context) {
@@ -272,14 +276,20 @@ function openGraphPanel(context) {
   panel.webview.html = fs.readFileSync(path.join(context.extensionPath, "graph-view.html"), "utf8")
     .replaceAll("__NONCE__", nonce).replaceAll("__CYTOSCAPE__", String(cytoUri));
 
-  const send = (keepPositions) => {
+  const send = async (keepPositions) => {
     try {
-      const graph = JSON.parse(runtimeExec(root, runtime, `graph_export.${suffix}`));
+      const graph = JSON.parse(await runtimeExec(root, runtime, `graph_export.${suffix}`));
       panel.webview.postMessage({ type: "data", graph, keepPositions: !!keepPositions });
     } catch (e) {
       panel.webview.postMessage({ type: "toast", message: `Graph export failed: ${String(e.stderr || e.message).trim()}`, isError: true });
     }
   };
+  // Reindex used by the stale banner and the post-assert flow: INCREMENTAL —
+  // the assertions pass runs on every incremental, so a full rebuild here was
+  // pure waste — with progress, never blocking the host.
+  const reindex = (title) => vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title },
+    () => runtimeExec(root, runtime, runtime === "node" ? "indexer.mjs" : "indexer.py", ["--incremental"]));
   // multi-root workspaces index repo-prefixed paths; resolve the prefix back to a folder
   const absOf = (rel) => {
     const seg = rel.split("/")[0];
@@ -288,7 +298,15 @@ function openGraphPanel(context) {
   };
   panel.webview.onDidReceiveMessage(async (m) => {
     if (m.type === "ready" || m.type === "refresh") {
-      send(m.type === "refresh");
+      await send(m.type === "refresh");
+    } else if (m.type === "reindex") {
+      try {
+        await reindex("AEGIS: reindexing (incremental)…");
+        panel.webview.postMessage({ type: "toast", message: "Index refreshed." });
+      } catch (e) {
+        panel.webview.postMessage({ type: "toast", message: String(e.stderr || e.message).trim(), isError: true });
+      }
+      await send(true);
     } else if (m.type === "openFile") {
       try {
         const doc = await vscode.workspace.openTextDocument(absOf(m.path));
@@ -299,20 +317,14 @@ function openGraphPanel(context) {
       } catch { vscode.window.showWarningMessage(`AEGIS: cannot open ${m.path}`); }
     } else if (m.type === "annotate") {
       try {
-        const res = runtimeExec(root, runtime, `annotate.${suffix}`, [JSON.stringify(m.payload)]);
+        const res = await runtimeExec(root, runtime, `annotate.${suffix}`, [JSON.stringify(m.payload)]);
         panel.webview.postMessage({ type: "toast", message: res.trim() });
         if (m.payload.action === "assert") {
-          const pick = await vscode.window.showInformationMessage(
-            "AEGIS: assertion recorded in docs/graph-assertions.json. Reindex now so it enters the graph?", "Reindex", "Later");
-          if (pick === "Reindex") {
-            const cp = require("child_process");
-            const exe = runtime === "node" ? "node" : (process.platform === "win32" ? "python" : "python3");
-            cp.execFile(exe, [indexerPath(root, runtime), "--full"],
-              { cwd: root, env: { ...process.env, ...workspaceEnv() } }, () => send(true));
-          }
-        } else {
-          send(true);
+          // one gesture, no modal: record → incremental reindex → the dashed
+          // edge appears. (The old flow asked a question and then ran --full.)
+          await reindex("AEGIS: ingesting assertion (incremental reindex)…");
         }
+        await send(true);
       } catch (e) {
         panel.webview.postMessage({ type: "toast", message: String(e.stderr || e.message).trim(), isError: true });
       }

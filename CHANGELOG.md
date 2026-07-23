@@ -19,7 +19,13 @@ The post-review release. Highlights, roughly in the order they landed:
 - **Graph view:** `AEGIS: Open Graph View` renders modules/topics/tables with
   warnings badged and asserted edges dashed; the Gaps panel is a human worklist
   whose annotations flow back with their own provenance (`asserted:human`).
-  New `graph_export` (documented JSON contract) and `annotate` CLIs.
+  New `graph_export` (documented JSON contract) and `annotate` CLIs. The panel
+  never freezes the editor anymore (exports/annotations run async), a stale
+  index announces itself with a banner + one-click incremental reindex (the
+  export now carries `indexed_sha`/`head_sha`/`fresh`, verified per root in
+  multi-repo workspaces), the selected node survives refreshes, capped lists
+  read "showing N of M" instead of truncating silently, and submitting an
+  assertion auto-ingests it via incremental reindex — no modal, no `--full`.
 - **Performance:** FK indexes on every cascade path — a 200-file incremental
   reindex drops ~2.7× on a 1,540-file repo. Then the deep pass: newline-offset
   line math (the per-match prefix re-scan was O(text²) on big files),
@@ -30,7 +36,11 @@ The post-review release. Highlights, roughly in the order they landed:
   LRU-bounded (64 MB) extraction text cache, FTS segment merge after bulk
   loads, and a cached read-only server connection (Python) — a cold full index
   drops 8.3× on a 1,500-file repo and 15.4× on a 5,000-file repo (Python
-  edition; identical graph rows), with `tests/bench.py` to reproduce.
+  edition; identical graph rows), with `tests/bench.py` to reproduce. FTS
+  chunk deletes now ride the trigram index instead of full-scanning the
+  chunk table per file (measured 35× at 100k chunks, exactness pinned by a
+  suite check), the WAL file is truncated after full indexes instead of
+  sitting at ~DB size, and `PRAGMA optimize` runs on indexer exit.
 - **Extensibility:** extractor hooks accept a file scope (`{ fn, files: /\.go$/ }`)
   and run over any tracked file, making non-JVM stacks first-class; sample
   file-scoped extractor included.
