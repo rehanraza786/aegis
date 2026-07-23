@@ -104,6 +104,7 @@ async function install(context, withAriadne) {
       copyIfAbsent(path.join(payload, "install-hooks.sh"), path.join(root, ".ariadne", "install-hooks.sh"), log);
       copyIfAbsent(path.join(payload, "pull-index.sh"), path.join(root, ".ariadne", "pull-index.sh"), log);
       copyIfAbsent(path.join(payload, "gitlab-ci-aegis.yml"), path.join(root, "gitlab-ci-aegis.yml"), log);
+      copyIfAbsent(path.join(payload, "github-actions-aegis.yml"), path.join(root, "github-actions-aegis.yml"), log);
     }
   } catch (e) {
     vscode.window.showErrorMessage(`AEGIS install failed: ${e.message}`);
@@ -118,7 +119,7 @@ async function install(context, withAriadne) {
       const rt = runtimeConfig();
       const [cmd, args] = rt === "node"
         ? ["node", [path.join(root, ".ariadne", "setup.mjs")]]
-        : [process.platform === "win32" ? "python" : "python3", [path.join(root, ".ariadne", "setup.py")]];
+        : [process.platform === "win32" ? "python" : "python3", [path.join(root, ".ariadne", "bootstrap.py")]];
       const code = await runProcess("Ariadne setup (dependencies, hooks, initial index)", cmd, args, { cwd: root });
       if (code === 0) vscode.window.showInformationMessage("AEGIS: Ariadne is set up. Open Copilot Chat in agent mode.");
       else vscode.window.showErrorMessage("AEGIS: setup failed, see the AEGIS output channel.");

@@ -888,7 +888,7 @@ await c.close();
     db.close()
 
     # ---- setup script (hooks) ----
-    setup = str(ar / ("setup.mjs" if rt == "node" else "setup.py"))
+    setup = str(ar / ("setup.mjs" if rt == "node" else "bootstrap.py"))
     code, out7 = run(exe + [setup], ws)
     check("setup script exits 0", code == 0, out7[-400:])
     check("hooks installed in all repos",
@@ -973,6 +973,14 @@ await c.close();
                               (TOOLKIT / "payload" / "ariadne-python" / "server.py").read_text(encoding="utf-8")))
     check("node and python tool registries match (24 tools)",
           node_reg == py_reg and len(node_reg) == 24, str(sorted(node_reg ^ py_reg)))
+    # one version identity across every manifest: npm, PyPI, and the CHANGELOG
+    node_ver = json.loads((TOOLKIT / "payload" / "ariadne-node" / "package.json").read_text(encoding="utf-8"))["version"]
+    pym = _re2.search(r'^version\s*=\s*"([^"]+)"',
+                      (TOOLKIT / "payload" / "ariadne-python" / "pyproject.toml").read_text(encoding="utf-8"), _re2.M)
+    chm = _re2.search(r"^## (\d+\.\d+\.\d+)", (TOOLKIT / "CHANGELOG.md").read_text(encoding="utf-8"), _re2.M)
+    check("payload version identity agrees (npm == pypi == CHANGELOG)",
+          pym and chm and node_ver == pym.group(1) == chm.group(1),
+          f"npm={node_ver} pypi={pym and pym.group(1)} changelog={chm and chm.group(1)}")
     # backticked snake_case tokens in prompt bodies are tool references unless
     # they name a known schema/config/result-field concept (allowlist below)
     ALLOW = {"is_test", "msg_edges", "db_access", "db_defs", "http_endpoints", "http_calls",

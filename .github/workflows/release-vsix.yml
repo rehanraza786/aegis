@@ -10,6 +10,11 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # Optional marketplace publishing: set either secret and the matching
+      # step runs; with neither set, the release is Releases-page-only as before.
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -42,3 +47,11 @@ jobs:
             extension/*.vsix
             extension/SHA256SUMS.txt
           generate_release_notes: true
+      - name: Publish to VS Code Marketplace (requires VSCE_PAT + registered publisher)
+        if: env.VSCE_PAT != ''
+        working-directory: extension
+        run: npx vsce publish --packagePath *.vsix --pat "$VSCE_PAT"
+      - name: Publish to Open VSX (covers Cursor/Windsurf/VSCodium; requires OVSX_PAT)
+        if: env.OVSX_PAT != ''
+        working-directory: extension
+        run: npx --yes ovsx publish *.vsix -p "$OVSX_PAT"

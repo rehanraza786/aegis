@@ -1,0 +1,80 @@
+# GitHub Actions: builds the shared ariadne index on every push to the default
+# branch and publishes it as a workflow artifact. Teammates pull it with
+# .ariadne/pull-index.sh (which auto-detects GitHub remotes).
+#
+# Install: copy this file to .github/workflows/aegis-index.yml in your repo.
+# The workflow name MUST stay `aegis-index` — the pull script looks it up by name.
+name: aegis-index
+on:
+  push:
+    branches: [main]        # ADJUST if your default branch differs
+  workflow_dispatch: {}     # allow manual runs from the UI
+permissions:
+  contents: read
+env:
+  TS_PROJECT_DIR: "frontend"          # directory containing tsconfig.json ("" to skip)
+  SCIP_TS_VERSION: "latest"           # pin for reproducible CI once known-good
+  SCIP_JAVA_VERSION: "latest.stable"  # com.sourcegraph:scip-java_2.13
+  COURSIER_VERSION: "v2.1.24"
+jobs:
+  aegis-index:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # full history: indexer stamps SHAs and diffs against them
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      # Reuse the previous run's graph: the indexer skips unchanged files, so a
+      # restored index means only what this push changed gets reindexed. Safe to
+      # lose — a cold cache just builds fresh (corruption is auto-recovered).
+      - uses: actions/cache@v4
+        with:
+          path: .ariadne/index.db
+          key: aegis-index-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: aegis-index-${{ github.ref_name }}-
+      - name: Detect runtime and install dependencies
+        run: |
+          if [ -f .ariadne/indexer.mjs ]; then
+            (cd .ariadne && npm install --silent --no-audit --no-fund)
+            echo "INDEX=node .ariadne/indexer.mjs" >> "$GITHUB_ENV"
+            echo "INGEST=node .ariadne/scip_ingest.mjs" >> "$GITHUB_ENV"
+          else
+            pip install -r .ariadne/requirements.txt
+            echo "INDEX=python3 .ariadne/indexer.py" >> "$GITHUB_ENV"
+            echo "INGEST=python3 .ariadne/scip_ingest.py" >> "$GITHUB_ENV"
+          fi
+      - name: Baseline index
+        run: $INDEX --full
+      - name: scip-typescript (compiler-grade, optional)
+        run: |
+          if [ -n "$TS_PROJECT_DIR" ] && [ -d "$TS_PROJECT_DIR" ]; then
+            (cd "$TS_PROJECT_DIR" \
+              && npm ci \
+              && npx --yes "@sourcegraph/scip-typescript@${SCIP_TS_VERSION}" index --output index.scip) \
+              || echo "WARN: scip-typescript failed; baseline index still published"
+          else
+            echo "TS_PROJECT_DIR '$TS_PROJECT_DIR' not present; skipping"
+          fi
+      - name: scip-java (compiler-grade, optional)
+        run: |
+          (curl -fLo cs.gz "https://github.com/coursier/coursier/releases/download/${COURSIER_VERSION}/cs-x86_64-pc-linux.gz" \
+            && gunzip -f cs.gz && chmod +x cs \
+            && ./cs launch "com.sourcegraph:scip-java_2.13:${SCIP_JAVA_VERSION}" -- index --output java.scip) \
+            || echo "WARN: scip-java failed; baseline index still published"
+      - name: Ingest SCIP output
+        run: $INGEST $(ls "$TS_PROJECT_DIR"/index.scip java.scip 2>/dev/null) || echo "no SCIP output to ingest"
+      - name: Generate flow docs + progress report
+        run: |
+          if [ -f .ariadne/docgen.mjs ]; then node .ariadne/docgen.mjs; else python3 .ariadne/docgen.py; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aegis-index
+          path: |
+            .ariadne/index.db
+            docs/generated/
+          retention-days: 30

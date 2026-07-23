@@ -1,9 +1,25 @@
 {
-  "name": "ariadne-node",
-  "version": "0.1.0",
-  "private": true,
+  "name": "aegis-ariadne",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Ariadne (GraphRAG-style)-style codebase MCP server (Node edition)",
+  "description": "Ariadne: the AEGIS codebase-graph MCP server (Node edition). Indexes code, Kafka topics, DB schema drift, and HTTP seams into SQLite; serves 24 MCP tools to Copilot, Claude, Cursor, or any MCP client.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rehanraza786/aegis",
+    "directory": "payload/ariadne-node"
+  },
+  "homepage": "https://github.com/rehanraza786/aegis#readme",
+  "keywords": ["mcp", "code-graph", "copilot", "claude", "kafka", "liquibase", "static-analysis"],
+  "bin": {
+    "aegis-ariadne": "./server.mjs",
+    "aegis-ariadne-index": "./indexer.mjs",
+    "aegis-ariadne-docgen": "./docgen.mjs"
+  },
+  "files": [
+    "*.mjs",
+    "scip.proto"
+  ],
   "engines": {
     "node": ">=18"
   },

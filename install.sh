@@ -128,6 +128,7 @@ if [ "$WITH_GRAPHRAG" = 1 ]; then
     copy_if_absent "$PAYLOAD/install-hooks.sh" ".ariadne/install-hooks.sh"
     copy_if_absent "$PAYLOAD/pull-index.sh" ".ariadne/pull-index.sh"
     copy_if_absent "$PAYLOAD/gitlab-ci-aegis.yml" "gitlab-ci-aegis.yml"
+    copy_if_absent "$PAYLOAD/github-actions-aegis.yml" "github-actions-aegis.yml"
   else
     echo "-- External graph engine '$ENGINE' selected: skipping .ariadne install, git hooks, and CI job (the engine manages its own index)."
     HINT="$(json_engine_field installHint)"

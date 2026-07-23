@@ -69,6 +69,16 @@ Requirements: git, and either Node ≥18 or Python ≥3.10. VS Code ≥1.99 regi
 
 There is a shell installer too, plus configuration and CI wiring, in [SETUP.md](SETUP.md).
 
+**Not on VS Code?** The engine installs like any package, for any MCP client:
+
+```
+npx aegis-ariadne            # Node edition MCP server — run from your workspace root
+uvx aegis-ariadne            # Python edition (locked-down environments)
+aegis-ariadne-index --full   # build/refresh the index; -docgen for the generated docs
+```
+
+Point Claude Code, Cursor, Zed, or anything else that speaks MCP at that command; the index, config, and extensions still live in your workspace's `.ariadne/`. The vsix flow vendors the same files instead of installing them — both stay supported.
+
 ---
 
 ## Using it

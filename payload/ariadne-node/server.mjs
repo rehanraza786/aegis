@@ -13,8 +13,16 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 import { pathsMatch } from "./http.mjs";
 import fs from "node:fs";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { approvedFiles } from "./trust.mjs";
+
+// The payload finally carries a version identity: surfaced by index_status so
+// "which Ariadne is this workspace running?" is a tool call, not archaeology.
+let PAYLOAD_VERSION = "unknown";
+try {
+  PAYLOAD_VERSION = JSON.parse(fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "package.json"), "utf8")).version ?? "unknown";
+} catch { /* vendored without a manifest */ }
 import path from "node:path";
 
 function git(args) {
@@ -98,7 +106,8 @@ tool(server, "index_status",
     const indexed = d.prepare("SELECT value FROM meta WHERE key='last_sha'").get()?.value ?? null;
     const head = git(["rev-parse", "HEAD"]);
     return { files: c("SELECT COUNT(*) c FROM files"), symbols: c("SELECT COUNT(*) c FROM symbols"),
-      edges: c("SELECT COUNT(*) c FROM edges"), indexed_sha: indexed, head_sha: head, fresh: indexed === head };
+      edges: c("SELECT COUNT(*) c FROM edges"), indexed_sha: indexed, head_sha: head, fresh: indexed === head,
+      payload_version: PAYLOAD_VERSION };
   }));
 
 tool(server, "search_code",
