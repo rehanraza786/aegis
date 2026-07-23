@@ -191,15 +191,31 @@ gaps = {
 }
 
 # ---- annotations ----
+def _assertion_row(r):
+    try:
+        p = json.loads(r["payload"]) if r["payload"] else {}
+    except Exception:  # noqa: BLE001 - legacy row
+        p = {}
+    out = {"kind": r["kind"], "file": r["file_path"], "line": r["line"],
+           "confidence": r["confidence"], "author": r["author"]}
+    for k in ("topic", "direction", "table", "path"):
+        if p.get(k):
+            out[k] = p[k]
+    if p.get("evidence"):
+        out["evidence"] = str(p["evidence"])[:200]
+    if r["source_hash"] and file_hash.get(r["file_path"]) != r["source_hash"]:
+        out["stale"] = True
+    return out
+
+
 file_hash = {r["path"]: r["hash"] for r in q("SELECT path, hash FROM files")}
 annotations = {
-    "insights": [{"target": r["target"], "kind": r["kind"], "by": r["model"]}
-                 for r in q("SELECT target, kind, model, hash FROM insights ORDER BY target")[:MAX_ITEMS]]
+    "insights": [{"target": r["target"], "kind": r["kind"], "by": r["model"],
+                  "summary": str(r["summary"] or "")[:300]}
+                 for r in q("SELECT target, kind, model, hash, summary FROM insights ORDER BY target")[:MAX_ITEMS]]
     if has("insights") else [],
-    "assertions": [{"kind": r["kind"], "file": r["file_path"], "line": r["line"],
-                    "confidence": r["confidence"], "author": r["author"],
-                    **({"stale": True} if r["source_hash"] and file_hash.get(r["file_path"]) != r["source_hash"] else {})}
-                   for r in q("SELECT kind, file_path, line, confidence, author, source_hash "
+    "assertions": [_assertion_row(r)
+                   for r in q("SELECT kind, payload, file_path, line, confidence, author, source_hash "
                               "FROM assertions ORDER BY file_path")[:MAX_ITEMS]]
     if has("assertions") else [],
 }

@@ -80,6 +80,34 @@ if (a.action === "insight") {
   fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
   console.log(`Asserted (provenance: ${author}) and recorded in docs/graph-assertions.json (${list.length} total). It enters the graph on the next index, marked STALE automatically if ${a.file} changes. Commit the file to share it.`);
 
+} else if (a.action === "retract" || a.action === "reaffirm") {
+  // lifecycle for existing assertions, keyed by the same natural key the
+  // no-duplicate filter uses. retract removes; reaffirm re-verifies: the
+  // source_hash moves to the evidence file's CURRENT hash, clearing STALE.
+  const af = path.join(ROOT, "docs", "graph-assertions.json");
+  if (!fs.existsSync(af)) die("docs/graph-assertions.json does not exist; nothing to modify.");
+  let list;
+  try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
+  catch (e) { die(`docs/graph-assertions.json is not valid JSON (${e.message}). Fix it first.`); }
+  if (!Array.isArray(list)) die("docs/graph-assertions.json is not a JSON array. Fix it first.");
+  const key = (x) => [x.kind, x.file, x.line ?? 0, x.topic ?? "", x.table ?? "", x.path ?? ""].join("|");
+  const target = key(a);
+  const hits = list.filter((x) => key(x) === target);
+  if (!hits.length) die("No matching assertion found in docs/graph-assertions.json (key: kind+file+line+topic/table/path).");
+  if (a.action === "retract") {
+    list = list.filter((x) => key(x) !== target);
+    fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
+    console.log(`Retracted ${hits.length} assertion(s) (by: ${author}); ${list.length} remain. Reindex removes it from the graph; commit the file to share.`);
+  } else {
+    const db = new Database(DB_PATH, { readonly: true });
+    let hash = null;
+    try { hash = db.prepare("SELECT hash FROM files WHERE path=?").get(a.file)?.hash ?? null; } finally { db.close(); }
+    if (!hash) die(`File '${a.file}' is not in the index; cannot reaffirm against it.`);
+    for (const x of list) if (key(x) === target) { x.source_hash = hash; x.reaffirmed_at = new Date().toISOString().slice(0, 10); x.reaffirmed_by = author; }
+    fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
+    console.log(`Reaffirmed ${hits.length} assertion(s) against the current ${a.file} (by: ${author}). STALE clears on the next index.`);
+  }
+
 } else {
-  die('action must be "insight" or "assert".');
+  die('action must be "insight", "assert", "retract", or "reaffirm".');
 }

@@ -96,6 +96,7 @@
     <div id="details"><h3>Details</h3><p class="muted">Click a node. Modules are rectangles, Kafka topics are
       diamonds, DB tables are barrels. Dashed border = asserted (derived, not parsed). ⚠ = warning.
       Right side lists <b>gaps</b>: places the graph needs a human.</p></div>
+    <div id="asserts"></div>
     <div id="gaps"></div>
   </div>
   <div class="toast" id="toast"></div>
@@ -338,7 +339,7 @@ function showDetails(d) {
     el.innerHTML = `<h3>${esc(m.id)} <span class="tag">module</span></h3>
       <div>${m.files} files · ${esc((m.langs || []).join(", "))}</div>
       ${m.deps.length ? `<h4>Depends on</h4>${m.deps.map((x) => `<div class="site">${esc(x)}</div>`).join("")}` : ""}
-      ${notes.length ? `<h4>Notes in graph</h4>${notes.map((n) => `<div class="site">${esc(n.kind)} note <span class="tag">${esc(n.by || "")}</span></div>`).join("")}` : ""}
+      ${notes.length ? `<h4>Notes in graph</h4>${notes.map((n) => `<div class="gap-item"><span class="tag">${esc(n.by || "")}</span> ${esc(n.summary || `${n.kind} note`)}</div>`).join("")}` : ""}
       <h4>Annotate</h4>${noteForm(m.id, "module")}`;
   } else if (d.type === "topic") {
     const t = d.ref;
@@ -385,7 +386,41 @@ function resetDetails() {
   document.getElementById("details").innerHTML = `<h3>Details</h3><p class="muted">Click a node.</p>`;
 }
 
+/* The assertions panel: every human/agent-derived fact in the graph, with its
+   lifecycle. STALE ones (evidence file changed since) float to the top as a
+   re-verification worklist — a stale assertion IS a gap. Re-affirm moves its
+   source_hash to the file's current hash; Retract removes it. Both write
+   docs/graph-assertions.json through annotate, then auto-reindex. */
+function renderAssertions() {
+  const el = document.getElementById("asserts");
+  const list = (G.annotations && G.annotations.assertions) || [];
+  if (!list.length) { el.innerHTML = ""; return; }
+  const stale = list.filter((x) => x.stale);
+  const current = list.filter((x) => !x.stale);
+  const row = (x) => `<div class="gap-item">
+      ${x.stale ? `<span class="err">STALE</span> ` : ""}<b>${esc(x.kind)}</b> ${esc(x.topic || x.table || x.path || "")}
+      ${x.direction ? `<span class="tag">${esc(x.direction)}</span>` : ""}
+      <span class="tag">${esc(x.confidence || "")}</span><span class="tag">${esc(x.author || "")}</span>
+      <div class="site"><a data-open="${esc(x.file)}:${x.line || 1}">${esc(x.file)}:${x.line || 1}</a></div>
+      ${x.evidence ? `<div class="muted">“${esc(x.evidence)}”</div>` : ""}
+      <div class="actions">
+        ${x.stale ? `<button data-act="reaffirm" data-a="${esc(JSON.stringify(x))}">Re-affirm (evidence still holds)</button>` : ""}
+        <button class="secondary" data-act="retract" data-a="${esc(JSON.stringify(x))}">Retract</button>
+      </div></div>`;
+  el.innerHTML = `<h3>Assertions in the graph (${list.length})</h3>
+    ${stale.length ? `<h4 class="err">Stale — the evidence file changed, re-verify</h4>` + stale.map(row).join("") : ""}
+    ${current.length ? `<h4>Current</h4>` + current.map(row).join("") : ""}`;
+  el.querySelectorAll("button[data-act]").forEach((b) => b.addEventListener("click", () => {
+    const x = JSON.parse(b.dataset.a);
+    b.disabled = true;
+    vscode.postMessage({ type: "annotate", payload: { action: b.dataset.act, kind: x.kind,
+      file: x.file, line: x.line || 0, topic: x.topic, table: x.table, path: x.path } });
+  }));
+  bindDetailHandlers(el);
+}
+
 function renderGaps() {
+  renderAssertions();
   const g = document.getElementById("gaps");
   const items = (G.gaps.unresolved_topic_expressions || []);
   const declUnused = (G.gaps.topics_declared_in_config_but_unused || []);
