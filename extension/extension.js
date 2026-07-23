@@ -276,14 +276,44 @@ function openGraphPanel(context) {
   panel.webview.html = fs.readFileSync(path.join(context.extensionPath, "graph-view.html"), "utf8")
     .replaceAll("__NONCE__", nonce).replaceAll("__CYTOSCAPE__", String(cytoUri));
 
-  const send = async (keepPositions) => {
+  // node positions + viewport survive closing the panel: the webview persists
+  // them here (workspaceState), and every data message hands them back
+  const STATE_KEY = "aegis.graphView.state";
+  // skip re-export when the index hasn't moved (mtime+size of db and -wal):
+  // the auto-refresh watcher can fire on reads/checkpoints; exporting an
+  // unchanged graph is pure spawn cost
+  let lastStat = null;
+  const statKey = () => {
+    try {
+      const key = (p) => { try { const s = fs.statSync(p); return `${s.mtimeMs}:${s.size}`; } catch { return "-"; } };
+      const base = path.join(root, ".ariadne", "index.db");
+      return `${key(base)}|${key(base + "-wal")}`;
+    } catch { return null; }
+  };
+  const send = async (keepPositions, force = true) => {
+    const stat = statKey();
+    if (!force && stat && stat === lastStat) return;
     try {
       const graph = JSON.parse(await runtimeExec(root, runtime, `graph_export.${suffix}`));
-      panel.webview.postMessage({ type: "data", graph, keepPositions: !!keepPositions });
+      lastStat = stat;
+      panel.webview.postMessage({ type: "data", graph, keepPositions: !!keepPositions,
+        saved: context.workspaceState.get(STATE_KEY) });
     } catch (e) {
       panel.webview.postMessage({ type: "toast", message: `Graph export failed: ${String(e.stderr || e.message).trim()}`, isError: true });
     }
   };
+  // live refresh: when a hook, agent, or terminal reindex touches the index,
+  // the panel updates itself (debounced; positions kept; skipped if unchanged)
+  const watcher = vscode.workspace.createFileSystemWatcher(
+    new vscode.RelativePattern(root, ".ariadne/index.db*"));
+  let refreshT = null;
+  const onIndexTouched = () => {
+    clearTimeout(refreshT);
+    refreshT = setTimeout(() => send(true, false), 1500);
+  };
+  watcher.onDidChange(onIndexTouched);
+  watcher.onDidCreate(onIndexTouched);
+  panel.onDidDispose(() => { clearTimeout(refreshT); watcher.dispose(); }, undefined, context.subscriptions);
   // Reindex used by the stale banner and the post-assert flow: INCREMENTAL —
   // the assertions pass runs on every incremental, so a full rebuild here was
   // pure waste — with progress, never blocking the host.
@@ -299,6 +329,8 @@ function openGraphPanel(context) {
   panel.webview.onDidReceiveMessage(async (m) => {
     if (m.type === "ready" || m.type === "refresh") {
       await send(m.type === "refresh");
+    } else if (m.type === "persist") {
+      context.workspaceState.update(STATE_KEY, m.state);
     } else if (m.type === "reindex") {
       try {
         await reindex("AEGIS: reindexing (incremental)…");

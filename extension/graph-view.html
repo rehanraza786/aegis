@@ -17,6 +17,14 @@
   #bar { grid-area: bar; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
          padding: 6px 10px; border-bottom: 1px solid var(--vscode-panel-border); }
   #bar .title { font-weight: 600; margin-right: 6px; }
+  #search { width: 200px; flex: none; }
+  #results { display: none; position: absolute; top: 34px; left: 96px; z-index: 20; width: 320px;
+             max-height: 320px; overflow-y: auto; background: var(--vscode-notifications-background, #252526);
+             border: 1px solid var(--vscode-panel-border); border-radius: 4px; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
+  #results.on { display: block; }
+  #results .item { padding: 5px 9px; cursor: pointer; display: flex; gap: 7px; align-items: baseline; }
+  #results .item.active, #results .item:hover { background: var(--vscode-button-secondaryBackground, #3a3d41); }
+  #results .item .tag { flex: none; }
   #bar label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; opacity: .9; white-space: nowrap; }
   #bar .spacer { flex: 1; }
   #bar .meta { opacity: .7; font-size: .92em; }
@@ -68,14 +76,18 @@
 <body>
   <div id="bar">
     <span class="title">AEGIS Graph</span>
+    <input id="search" type="search" placeholder="Search nodes ( / )" autocomplete="off">
     <label><input type="checkbox" id="tTopics" checked> Topics</label>
     <label><input type="checkbox" id="tTables" checked> Tables</label>
+    <label><input type="checkbox" id="tEndpoints" checked> Endpoints</label>
     <label><input type="checkbox" id="tTests"> Test-only items</label>
     <span class="spacer"></span>
     <span class="meta" id="meta"></span>
-    <button class="secondary" id="fit">Fit</button>
-    <button id="refresh">Refresh</button>
+    <button class="secondary" id="relayout" title="Recompute the layout (deterministic)">Layout</button>
+    <button class="secondary" id="fit">Fit (f)</button>
+    <button id="refresh">Refresh (r)</button>
   </div>
+  <div id="results"></div>
   <div id="cy"></div>
   <div id="stale"><span class="warn">⚠ Index is stale</span><span class="muted" id="staleDetail"></span>
     <button id="staleReindex">Reindex</button></div>
@@ -100,6 +112,7 @@ const C = () => ({
   module: cssVar("--vscode-charts-blue", "#3794ff"),
   topic:  cssVar("--vscode-charts-yellow", "#cca700"),
   table:  cssVar("--vscode-charts-purple", "#b180d7"),
+  endpoint: cssVar("--vscode-charts-green", "#89d185"),
   warn:   cssVar("--vscode-editorWarning-foreground", "#cca700"),
   err:    cssVar("--vscode-editorError-foreground", "#f14c4c"),
   ink:    cssVar("--vscode-foreground", "#ccc"),
@@ -115,8 +128,19 @@ const toast = (msg, isErr) => {
   clearTimeout(t._h); t._h = setTimeout(() => { t.style.display = "none"; }, 6000);
 };
 
+/* Deterministic pseudo-random position from the node id: fresh layouts start
+   from the same seed every time (cose runs randomize:false on top), and nodes
+   that appear later (e.g. enabling a layer) land somewhere stable instead of
+   stacking at 0,0. Same id → same spot, forever. */
+function hashPos(id) {
+  let h1 = 0x811c9dc5, h2 = 0x1000193;
+  for (let i = 0; i < id.length; i++) { h1 = ((h1 ^ id.charCodeAt(i)) * 16777619) >>> 0; h2 = ((h2 * 31) + id.charCodeAt(i)) >>> 0; }
+  return { x: 120 + (h1 % 1000), y: 80 + (h2 % 620) };
+}
+
 function elements() {
   const showTopics = tTopics.checked, showTables = tTables.checked, showTests = tTests.checked;
+  const showEndpoints = tEndpoints.checked;
   const els = [], modIds = new Set(G.modules.map((m) => m.id));
   const modOf = (p) => p.split("/")[0];
   for (const m of G.modules) {
@@ -155,6 +179,27 @@ function elements() {
       els.push({ data: { id, source: "m:" + mod, target: "d:" + t.table, type: "access", asserted: !!s.asserted, label: s.mode } });
     });
   }
+  if (showEndpoints) {
+    const seenEp = new Set();
+    for (const e of G.endpoints) {
+      const id = `e:${e.method} ${e.path}`;
+      if (seenEp.has(id)) continue; seenEp.add(id);
+      const warn = Object.keys(e.warnings || {}).length > 0;
+      els.push({ data: { id, label: (warn ? "⚠ " : "") + `${e.method} ${e.path}`, type: "endpoint", warn, ref: e } });
+      const homeMod = modOf(e.file);
+      if (modIds.has(homeMod)) {
+        els.push({ data: { id: `srv:${id}`, source: "m:" + homeMod, target: id, type: "serve", label: "serves" } });
+      }
+      const seenCall = new Set();
+      (e.callers.items || []).forEach((c) => {
+        const mod = modOf(c.path); if (!modIds.has(mod) || mod === homeMod) return;
+        const cid = `call:${id}:${mod}`; if (seenCall.has(cid)) return; seenCall.add(cid);
+        els.push({ data: { id: cid, source: "m:" + mod, target: id, type: "httpcall", asserted: !!c.asserted, label: "calls" } });
+      });
+    }
+  }
+  // every node gets a deterministic seed position (see hashPos)
+  for (const el of els) if (!el.data.source) el.position = hashPos(el.data.id);
   return els;
 }
 
@@ -170,6 +215,9 @@ function style() {
         "background-color": c.topic, "background-opacity": .2, "border-color": c.topic, "font-size": 10 } },
     { selector: 'node[type="table"]', style: { shape: "barrel", width: 96, height: 40,
         "background-color": c.table, "background-opacity": .2, "border-color": c.table, "font-size": 10 } },
+    { selector: 'node[type="endpoint"]', style: { shape: "round-tag", width: 120, height: 30,
+        "background-color": c.endpoint, "background-opacity": .18, "border-color": c.endpoint,
+        "font-size": 9, "text-max-width": 140 } },
     { selector: "node[?warn]", style: { "border-color": c.warn, "border-width": 2.5 } },
     { selector: "node[?testOnly]", style: { opacity: .45 } },
     { selector: "node:selected", style: { "border-width": 3, "overlay-opacity": .08 } },
@@ -180,26 +228,76 @@ function style() {
     { selector: 'edge[type="produce"], edge[type="consume"]', style: { "line-color": c.topic, "target-arrow-color": c.topic, "line-opacity": .7 } },
     { selector: 'edge[type="access"]', style: { "line-color": c.table, "target-arrow-color": c.table, "line-opacity": .7 } },
     { selector: 'edge[type="testedge"]', style: { "line-style": "dotted", opacity: .4 } },
+    { selector: 'edge[type="serve"], edge[type="httpcall"]', style: { "line-color": c.endpoint, "target-arrow-color": c.endpoint, "line-opacity": .65 } },
     { selector: "edge[?asserted]", style: { "line-style": "dashed" } },
+    // focus mode: everything outside the selected neighborhood recedes
+    { selector: ".dim", style: { opacity: .13, "text-opacity": .1 } },
+    // label level-of-detail: edge labels appear past a zoom threshold (or on selection)
+    { selector: "edge.lod-hidden", style: { "text-opacity": 0 } },
+    { selector: "edge.lod-hidden:selected", style: { "text-opacity": .8 } },
   ];
 }
 
-function render(keepPositions) {
-  const positions = keepPositions && cy ? Object.fromEntries(cy.nodes().map((n) => [n.id(), n.position()])) : null;
+let savedState = null;   // extension-provided workspace state: { positions, zoom, pan }
+let restoredView = false; // zoom/pan restored once per panel lifetime
+function focusOn(n) {
+  cy.elements().addClass("dim");
+  n.closedNeighborhood().removeClass("dim");
+}
+function unfocus() { if (cy) cy.elements().removeClass("dim"); }
+let persistT = null;
+function schedulePersist() {
+  clearTimeout(persistT);
+  persistT = setTimeout(() => {
+    if (!cy) return;
+    vscode.postMessage({ type: "persist", state: {
+      positions: Object.fromEntries(cy.nodes().map((n) => [n.id(), n.position()])),
+      zoom: cy.zoom(), pan: cy.pan(),
+    } });
+  }, 800);
+}
+let lodShown = null;
+function updateLod() {
+  const show = cy.zoom() >= 0.75;
+  if (show === lodShown) return;
+  lodShown = show;
+  cy.edges()[show ? "removeClass" : "addClass"]("lod-hidden");
+}
+
+function render(keepPositions, freshLayout) {
+  const live = keepPositions && cy ? Object.fromEntries(cy.nodes().map((n) => [n.id(), n.position()])) : null;
+  const stored = !freshLayout && !live && savedState?.positions ? savedState.positions : null;
   if (cy) cy.destroy();
+  const preset = live || stored;
   cy = cytoscape({ container: document.getElementById("cy"), elements: elements(), style: style(),
-    layout: positions ? { name: "preset", positions: (n) => positions[n.id()] || { x: 0, y: 0 } }
-                      : { name: "cose", animate: false, nodeRepulsion: 90000, idealEdgeLength: 110, padding: 24,
-                          nodeDimensionsIncludeLabels: true, nodeOverlap: 24, componentSpacing: 120 },
+    // priority: live positions (toggles/refreshes never rearrange the map) →
+    // stored positions (the map survives closing the panel) → deterministic
+    // cose from hashPos seeds (randomize:false), so even a fresh layout is
+    // the same layout every time
+    layout: preset ? { name: "preset", positions: (n) => preset[n.id()] || hashPos(n.id()) }
+                   : { name: "cose", animate: false, randomize: false, nodeRepulsion: 90000, idealEdgeLength: 110,
+                       padding: 24, nodeDimensionsIncludeLabels: true, nodeOverlap: 24, componentSpacing: 120 },
     wheelSensitivity: .2 });
   window._cy = cy; // debug/test hook (the container div already owns window.cy)
-  cy.on("tap", "node", (ev) => { selected = ev.target.data(); showDetails(selected); });
-  cy.on("tap", (ev) => { if (ev.target === cy) { selected = null; resetDetails(); } });
+  cy.on("tap", "node", (ev) => { selected = ev.target.data(); showDetails(selected); focusOn(ev.target); });
+  cy.on("tap", (ev) => { if (ev.target === cy) { selected = null; resetDetails(); unfocus(); } });
+  // LOD is deferred to the next frame: toggling classes synchronously INSIDE
+  // the zoom event re-enters the renderer mid-viewport-change and can crash
+  // the webview's Chromium (reproduced headless; rAF-deferred it cannot)
+  cy.on("zoom", () => requestAnimationFrame(updateLod));
+  cy.on("layoutstop dragfree pan zoom", schedulePersist);
+  if (!restoredView && stored && savedState.zoom) {
+    cy.viewport({ zoom: savedState.zoom, pan: savedState.pan });
+  }
+  restoredView = true;
+  lodShown = null;
+  updateLod();
   const c = C();
   document.getElementById("legend").innerHTML =
     `<span><span class="sw" style="background:${c.module}"></span>module</span>` +
     `<span><span class="sw diamond" style="background:${c.topic}"></span>Kafka topic</span>` +
     `<span><span class="sw round" style="background:${c.table}"></span>DB table</span>` +
+    `<span><span class="sw" style="background:${c.endpoint}"></span>endpoint</span>` +
     `<span><span class="warn">⚠ warning</span></span><span class="muted">dashed = asserted</span>`;
   // "shown/total" whenever the export capped a list — silent truncation reads
   // as "covered everything" when it didn't
@@ -271,6 +369,14 @@ function showDetails(d) {
           <button type="submit">Assert into graph</button>
           <div class="hint">Writes docs/graph-assertions.json — git-versioned, PR-reviewed, provenance “human”.</div>
         </form>` : ""}`;
+  } else if (d.type === "endpoint") {
+    const e = d.ref;
+    const w = e.warnings || {};
+    el.innerHTML = `<h3>${esc(e.method)} ${esc(e.path)} <span class="tag">endpoint</span></h3>
+      ${e.asserted ? `<div class="muted">provenance: ${esc(e.asserted)}</div>` : ""}
+      ${w.no_caller ? `<div class="warn">⚠ no production caller found${w.tested_only ? " (exercised only by tests)" : ""}</div>` : ""}
+      <h4>Defined at</h4><div class="site"><a data-open="${esc(e.file)}:${e.line}">${esc(e.file)}:${e.line}</a></div>
+      <h4>Callers</h4>${(e.callers.items || []).map((s) => siteRow(s, s.client ? ` <span class="tag">${esc(s.client)}</span>` : "")).join("") || '<div class="muted">none</div>'}${moreRow(e.callers)}`;
   }
   bindDetailHandlers(el);
 }
@@ -325,15 +431,23 @@ function bindDetailHandlers(root) {
   }));
 }
 
+let endpointsInit = false;
 window.addEventListener("message", (ev) => {
   const m = ev.data;
   if (m.type === "data") {
-    G = m.graph; render(m.keepPositions); renderGaps();
+    G = m.graph;
+    if (m.saved) savedState = m.saved;
+    if (!endpointsInit) {
+      // sane default: draw the endpoints layer unless it would wallpaper the map
+      tEndpoints.checked = (G.endpoints || []).length <= 60;
+      endpointsInit = true;
+    }
+    render(m.keepPositions); renderGaps();
     // selection survives a refresh: re-resolve the node in the NEW graph and
     // re-render its (possibly changed) details, instead of dropping to blank
     if (selected) {
       const n = cy.getElementById(selected.id);
-      if (n && n.nonempty()) { n.select(); selected = n.data(); showDetails(selected); }
+      if (n && n.nonempty()) { n.select(); selected = n.data(); showDetails(selected); focusOn(n); }
       else { selected = null; resetDetails(); }
     }
   }
@@ -345,9 +459,86 @@ document.getElementById("staleReindex").addEventListener("click", () => {
   vscode.postMessage({ type: "reindex" });
 });
 document.getElementById("fit").addEventListener("click", () => cy && cy.fit(undefined, 30));
-for (const id of ["tTopics", "tTables", "tTests"]) {
-  document.getElementById(id).addEventListener("change", () => { render(false); renderGaps(); });
+document.getElementById("relayout").addEventListener("click", () => { render(false, true); renderGaps(); schedulePersist(); });
+// layer toggles keep every node where it was — spatial memory is the point
+for (const id of ["tTopics", "tTables", "tEndpoints", "tTests"]) {
+  document.getElementById(id).addEventListener("change", () => { render(true); renderGaps(); });
 }
+
+/* ---- search: fuzzy jump over modules/topics/tables/endpoints. `/` focuses,
+   arrows navigate, Enter selects + animates + focuses the neighborhood. The
+   result list is real DOM — the accessible twin of the canvas. ---- */
+const searchEl = document.getElementById("search");
+const resultsEl = document.getElementById("results");
+let sItems = [];
+let sActive = 0;
+function searchIndex() {
+  const out = [];
+  for (const m of G.modules) out.push({ id: "m:" + m.id, label: m.id, kind: "module" });
+  for (const t of G.topics) out.push({ id: "t:" + t.topic, label: t.topic, kind: "topic" });
+  for (const t of G.tables) out.push({ id: "d:" + t.table, label: t.table, kind: "table" });
+  const seen = new Set();
+  for (const e of G.endpoints) {
+    const id = `e:${e.method} ${e.path}`;
+    if (!seen.has(id)) { seen.add(id); out.push({ id, label: `${e.method} ${e.path}`, kind: "endpoint" }); }
+  }
+  return out;
+}
+function runSearch() {
+  const qy = searchEl.value.trim().toLowerCase();
+  if (!qy || !G) { resultsEl.classList.remove("on"); sItems = []; return; }
+  sItems = searchIndex().map((it) => {
+    const l = it.label.toLowerCase();
+    return { ...it, s: l === qy ? 3 : l.startsWith(qy) ? 2 : l.includes(qy) ? 1 : 0 };
+  }).filter((it) => it.s > 0).sort((a, b) => b.s - a.s || a.label.length - b.label.length).slice(0, 12);
+  sActive = 0;
+  resultsEl.innerHTML = sItems.map((it, i) =>
+    `<div class="item${i === 0 ? " active" : ""}" data-i="${i}" role="option"><span class="tag">${it.kind}</span><span>${esc(it.label)}</span></div>`).join("")
+    || `<div class="item muted">no matches</div>`;
+  resultsEl.classList.add("on");
+  resultsEl.querySelectorAll(".item[data-i]").forEach((d) => d.addEventListener("click", () => jumpTo(sItems[Number(d.dataset.i)])));
+}
+function jumpTo(it) {
+  if (!it || !cy) return;
+  resultsEl.classList.remove("on");
+  searchEl.blur();
+  if (it.kind === "endpoint" && !tEndpoints.checked) { tEndpoints.checked = true; render(true); renderGaps(); }
+  const n = cy.getElementById(it.id);
+  if (!n || n.empty()) return;
+  cy.animate({ fit: { eles: n.closedNeighborhood(), padding: 120 }, duration: 450, easing: "ease-in-out" });
+  cy.$(":selected").unselect();
+  n.select();
+  selected = n.data();
+  showDetails(selected);
+  focusOn(n);
+}
+searchEl.addEventListener("input", runSearch);
+searchEl.addEventListener("keydown", (ev) => {
+  if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+    ev.preventDefault();
+    if (!sItems.length) return;
+    sActive = (sActive + (ev.key === "ArrowDown" ? 1 : sItems.length - 1)) % sItems.length;
+    resultsEl.querySelectorAll(".item[data-i]").forEach((d, i) => d.classList.toggle("active", i === sActive));
+  } else if (ev.key === "Enter") {
+    jumpTo(sItems[sActive]);
+  } else if (ev.key === "Escape") {
+    resultsEl.classList.remove("on");
+    searchEl.blur();
+  }
+});
+document.addEventListener("keydown", (ev) => {
+  // only TEXT-entry elements swallow shortcuts; a focused checkbox or button
+  // (e.g. right after clicking a layer toggle) must not eat "/" or Escape
+  const a = document.activeElement;
+  const tag = a?.tagName || "";
+  const inField = tag === "TEXTAREA" || tag === "SELECT" ||
+    (tag === "INPUT" && !/^(checkbox|radio|button)$/.test(a.type || ""));
+  if (inField) return;
+  if (ev.key === "/") { ev.preventDefault(); searchEl.focus(); searchEl.select(); }
+  else if (ev.key === "Escape") { selected = null; resetDetails(); unfocus(); if (cy) cy.$(":selected").unselect(); resultsEl.classList.remove("on"); }
+  else if (ev.key === "f") { if (cy) cy.fit(undefined, 30); }
+  else if (ev.key === "r") vscode.postMessage({ type: "refresh" });
+});
 vscode.postMessage({ type: "ready" });
 </script>
 </body>
