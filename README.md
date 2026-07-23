@@ -12,6 +12,18 @@ MIT licensed. Runs entirely on your machines. No telemetry, no accounts, no API 
 
 ---
 
+## See it in 30 seconds
+
+The graph view on a six-repo workspace — click a topic for its producers and
+consumers with file:line, catch schema drift, then close one of the graph's
+own blind spots with an evidence-backed annotation that every agent sees:
+
+![AEGIS graph view: explore the seams, then annotate a gap with evidence](docs/media/aegis-demo.gif)
+
+▶ [Watch the full 50-second demo (install → index → graph → annotate, MP4)](docs/media/aegis-demo.mp4)
+
+---
+
 ## The problem this solves
 
 Copilot in agent mode is capable but blind. Ask it "what breaks if I change `OrderService.findById`?" and it will grep, open six files, follow imports by hand, spend several thousand tokens, and give you an answer that's *probably* right. Ask it "who consumes `payments.completed`?" and it can't answer at all, because the producer says `kafkaTemplate.send(PAYMENTS_TOPIC, ...)`, the constant lives in another class, the consumer resolves the topic from `${app.kafka.payments-topic}` in a YAML file, and the two services are in different git repos.
