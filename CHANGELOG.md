@@ -21,7 +21,16 @@ The post-review release. Highlights, roughly in the order they landed:
   whose annotations flow back with their own provenance (`asserted:human`).
   New `graph_export` (documented JSON contract) and `annotate` CLIs.
 - **Performance:** FK indexes on every cascade path — a 200-file incremental
-  reindex drops ~2.7× on a 1,540-file repo.
+  reindex drops ~2.7× on a 1,540-file repo. Then the deep pass: newline-offset
+  line math (the per-match prefix re-scan was O(text²) on big files),
+  segment-boundary suffix-map import resolution (was O(imports × paths), and
+  no longer fabricates edges from mid-segment matches), `executemany` batching
+  and connection-lifetime prepared statements, one reused WASM parser per
+  language in the Node edition (`new Parser()` per file leaked WASM heap), an
+  LRU-bounded (64 MB) extraction text cache, FTS segment merge after bulk
+  loads, and a cached read-only server connection (Python) — a cold full index
+  drops 8.3× on a 1,500-file repo and 15.4× on a 5,000-file repo (Python
+  edition; identical graph rows), with `tests/bench.py` to reproduce.
 - **Extensibility:** extractor hooks accept a file scope (`{ fn, files: /\.go$/ }`)
   and run over any tracked file, making non-JVM stacks first-class; sample
   file-scoped extractor included.
