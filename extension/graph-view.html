@@ -271,6 +271,9 @@ function style(nodeCount) {
     { selector: "edge[?asserted]", style: { "line-style": "dashed" } },
     // focus mode: everything outside the selected neighborhood recedes
     { selector: ".dim", style: { opacity: .13, "text-opacity": .1 } },
+    // path highlight (shift-click a second node): the explain_path twin in-view
+    { selector: ".path-hl", style: { opacity: 1, "text-opacity": 1, "border-width": 3 } },
+    { selector: "edge.path-hl", style: { width: 3.2, "line-color": c.warn, "target-arrow-color": c.warn } },
     // drag-to-connect: the in-flight gesture uses the warning color so a draft
     // edge is never mistaken for a real (parsed or asserted) one
     { selector: ".eh-source, .eh-target", style: { "border-width": 3, "border-color": c.warn } },
@@ -389,7 +392,27 @@ function render(keepPositions, freshLayout) {
     wheelSensitivity: .2 });
   if (!preset && nNodes > 800) toast(`${nNodes} nodes — using the fast grid layout. Search (/) and click to focus; Layout re-runs it.`);
   window._cy = cy; // debug/test hook (the container div already owns window.cy)
-  cy.on("tap", "node", (ev) => { selected = ev.target.data(); showDetails(selected); focusOn(ev.target); });
+  cy.on("tap", "node", (ev) => {
+    // shift-click with a selection = highlight the shortest path between the
+    // two (the in-view twin of the explain_path tool); Esc clears
+    if (ev.originalEvent && ev.originalEvent.shiftKey && selected && selected.id && selected.id !== ev.target.id()) {
+      const a = cy.getElementById(selected.id);
+      if (a && a.nonempty()) {
+        const r = cy.elements().aStar({ root: a, goal: ev.target, directed: false });
+        cy.elements().removeClass("path-hl");
+        if (r.found) {
+          cy.elements().addClass("dim");
+          r.path.removeClass("dim").addClass("path-hl");
+          toast(`Path: ${Math.max(0, r.path.nodes().length - 1)} hop(s). explain_path in chat gives per-hop evidence. Esc clears.`);
+        } else {
+          toast("No path between these two in the current layers (try enabling more layers).", true);
+        }
+        return;
+      }
+    }
+    cy.elements().removeClass("path-hl");
+    selected = ev.target.data(); showDetails(selected); focusOn(ev.target);
+  });
   cy.on("tap", (ev) => { if (ev.target === cy) { selected = null; resetDetails(); unfocus(); } });
   // (label LOD is native now: min-zoomed-font-size — zero JS inside zoom
   // events, which is also the class of bug the harness rules ban)
@@ -891,7 +914,7 @@ document.addEventListener("keydown", (ev) => {
     (tag === "INPUT" && !/^(checkbox|radio|button)$/.test(a.type || ""));
   if (inField) return;
   if (ev.key === "/") { ev.preventDefault(); searchEl.focus(); searchEl.select(); }
-  else if (ev.key === "Escape") { setDrawMode(false); selected = null; resetDetails(); unfocus(); if (cy) cy.$(":selected").unselect(); resultsEl.classList.remove("on"); }
+  else if (ev.key === "Escape") { setDrawMode(false); selected = null; resetDetails(); unfocus(); if (cy) { cy.$(":selected").unselect(); cy.elements().removeClass("path-hl"); } resultsEl.classList.remove("on"); }
   else if (ev.key === "f") { if (cy) cy.fit(undefined, 30); }
   else if (ev.key === "r") vscode.postMessage({ type: "refresh" });
 });

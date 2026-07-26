@@ -423,6 +423,14 @@ def connect(for_indexing=False):
             con.execute(f"ALTER TABLE files ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
+    # dirty-state provenance: 0 = committed at last_sha, 1 = tracked with
+    # uncommitted changes, 2 = untracked. The worktree union (batch 18) made
+    # in-flight work visible; this column makes it DISTINGUISHABLE — an agent
+    # can tell which facts rest on its own uncommitted edits.
+    try:
+        con.execute("ALTER TABLE files ADD COLUMN wt_state INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     # provenance: 'static' (parsed) vs 'asserted:<author>' (derived). Never silently mixed.
     for t in ("msg_edges", "db_access", "http_endpoints", "http_calls"):
         try:
@@ -544,13 +552,12 @@ def porcelain_entries(root):
     return out
 
 
-def worktree_sig(root):
+def worktree_sig_from(root, ents):
     """Content-sensitive fingerprint of the uncommitted state: HEAD alone cannot
     answer "is the index fresh?" once the worktree is indexed too. Format is
     shared byte-for-byte with the Node edition (sorted "st|rel|size|mtime_ms"
     lines, sha1) so a runtime switch on a shared DB never fakes staleness.
     Clean tree = ""."""
-    ents = porcelain_entries(root)
     if not ents:
         return ""
     lines = []
@@ -1410,14 +1417,21 @@ def current_sha(root=None):
 
 
 def stamp_all(con):
+    con.execute("UPDATE files SET wt_state=0 WHERE wt_state != 0")
     for root in ROOTS:
-        key = f"last_sha:{root.name if MULTI else '.'}"
+        prefix = root.name if MULTI else ""
+        key = f"last_sha:{prefix or '.'}"
         con.execute("INSERT OR REPLACE INTO meta VALUES(?, ?)", (key, current_sha(root)))
         # What the worktree looked like when this index was built. index_status
         # compares it with the live signature: `fresh` can no longer say true
         # while an agent's uncommitted edit sits outside the graph.
+        ents = porcelain_entries(root)
         con.execute("INSERT OR REPLACE INTO meta VALUES(?, ?)",
-                    (f"worktree_sig:{root.name if MULTI else '.'}", worktree_sig(root)))
+                    (f"worktree_sig:{prefix or '.'}", worktree_sig_from(root, ents)))
+        # per-file dirty provenance rides the same porcelain pass
+        for st, rel, _origin in ents:
+            con.execute("UPDATE files SET wt_state=? WHERE path=?",
+                        (2 if st == "??" else 1, f"{prefix}/{rel}" if prefix else rel))
     con.execute("INSERT OR REPLACE INTO meta VALUES('last_sha', ?)", (current_sha(),))
 
 

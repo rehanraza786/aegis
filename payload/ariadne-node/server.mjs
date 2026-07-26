@@ -247,6 +247,8 @@ const TOOL_ANNOTATIONS = {
   decisions: RO,
   decision_trace: RO,
   save_decision: WR,
+  explain_path: RO,
+  usage_report: RO,
   save_insight: WR,
   graph_gaps: RO,
   assert_edge: WR,
@@ -259,11 +261,50 @@ const TOOL_ANNOTATIONS = {
 };
 
 // Every tool returns an error message (not a crash) so the agent can adapt.
+// ---- context-ROI ledger: measure the tokens, don't claim them ----
+// Every response knows its own size, and the graph knows the size of the files
+// an answer SPANS (files.size) — i.e. what an agent would have read without
+// the tool. Appended locally to .ariadne/usage.jsonl; usage_report aggregates.
+// Zero egress: rows on your own disk, nothing else.
+const USAGE_PATH = path.join(GR_DIR, "usage.jsonl");
+let _naiveFiles = null; // per-call file set, populated by tools via noteFiles()
+const noteFiles = (paths) => { if (_naiveFiles) for (const p of paths ?? []) if (p) _naiveFiles.add(p); };
+function naiveBytes(paths) {
+  if (!paths.size) return 0;
+  try {
+    return withDb((d) => {
+      const q = d.prepare("SELECT size FROM files WHERE path=?");
+      let sum = 0;
+      for (const p of paths) sum += q.get(p)?.size ?? 0;
+      return sum;
+    });
+  } catch { return 0; }
+}
+function ledger(toolName, bytesOut, paths) {
+  try {
+    const rec = { ts: Math.floor(Date.now() / 1000), tool: toolName, bytes: bytesOut,
+      ...(paths.size ? { naive_bytes: naiveBytes(paths), files: paths.size } : {}) };
+    fs.appendFileSync(USAGE_PATH, JSON.stringify(rec) + "\n");
+    // rotation: keep the newer half once the ledger crosses ~1MB
+    const st = fs.statSync(USAGE_PATH);
+    if (st.size > 1024 * 1024) {
+      const lines = fs.readFileSync(USAGE_PATH, "utf8").split("\n").filter(Boolean);
+      fs.writeFileSync(USAGE_PATH, lines.slice(Math.floor(lines.length / 2)).join("\n") + "\n");
+    }
+  } catch { /* the ledger must never break a tool call */ }
+}
 function tool(server, name, description, schema, handler) {
   const ann = TOOL_ANNOTATIONS[name];
   server.registerTool(name, { description, inputSchema: schema, ...(ann ? { annotations: ann } : {}) }, async (args) => {
-    try { return text(budget(await handler(args))); }
+    const mine = new Set();
+    _naiveFiles = mine;
+    try {
+      const out = budget(await handler(args));
+      ledger(name, out.length, mine);
+      return text(out);
+    }
     catch (e) { return text(`Error in ${name}: ${e.message ?? e}`); }
+    finally { if (_naiveFiles === mine) _naiveFiles = null; }
   });
 }
 
@@ -365,6 +406,16 @@ tool(server, "search_code",
 
 // Resolve a target (file path, symbol name, or fragment) to a file row —
 // shared by context_pack and the /aegis-impact prompt.
+// dirty-state provenance label for a file row: '' (committed) | 'working-tree' | 'untracked'
+function wtLabel(d, pathOrId) {
+  try {
+    const row = typeof pathOrId === "number"
+      ? d.prepare("SELECT wt_state s FROM files WHERE id=?").get(pathOrId)
+      : d.prepare("SELECT wt_state s FROM files WHERE path=?").get(pathOrId);
+    return row?.s === 2 ? "untracked" : row?.s === 1 ? "working-tree" : "";
+  } catch { return ""; }
+}
+
 function resolveTarget(d, target) {
   let file = d.prepare("SELECT id, path, lang FROM files WHERE path=?").get(target);
   let symbol = null;
@@ -439,9 +490,14 @@ tool(server, "context_pack",
       }
     } catch { /* files.is_test / test_cases may predate this index build */ }
 
+    noteFiles([file.path, ...dependents, ...(typeof tests === "object" ? tests.files : [])]);
+    const wt = wtLabel(d, file.path);
     return {
       target: symbol ? `${symbol.parent ? symbol.parent + "." : ""}${symbol.name} (${symbol.kind})` : file.path,
       file: file.path + (symbol ? `:${symbol.line}` : ""),
+      // dirty-state provenance: an agent must know when a fact rests on its
+      // own in-flight edit (committed facts carry no tag — token frugality)
+      ...(wt ? { state: `${wt} — this file's facts reflect UNCOMMITTED work` } : {}),
       module: mod,
       outline: cap(outline.map((o) => `${o.parent ? o.parent + "." : ""}${o.name}:${o.kind}@${o.line}`), 25),
       callers: callers.length ? callers.map((c) => `${c.caller} (${c.path}:${c.line})`) : "none recorded (heuristic; use find_references for certainty)",
@@ -477,8 +533,10 @@ tool(server, "file_outline",
   ({ path: p }) => withDb((d) => {
     const f = d.prepare("SELECT * FROM files WHERE path=?").get(p);
     if (!f) return "File not in index.";
+    noteFiles([p]);
+    const wt = wtLabel(d, p);
     return {
-      path: p, lang: f.lang, lines: f.lines,
+      path: p, lang: f.lang, lines: f.lines, ...(wt ? { state: wt } : {}),
       symbols: d.prepare("SELECT name, kind, line, signature, parent FROM symbols WHERE file_id=? ORDER BY line LIMIT ?").all(f.id, MAX_ROWS),
       symbol_count: d.prepare("SELECT COUNT(*) c FROM symbols WHERE file_id=?").get(f.id).c,
       imports: d.prepare("SELECT f2.path p FROM edges e JOIN files f2 ON f2.id=e.dst WHERE e.src=?").all(f.id).map((r) => r.p),
@@ -519,7 +577,7 @@ function blastData(d, p, depth) {
 tool(server, "blast_radius",
   "Everything that transitively depends on a file (reverse dependency BFS). Call BEFORE modifying shared code to know what to re-test.",
   { path: z.string().min(1).max(500), depth: z.number().int().optional() },
-  ({ path: p, depth }) => withDb((d) => blastData(d, p, clamp(depth ?? 2, 1, 5)) ?? "File not in index."));
+  ({ path: p, depth }) => withDb((d) => { noteFiles([p]); return blastData(d, p, clamp(depth ?? 2, 1, 5)) ?? "File not in index."; }));
 
 tool(server, "dependencies",
   "What a file imports (its direct in-repo dependencies).",
@@ -1229,9 +1287,13 @@ tool(server, "plan_context",
       insights = d.prepare(`SELECT target, summary FROM insights WHERE target IN (${mods.map(() => "?").join(",")})`)
         .all(...mods).map((r) => `${r.target}: ${String(r.summary).slice(0, 150)}`);
     } catch { /* no insights yet */ }
+    noteFiles(seeds);
     return {
       task_terms: terms,
-      files_to_read: seeds.map((p) => ({ path: p, matched: [...(why.get(p) ?? [])].slice(0, 4) })),
+      files_to_read: seeds.map((p) => {
+        const wt = wtLabel(d, p);
+        return { path: p, matched: [...(why.get(p) ?? [])].slice(0, 4), ...(wt ? { state: wt } : {}) };
+      }),
       symbols: capList(symbols, 12),
       kafka: topics.size ? [...topics.keys()] : "none",
       database: tables.size ? [...tables.keys()] : "none",
@@ -1243,10 +1305,153 @@ tool(server, "plan_context",
     };
   }));
 
+tool(server, "explain_path",
+  "WHY does editing A affect B? The shortest provenance-weighted path between two graph nodes — files, symbols, modules, topics (kafka:orders.created or just the topic name), tables (db:payments), endpoints (GET /api/x) — with per-hop evidence (kind + file:line + parsed/asserted provenance). blast_radius asserts the answer; this explains it, in ~300 tokens.",
+  { source: z.string().min(1).max(300), target: z.string().min(1).max(300) },
+  ({ source, target }) => withDb((d) => {
+    // --- resolve an endpoint of the path to a node id in the traversal space:
+    //     files are "f:<path>", topics "t:<topic>", tables "d:<tbl>", endpoints "e:<METHOD> <path>"
+    const resolveNode = (raw) => {
+      const t = raw.trim();
+      const mEp = t.match(/^(GET|POST|PUT|DELETE|PATCH|HEAD)\s+(\S+)$/i);
+      if (mEp) return { id: `e:${mEp[1].toUpperCase()} ${mEp[2]}`, label: t };
+      const bare = t.replace(/^(kafka|topic):/i, "");
+      if (t !== bare || d.prepare("SELECT 1 FROM msg_edges WHERE topic=?").get(bare)) return { id: `t:${bare}`, label: bare };
+      const tbl = t.replace(/^(db|table):/i, "");
+      if (t !== tbl || d.prepare("SELECT 1 FROM db_access WHERE tbl=? UNION SELECT 1 FROM db_defs WHERE tbl=?").get(tbl, tbl)) return { id: `d:${tbl}`, label: tbl };
+      const hit = resolveTarget(d, t);
+      return hit ? { id: `f:${hit.file.path}`, label: hit.file.path } : null;
+    };
+    const A = resolveNode(source);
+    const B = resolveNode(target);
+    if (!A) return `'${source}' resolves to nothing in the graph (file, symbol, topic, table, or 'GET /path').`;
+    if (!B) return `'${target}' resolves to nothing in the graph (file, symbol, topic, table, or 'GET /path').`;
+    if (A.id === B.id) return "Same node.";
+
+    // --- lazy neighbor expansion over imports + seams; asserted edges carry
+    //     their provenance. BFS = fewest hops; expansion capped so a hub graph
+    //     cannot melt the server.
+    const fidOf = new Map();
+    const fileId = (pth) => {
+      if (!fidOf.has(pth)) fidOf.set(pth, d.prepare("SELECT id FROM files WHERE path=?").get(pth)?.id ?? null);
+      return fidOf.get(pth);
+    };
+    const pathOfId = (id) => d.prepare("SELECT path FROM files WHERE id=?").get(id)?.path;
+    const neighbors = (node) => {
+      const out = [];
+      const [kind, rest] = [node.slice(0, 1), node.slice(2)];
+      if (kind === "f") {
+        const fid = fileId(rest);
+        if (fid == null) return out;
+        for (const r of d.prepare("SELECT dst, kind FROM edges WHERE src=? LIMIT 200").all(fid)) {
+          const p2 = pathOfId(r.dst); if (p2) out.push({ node: `f:${p2}`, how: `${r.kind === "ref" ? "references (SCIP)" : "imports"}`, at: rest });
+        }
+        for (const r of d.prepare("SELECT src, kind FROM edges WHERE dst=? LIMIT 200").all(fid)) {
+          const p2 = pathOfId(r.src); if (p2) out.push({ node: `f:${p2}`, how: `${r.kind === "ref" ? "referenced by (SCIP)" : "imported by"}`, at: p2 });
+        }
+        for (const r of d.prepare("SELECT topic, direction, line, source FROM msg_edges WHERE file_id=? LIMIT 60").all(fid)) {
+          out.push({ node: `t:${r.topic}`, how: `${r.direction}s topic`, at: `${rest}:${r.line}`, src: r.source });
+        }
+        for (const r of d.prepare("SELECT tbl, mode, line, source FROM db_access WHERE file_id=? LIMIT 60").all(fid)) {
+          out.push({ node: `d:${r.tbl}`, how: `${r.mode} table`, at: `${rest}:${r.line}`, src: r.source });
+        }
+        for (const r of d.prepare("SELECT method, path, line, source FROM http_endpoints WHERE file_id=? LIMIT 60").all(fid)) {
+          out.push({ node: `e:${r.method} ${r.path}`, how: "serves endpoint", at: `${rest}:${r.line}`, src: r.source });
+        }
+        for (const r of d.prepare("SELECT method, norm, line, source FROM http_calls WHERE file_id=? LIMIT 60").all(fid)) {
+          out.push({ node: `e:${r.method} ${r.norm}`, how: "calls endpoint", at: `${rest}:${r.line}`, src: r.source });
+        }
+      } else if (kind === "t") {
+        for (const r of d.prepare(`SELECT f.path, m.direction, m.line, m.source FROM msg_edges m JOIN files f ON f.id=m.file_id
+            WHERE m.topic=? LIMIT 120`).all(rest)) {
+          out.push({ node: `f:${r.path}`, how: r.direction === "produce" ? "produced by" : "consumed by", at: `${r.path}:${r.line}`, src: r.source });
+        }
+      } else if (kind === "d") {
+        for (const r of d.prepare(`SELECT f.path, a.mode, a.line, a.source FROM db_access a JOIN files f ON f.id=a.file_id
+            WHERE a.tbl=? LIMIT 120`).all(rest)) {
+          out.push({ node: `f:${r.path}`, how: `${r.mode}-accessed by`, at: `${r.path}:${r.line}`, src: r.source });
+        }
+      } else if (kind === "e") {
+        const sp = rest.indexOf(" ");
+        const method = rest.slice(0, sp), pth = rest.slice(sp + 1);
+        for (const r of d.prepare(`SELECT f.path, e.line, e.source FROM http_endpoints e JOIN files f ON f.id=e.file_id
+            WHERE e.method=? AND (e.path=? OR e.norm=?) LIMIT 60`).all(method, pth, pth)) {
+          out.push({ node: `f:${r.path}`, how: "served by", at: `${r.path}:${r.line}`, src: r.source });
+        }
+        for (const r of d.prepare(`SELECT f.path, c.line, c.source FROM http_calls c JOIN files f ON f.id=c.file_id
+            WHERE c.method=? AND (c.path=? OR c.norm=?) LIMIT 60`).all(method, pth, pth)) {
+          out.push({ node: `f:${r.path}`, how: "called by", at: `${r.path}:${r.line}`, src: r.source });
+        }
+      }
+      return out;
+    };
+    const MAXHOPS = 6, MAXEXPAND = 4000;
+    const prev = new Map([[A.id, null]]);
+    let frontier = [A.id];
+    let expanded = 0;
+    let found = false;
+    for (let hop = 0; hop < MAXHOPS && frontier.length && !found; hop++) {
+      const next = [];
+      for (const n of frontier) {
+        if (expanded++ > MAXEXPAND) break;
+        for (const nb of neighbors(n)) {
+          if (prev.has(nb.node)) continue;
+          prev.set(nb.node, { from: n, ...nb });
+          if (nb.node === B.id) { found = true; break; }
+          next.push(nb.node);
+        }
+        if (found) break;
+      }
+      frontier = next;
+    }
+    if (!found) return `No path within ${MAXHOPS} hops between '${A.label}' and '${B.label}' (${expanded} expansions). They may connect through code the graph cannot see — graph_gaps lists the blind spots.`;
+    const hops = [];
+    for (let cur = B.id; prev.get(cur); cur = prev.get(cur).from) {
+      const e = prev.get(cur);
+      hops.unshift(`${e.from.slice(2)} —[${e.how}${e.src && e.src !== "static" ? `, ${e.src}` : ""} @ ${e.at}]→ ${cur.slice(2)}`);
+    }
+    noteFiles(hops.flatMap((h) => [...h.matchAll(/([\w./-]+\.[a-z]{1,4}):\d+/g)].map((m) => m[1])));
+    return { from: A.label, to: B.label, hops: hops.length, path: hops,
+      note: "provenance rides each hop (parsed unless marked asserted:<author>); dashed-in-the-view = asserted here too" };
+  }));
+
+tool(server, "usage_report",
+  "The context-ROI ledger: how many bytes Ariadne served vs what the answered questions would have cost in raw file reads (the files each answer spans, measured from the index). Local-only (.ariadne/usage.jsonl); nothing leaves the machine. days: look-back window (default 7).",
+  { days: z.number().int().optional() },
+  ({ days }) => {
+    const win = clamp(days ?? 7, 1, 90);
+    if (!fs.existsSync(USAGE_PATH)) return "No usage recorded yet — the ledger starts with the first tool call after this update.";
+    const cut = Math.floor(Date.now() / 1000) - win * 86400;
+    const byTool = new Map();
+    let calls = 0, bytes = 0, naive = 0;
+    for (const line of fs.readFileSync(USAGE_PATH, "utf8").split("\n")) {
+      if (!line) continue;
+      let r; try { r = JSON.parse(line); } catch { continue; }
+      if (r.ts < cut) continue;
+      calls++; bytes += r.bytes || 0; naive += r.naive_bytes || 0;
+      const t = byTool.get(r.tool) ?? { calls: 0, bytes: 0, naive_bytes: 0 };
+      t.calls++; t.bytes += r.bytes || 0; t.naive_bytes += r.naive_bytes || 0;
+      byTool.set(r.tool, t);
+    }
+    if (!calls) return `No usage in the last ${win} day(s).`;
+    const top = [...byTool.entries()].sort((a, b) => b[1].calls - a[1].calls).slice(0, 8)
+      .map(([t, v]) => ({ tool: t, ...v }));
+    return {
+      window_days: win, calls, bytes_served: bytes,
+      naive_read_bytes: naive,
+      saved_pct: naive > 0 ? Math.round((1 - bytes / naive) * 1000) / 10 : null,
+      note: naive > 0
+        ? "naive_read_bytes = the on-disk size of the files each answer spans — what reading instead of asking would have cost. Local ledger, nothing leaves the machine."
+        : "naive baseline appears once file-spanning tools (context_pack, plan_context, change_check…) are used.",
+      by_tool: top,
+    };
+  });
+
 tool(server, "change_check",
   "PRE-EDIT decision support: given the files you intend to touch, ONE call returning their combined blast radius, the tests to re-run, the seam warnings your edit could introduce (sole producers/consumers, drift tables, uncalled endpoints, unresolved expressions), the decisions governing them, and the assertions your edit will mark STALE. Call BEFORE proposing a diff.",
   { files: z.array(z.string().min(1).max(500)).min(1).max(20) },
   ({ files }) => withDb((d) => {
+    noteFiles(files);
     const known = [];
     const unknown = [];
     for (const p of files) {
@@ -1265,8 +1470,10 @@ tool(server, "change_check",
       for (const l of b.by_depth) for (const p of l) affected.add(p);
       for (const t of b.tests_affected ?? []) testsAffected.add(t);
       const seams = fileSeams(d, f.id);
+      const wt = wtLabel(d, f.id);
       perFile.push({
         path: f.path,
+        ...(wt ? { state: wt } : {}),
         direct_dependents: d.prepare("SELECT COUNT(*) c FROM edges WHERE dst=?").get(f.id).c,
         ...(seams.topics.length ? { kafka: seams.topics.map((t) => `${t.direction} ${t.topic}`) } : {}),
         ...(seams.tables.length ? { database: seams.tables.map((t) => `${t.mode} ${t.tbl}`) } : {}),
@@ -1291,6 +1498,10 @@ tool(server, "change_check",
       }
     }
     if (sole.length) warn.sole_seam_side = sole;
+    // facts resting on uncommitted work: fine while YOU are the editor, a trap
+    // when a reviewer or a second agent trusts them as committed truth
+    const dirtyKnown = perFile.filter((f) => f.state).map((f) => `${f.path} (${f.state})`);
+    if (dirtyKnown.length) warn.based_on_uncommitted_state = dirtyKnown.map((x) => `${x} — commit (or verify) before treating downstream conclusions as durable`);
     const drift = d.prepare(`SELECT DISTINCT a.tbl FROM db_access a WHERE a.file_id IN (${idMarks})
       AND a.tbl NOT IN (SELECT tbl FROM db_defs)`).all(...kids).map((r) => r.tbl);
     if (drift.length) warn.drift_tables_touched = drift.map((t) => `${t} — accessed here but no changeset defines it; fix the changelog with this change, or explain why not`);
