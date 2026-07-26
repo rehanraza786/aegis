@@ -14,6 +14,8 @@ The output is an assessment, not code. Do not start implementing partway through
 
 ## Procedure
 
+> **One-call shortcut:** `change_check(<files you intend to touch>)` performs Steps 2–4 in one call — blast radius, tests to re-run, seam warnings (sole-producer, drift, uncalled endpoints), governing decisions, and assertions the edit would stale. Run it FIRST; walk the steps below only where its output demands a deeper look. The server prompt `/aegis-impact <target>` renders the same analysis as a brief.
+
 **Step 1 — Name the target precisely.** A file, a class, a method, a table, a
 topic, or an endpoint. If the request is vague ("change how orders work"), narrow
 it with `find_symbol` / `search_code` first, and state what you settled on.

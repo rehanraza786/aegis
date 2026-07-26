@@ -16,6 +16,8 @@ references it.**
 
 ## Step 1 — Establish the current truth (before writing anything)
 
+> **One-call shortcut:** `change_check(<entity + changeset files>)` surfaces drift warnings, dependents, and the tests that pin current behavior before you write the changeset; `db_map <table>` stays the drill-down.
+
 - `db_map <table>` — does the table already exist? What changesets shaped it?
   Who reads and writes it today?
 - If the table shows **DRIFT: accessed by code but no changeset defines it**, stop

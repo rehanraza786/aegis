@@ -3,7 +3,7 @@
   "ariadne": {
     "label": "Ariadne (built-in: SQLite graph + SCIP compiler-grade, GitLab CI team sharing)",
     "managed": true,
-    "toolHints": "Use module_map to orient, search_code/find_symbol to locate code, file_outline instead of reading files, blast_radius before modifying shared code, find_callers/find_callees for the call graph, message_flow for Kafka topology, db_map for tables/Liquibase/drift, http_map for REST endpoint\u2194caller correlation across the stack, and find_references (SCIP) for compiler-grade lookup. Read docs/generated/agent-context.md FIRST. Check index_status if stale; reindex if fresh=false."
+    "toolHints": "Start with plan_context(task) \u2014 files to read, seams, governing decisions, and tests in ONE call \u2014 and run change_check(files) BEFORE editing to get blast radius, tests to re-run, and seam warnings. Server prompts /aegis-impact, /aegis-orient, /aegis-resolve-gap, /aegis-release-check render these flows for you. Drill down with module_map to orient, search_code/find_symbol to locate code, file_outline instead of reading files, blast_radius before modifying shared code, find_callers/find_callees for the call graph, message_flow for Kafka topology, db_map for tables/Liquibase/drift, http_map for REST endpoint\u2194caller correlation across the stack, and find_references (SCIP) for compiler-grade lookup. Read docs/generated/agent-context.md FIRST. Check index_status if results look stale; reindex absorbs uncommitted work too (fresh=false means run it)."
   },
   "codebase-memory": {
     "label": "codebase-memory-mcp (external: tree-sitter, 158 languages, static binary)",

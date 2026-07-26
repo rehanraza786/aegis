@@ -69,7 +69,11 @@ Write-back is `annotate.mjs`/`annotate.py '<json>'`, same semantics as the
 `save_insight` / `assert_edge` MCP tools, with one addition: the default
 provenance is **`human`** (insights land as `human:graph-view`, assertion edges
 as `asserted:human`), so a person's annotation is distinguishable from both a
-parsed fact and a model's inference, everywhere it appears.
+parsed fact and a model's inference, everywhere it appears. Assertion payloads
+anchor to evidence with `file` + `line` (the graph view's draw-to-connect
+gesture prefills the seam fields but still demands the anchor), and the action
+set is `insight`, `assert`, `dismiss` (gap triage: `{gap, key, reason}` mutes a
+gap card auditably), `retract`, and `reaffirm`.
 
 One provenance rule for seam rows: `source` stays two-valued (`static` for
 parsed, `asserted:<author>` for derived), never encode test-ness there. Whether

@@ -12,6 +12,8 @@ ladder. Follow the ladder in order and stop as soon as the question is answered.
 
 ## The ladder (cheapest first — never skip a rung)
 
+> **One-call shortcut:** `plan_context(<the request>)` returns the files to read, the seams involved, governing decisions, and the tests that pin behavior — most orientation briefs start (and often end) there. The server prompt `/aegis-orient <module>` renders a ready-made brief. Use the ladder below to drill into whatever those surface.
+
 1. **`docs/generated/agent-context.md`** — read this first, always. ~100 lines:
    modules, Kafka topics, database tables, REST endpoints, high-risk files,
    standing decisions, house rules. If it exists and is fresh, most orientation

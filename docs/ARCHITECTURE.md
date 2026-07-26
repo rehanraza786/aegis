@@ -96,11 +96,18 @@ UI-scale ceiling (`maxExportItems`) with the same warnings-first rule.
 
 ## Serving
 
-Each edition's `server` registers the same 24 MCP tools (a suite check pins the
-registries equal — see docs/TOOLS.md) over stdio, opens the DB read-only with
-reopen-on-swap, and loads trust-approved `*.tool.*` extensions. Writer tools
-(`save_decision`, `save_insight`) use short-lived connections with a 10s busy
-timeout so they wait out an in-flight index instead of failing.
+Each edition's `server` registers the same 26 MCP tools, 4 server-rendered
+prompts (`/aegis-impact`, `/aegis-orient`, `/aegis-resolve-gap`,
+`/aegis-release-check`), and 7 `ariadne://` resources with real subscription
+support (`resources/updated` + `list_changed` fan out when the index moves) — a
+suite check pins all four registries equal across editions (see docs/TOOLS.md).
+Everything is served over stdio only; the DB opens read-only with identity
+revalidation and reopen-on-error, and trust-approved `*.tool.*` extensions
+load alongside. Tool responses pass through a shared budget (row caps at every
+nesting level, warnings kept first, a `budget` field reporting what fell) so no
+single call can flood the model's context. Writer tools (`save_decision`,
+`save_insight`) use short-lived connections with a 10s busy timeout so they
+wait out an in-flight index instead of failing.
 
 ## Multi-root workspaces
 

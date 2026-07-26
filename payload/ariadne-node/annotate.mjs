@@ -128,5 +128,5 @@ if (a.action === "insight") {
   }
 
 } else {
-  die('action must be "insight", "assert", "retract", or "reaffirm".');
+  die('action must be "insight", "assert", "dismiss", "retract", or "reaffirm".');
 }

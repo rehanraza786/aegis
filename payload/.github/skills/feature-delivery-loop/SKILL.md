@@ -12,6 +12,8 @@ iteration after iteration — until the Definition of Done is fully satisfied.
 
 ## Phase 0: Frame the story
 
+> **Start with one call, not six:** `plan_context(<task>)` hands you the files to read, seams, governing decisions, and tests for this story; `change_check(<files>)` before each increment's edits gives blast radius, tests to re-run, and seam warnings. Drill down with single tools only where those point.
+
 If the `spec-driven-artifacts` skill is available, run its SPECIFY → PLAN →
 TASKS phases first: the acceptance criteria live in spec.md, the slicing in
 tasks.md, and each loop iteration below updates tasks.md checkboxes, appends

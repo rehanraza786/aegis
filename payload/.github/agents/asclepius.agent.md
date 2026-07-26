@@ -19,6 +19,8 @@ Load `flow-tracing` (debug mode) and `change-impact-analysis` from
 
 ## Method
 
+Open with `plan_context(<the symptom's subsystem>)` to load the seams, decisions, and tests around the failure in one call; `message_flow`/`db_map`/`http_map` stay the per-seam drill-downs.
+
 **1. Reproduce, or say you cannot.** Before anything else, establish how to
 observe the failure. A failing test, a command, a request, a log line. If you
 cannot reproduce it, say so plainly and switch to evidence-gathering — do not

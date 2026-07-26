@@ -1,11 +1,13 @@
 # Ariadne tool reference
 
-All 26 MCP tools — plus 4 server-rendered prompts and 6 `ariadne://`
+All 26 MCP tools — plus 4 server-rendered prompts and 7 `ariadne://`
 resources — identical across both editions (a suite check pins the tool,
 prompt, and resource registries equal, and pins this document to them). Every
-result is budget-capped (rows and bytes, warnings kept first); every error
-returns as a message the agent can adapt to, never a crash. Params marked ?
-are optional.
+result is budget-capped at EVERY nesting level (rows and bytes, warnings kept
+first, nested lists capped with an explicit `…and N more` tail); when rows
+were dropped anywhere, the response opens with a `budget: {rows_capped}`
+field, so a partial view always announces itself. Every error returns as a
+message the agent can adapt to, never a crash. Params marked ? are optional.
 
 Every tool carries MCP annotations: `readOnlyHint: true` on the 22 read-only
 tools, and the four writers (`save_decision`, `save_insight`, `assert_edge`,
@@ -156,7 +158,12 @@ these and the server emits `notifications/resources/updated` (plus one
 and within ~2s of a hook- or agent-triggered reindex outside this process.
 
 **`ariadne://graph`** → the full graph-export JSON snapshot (modules, topics,
-tables, endpoints, gaps, annotations), cached until the index moves.
+tables, endpoints, gaps, annotations), cached until the index moves. UI-scale,
+not context-scale — easily hundreds of KB on a real workspace; agents should
+read the summary below or use tools.
+
+**`ariadne://graph/summary`** → a ~1KB overview: per-layer counts, the
+highest-degree modules, gap totals. The agent-safe glance at the whole graph.
 
 **`ariadne://status`** → freshness JSON; the resource twin of `index_status`.
 
@@ -168,5 +175,7 @@ orientation pack.
 **`ariadne://decisions/{id}`** → one ADR as markdown (the git-versioned source
 file when present, else the indexed summary).
 
-**`ariadne://assertions`** → the human knowledge layer:
+**`ariadne://assertions`** → the human knowledge layer (newest-first, capped
+at 200 with `total`/`showing` — the full ledger stays in
+docs/graph-assertions.json):
 `docs/graph-assertions.json` with a computed `stale` flag per assertion.

@@ -331,9 +331,10 @@ Tests: {n_test} test files indexed. Test-derived facts are labeled [TEST] in too
 
 ## How to look things up (cheapest first)
 1. This pack + `docs/generated/*.md` (architecture, message-flows, data-map), already summarized.
-2. Ariadne MCP tools. `find_symbol`, `file_outline`, `find_callers`, `blast_radius`, `message_flow`, `db_map`, `find_references` (SCIP, compiler-grade).
-3. `.github/knowledge/` (Delphi) for module intent and gotchas; `docs/features/` for specs and task state; `docs/constitution.md` for non-negotiables.
-4. Source files, only to edit, or when the layers above point you to a specific location.
+2. Ariadne composites, ONE call each: `plan_context(task)` before starting work (files, seams, decisions, tests), `change_check(files)` before editing (blast radius, tests to re-run, seam warnings). Server prompts `/aegis-impact` `/aegis-orient` `/aegis-resolve-gap` `/aegis-release-check` render the full flows.
+3. Single Ariadne tools to drill down. `context_pack`, `find_symbol`, `file_outline`, `find_callers`, `blast_radius`, `message_flow`, `db_map`, `find_references` (SCIP, compiler-grade).
+4. `.github/knowledge/` (Delphi) for module intent and gotchas; `docs/features/` for specs and task state; `docs/constitution.md` for non-negotiables.
+5. Source files, only to edit, or when the layers above point you to a specific location.
 
 ## High-risk files (largest blast radius, check dependents before touching)
 {chr(10).join(f"- `{h['path']}` ({h['n']} dependents)" for h in hot6)}
