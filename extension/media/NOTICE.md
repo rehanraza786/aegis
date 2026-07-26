@@ -7,6 +7,12 @@
   https://github.com/cytoscape/cytoscape.js-edgehandles — bundled
   self-contained (inlines lodash.memoize and lodash.throttle, both MIT) so the
   drag-to-connect assert gesture works with zero network egress.
+- `fcose.min.js` — cytoscape-fcose 2.2.0, MIT license,
+  https://github.com/iVis-at-Bilkent/cytoscape.js-fcose — bundled
+  self-contained (inlines cose-base and layout-base, both MIT). Spectral +
+  fast-CoSE layout: the same map cose computed in tens of seconds at ~1k
+  nodes lands in a fraction of that, so the view stays an instrument at scale.
+  Zero network egress, like everything else in media/.
 
 The SVG exporter is first-party code in graph-view.html (a purpose-built
 serializer for the view's four node shapes) — the common cytoscape SVG plugin

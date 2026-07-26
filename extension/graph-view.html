@@ -11,7 +11,7 @@
   body {
     font-family: var(--vscode-font-family); font-size: var(--vscode-font-size, 13px);
     color: var(--vscode-foreground); background: var(--vscode-editor-background);
-    display: grid; grid-template-rows: auto 1fr; grid-template-columns: 1fr 340px;
+    display: grid; grid-template-rows: auto 1fr; grid-template-columns: 1fr minmax(240px, auto);
     grid-template-areas: "bar bar" "graph side"; overflow: hidden;
   }
   #bar { grid-area: bar; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
@@ -36,7 +36,15 @@
   button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
   button:hover { filter: brightness(1.1); }
   #cy { grid-area: graph; min-width: 0; min-height: 0; }
-  #side { grid-area: side; border-left: 1px solid var(--vscode-panel-border); overflow-y: auto; padding: 10px 12px; }
+  /* horizontally resizable: drag the left edge (native resize handle) */
+  #side { grid-area: side; border-left: 1px solid var(--vscode-panel-border); overflow-y: auto; padding: 10px 12px;
+          width: 340px; resize: horizontal; overflow-x: auto; min-width: 240px; max-width: 70vw; direction: rtl; }
+  #side > * { direction: ltr; }
+  details.gap-sec > summary { cursor: pointer; font-weight: 600; padding: 4px 0;
+          position: sticky; top: 0; background: var(--vscode-editor-background, inherit); z-index: 1; }
+  details.gap-sec { margin: 8px 0; }
+  button.more { margin: 6px 0; }
+  #refreshPill { display: flex; gap: 8px; align-items: center; }
   #side h3 { margin: 4px 0 8px; font-size: 1em; }
   #side h4 { margin: 12px 0 4px; font-size: .95em; opacity: .85; }
   .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: .9em; opacity: .85; margin: 2px 0 8px; }
@@ -77,7 +85,8 @@
 <body>
   <div id="bar">
     <span class="title">AEGIS Graph</span>
-    <input id="search" type="search" placeholder="Search nodes ( / )" autocomplete="off">
+    <input id="search" type="search" placeholder="Search nodes ( / )" autocomplete="off"
+           role="combobox" aria-expanded="false" aria-controls="results" aria-autocomplete="list">
     <label><input type="checkbox" id="tTopics" checked> Topics</label>
     <label><input type="checkbox" id="tTables" checked> Tables</label>
     <label><input type="checkbox" id="tEndpoints" checked> Endpoints</label>
@@ -103,15 +112,22 @@
     <div id="asserts"></div>
     <div id="gaps"></div>
   </div>
-  <div class="toast" id="toast"></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <div class="toast" id="refreshPill" style="display:none" role="status" aria-live="polite">
+    <span>Graph updated while you were typing&nbsp;</span>
+    <button id="refreshApply" type="button">Apply refresh</button>
+  </div>
+  <div class="toast" id="drawBanner" style="display:none" role="status">Draw: click a source node, then a target · Esc cancels</div>
 
 <script nonce="__NONCE__" src="__CYTOSCAPE__"></script>
 <script nonce="__NONCE__" src="__EDGEHANDLES__"></script>
+<script nonce="__NONCE__" src="__FCOSE__"></script>
 <script nonce="__NONCE__">
 const vscode = acquireVsCodeApi();
 let G = null, cy = null, selected = null, eh = null, drawing = false;
 // drag-to-connect: bundled in the vsix (see media/NOTICE.md), zero egress
 if (typeof cytoscapeEdgehandles !== "undefined") cytoscape.use(cytoscapeEdgehandles);
+if (typeof cytoscapeFcose !== "undefined") cytoscape.use(cytoscapeFcose);
 
 /* VS Code's own chart palette adapts to the active theme (light AND dark).
    Identity is never color-alone: node SHAPE + text label carry the type. */
@@ -140,10 +156,11 @@ const toast = (msg, isErr) => {
    from the same seed every time (cose runs randomize:false on top), and nodes
    that appear later (e.g. enabling a layer) land somewhere stable instead of
    stacking at 0,0. Same id → same spot, forever. */
+let hashSpan = { w: 1000, h: 620 }; // grows with node count (see elements())
 function hashPos(id) {
   let h1 = 0x811c9dc5, h2 = 0x1000193;
   for (let i = 0; i < id.length; i++) { h1 = ((h1 ^ id.charCodeAt(i)) * 16777619) >>> 0; h2 = ((h2 * 31) + id.charCodeAt(i)) >>> 0; }
-  return { x: 120 + (h1 % 1000), y: 80 + (h2 % 620) };
+  return { x: 120 + (h1 % hashSpan.w), y: 80 + (h2 % hashSpan.h) };
 }
 
 function elements() {
@@ -206,15 +223,29 @@ function elements() {
       });
     }
   }
-  // every node gets a deterministic seed position (see hashPos)
+  // every node gets a deterministic seed position (see hashPos). The seed box
+  // grows with √n — a FIXED 1000×620 box packed 1k nodes closer than a node
+  // radius, so mis-taps (and drag-to-connect grabbing the wrong source) were
+  // geometrically guaranteed.
+  const nNodes = els.filter((e) => !e.data.source).length;
+  const w = Math.max(1000, Math.round(420 * Math.sqrt(nNodes)));
+  hashSpan = { w, h: Math.max(620, Math.round(w * 0.62)) };
   for (const el of els) if (!el.data.source) el.position = hashPos(el.data.id);
   return els;
 }
 
-function style() {
+function style(nodeCount) {
   const c = C();
+  // straight edges keep their arrows but skip bezier control-point math —
+  // measured 14.4fps panning at ~1k nodes with beziers
+  const edgeCurve = (nodeCount ?? 0) > 500 ? "straight" : "bezier";
   return [
+    // min-zoomed-font-size is the label LOD: labels vanish below the zoom
+    // threshold NATIVELY (no style mutation inside zoom events — the
+    // hand-rolled JS version cost a 700ms stall crossing the threshold at 1k
+    // nodes, and at default zoom 98% of labels overlapped another label)
     { selector: "node", style: { label: "data(label)", color: c.ink, "font-size": 11,
+        "min-zoomed-font-size": 8,
         "text-valign": "center", "text-halign": "center", "text-wrap": "wrap", "text-max-width": 110,
         "border-width": 1.5, "border-color": c.line } },
     { selector: 'node[type="module"]', style: { shape: "round-rectangle", width: 120, height: 34,
@@ -230,19 +261,16 @@ function style() {
     { selector: "node[?testOnly]", style: { opacity: .45 } },
     { selector: "node:selected", style: { "border-width": 3, "overlay-opacity": .08 } },
     { selector: "edge", style: { width: 1.4, "line-color": c.line, "target-arrow-color": c.line,
-        "target-arrow-shape": "triangle", "arrow-scale": .8, "curve-style": "bezier",
-        label: "data(label)", "font-size": 8.5, color: c.ink, "text-opacity": .75,
+        "target-arrow-shape": "triangle", "arrow-scale": .8, "curve-style": edgeCurve,
+        label: "data(label)", "font-size": 8.5, "min-zoomed-font-size": 7, color: c.ink, "text-opacity": .75,
         "text-background-color": c.bg, "text-background-opacity": .85, "text-background-padding": 1 } },
     { selector: 'edge[type="produce"], edge[type="consume"]', style: { "line-color": c.topic, "target-arrow-color": c.topic, "line-opacity": .7 } },
-    { selector: 'edge[type="access"]', style: { "line-color": c.table, "target-arrow-color": c.table, "line-opacity": .7 } },
+    { selector: 'edge[type="access"]', style: { "line-color": c.table, "target-arrow-color": c.table, "line-opacity": .7, "target-arrow-shape": "square" } },
     { selector: 'edge[type="testedge"]', style: { "line-style": "dotted", opacity: .4 } },
-    { selector: 'edge[type="serve"], edge[type="httpcall"]', style: { "line-color": c.endpoint, "target-arrow-color": c.endpoint, "line-opacity": .65 } },
+    { selector: 'edge[type="serve"], edge[type="httpcall"]', style: { "line-color": c.endpoint, "target-arrow-color": c.endpoint, "line-opacity": .65, "target-arrow-shape": "vee" } },
     { selector: "edge[?asserted]", style: { "line-style": "dashed" } },
     // focus mode: everything outside the selected neighborhood recedes
     { selector: ".dim", style: { opacity: .13, "text-opacity": .1 } },
-    // label level-of-detail: edge labels appear past a zoom threshold (or on selection)
-    { selector: "edge.lod-hidden", style: { "text-opacity": 0 } },
-    { selector: "edge.lod-hidden:selected", style: { "text-opacity": .8 } },
     // drag-to-connect: the in-flight gesture uses the warning color so a draft
     // edge is never mistaken for a real (parsed or asserted) one
     { selector: ".eh-source, .eh-target", style: { "border-width": 3, "border-color": c.warn } },
@@ -269,9 +297,15 @@ function inferAssert(a, b) {
 
 function setDrawMode(on) {
   drawing = !!on && !!eh;
-  document.getElementById("drawEdge").classList.toggle("on", drawing);
+  const btn = document.getElementById("drawEdge");
+  btn.classList.toggle("on", drawing);
+  btn.setAttribute("aria-pressed", String(drawing));
+  // a latched mode needs a VISIBLE latch: the banner stays up while drawing
+  // (the one-shot toast disappeared and left no trace that clicks now draw)
+  const banner = document.getElementById("drawBanner");
+  if (banner) banner.style.display = drawing ? "block" : "none";
   if (!eh) return;
-  if (drawing) { eh.enableDrawMode(); toast("Draw mode: drag from a module to a topic/table/endpoint (or topic/table to a module). Esc cancels."); }
+  if (drawing) eh.enableDrawMode();
   else eh.disableDrawMode();
 }
 
@@ -318,42 +352,56 @@ function schedulePersist() {
     } });
   }, 800);
 }
-let lodShown = null;
-function updateLod() {
-  const show = cy.zoom() >= 0.75;
-  if (show === lodShown) return;
-  lodShown = show;
-  cy.edges()[show ? "removeClass" : "addClass"]("lod-hidden");
-}
-
 function render(keepPositions, freshLayout) {
   const live = keepPositions && cy ? Object.fromEntries(cy.nodes().map((n) => [n.id(), n.position()])) : null;
   const stored = !freshLayout && !live && savedState?.positions ? savedState.positions : null;
   if (cy) cy.destroy();
   const preset = live || stored;
-  cy = cytoscape({ container: document.getElementById("cy"), elements: elements(), style: style(),
+  const els = elements();
+  const nNodes = els.filter((e) => !e.data.source).length;
+  const nEdges = els.length - nNodes;
+  // Layout staging by size (measured: synchronous cose took 2.0s at 240
+  // nodes, 27s at ~1k — the view stopped being an instrument):
+  //   preset  — live/stored positions always win (spatial memory)
+  //   fcose   — spectral + fast CoSE (bundled, MIT): the default fresh layout
+  //   grid    — past ~800 nodes even fcose is seconds; a legible grid now
+  //             beats a beautiful carpet later (drill down via search/focus)
+  //   cose    — only if the fcose bundle somehow failed to load
+  const fresh = nNodes > 800
+    ? { name: "grid", condense: true, padding: 24 }
+    : (typeof cytoscapeFcose !== "undefined"
+      ? { name: "fcose", quality: "default", animate: false, randomize: false,
+          nodeSeparation: 90, idealEdgeLength: 110, padding: 24,
+          nodeDimensionsIncludeLabels: true }
+      : { name: "cose", animate: false, randomize: false, nodeRepulsion: 90000, idealEdgeLength: 110,
+          padding: 24, nodeDimensionsIncludeLabels: true, nodeOverlap: 24, componentSpacing: 120,
+          numIter: nNodes > 250 ? 400 : 1000 });
+  cy = cytoscape({ container: document.getElementById("cy"), elements: els, style: style(nNodes),
     // priority: live positions (toggles/refreshes never rearrange the map) →
-    // stored positions (the map survives closing the panel) → deterministic
-    // cose from hashPos seeds (randomize:false), so even a fresh layout is
-    // the same layout every time
-    layout: preset ? { name: "preset", positions: (n) => preset[n.id()] || hashPos(n.id()) }
-                   : { name: "cose", animate: false, randomize: false, nodeRepulsion: 90000, idealEdgeLength: 110,
-                       padding: 24, nodeDimensionsIncludeLabels: true, nodeOverlap: 24, componentSpacing: 120 },
+    // stored positions (the map survives closing the panel) → staged fresh
+    // layout from hashPos seeds, so even a fresh layout is stable run to run
+    layout: preset ? { name: "preset", positions: (n) => preset[n.id()] || hashPos(n.id()) } : fresh,
+    // pans move a texture instead of re-painting thousands of paths; edges
+    // hide during viewport changes only past real size (measured 14.4fps
+    // panning at ~1k nodes without these)
+    textureOnViewport: nNodes > 300,
+    hideEdgesOnViewport: nEdges > 2000,
     wheelSensitivity: .2 });
+  if (!preset && nNodes > 800) toast(`${nNodes} nodes — using the fast grid layout. Search (/) and click to focus; Layout re-runs it.`);
   window._cy = cy; // debug/test hook (the container div already owns window.cy)
   cy.on("tap", "node", (ev) => { selected = ev.target.data(); showDetails(selected); focusOn(ev.target); });
   cy.on("tap", (ev) => { if (ev.target === cy) { selected = null; resetDetails(); unfocus(); } });
-  // LOD is deferred to the next frame: toggling classes synchronously INSIDE
-  // the zoom event re-enters the renderer mid-viewport-change and can crash
-  // the webview's Chromium (reproduced headless; rAF-deferred it cannot)
-  cy.on("zoom", () => requestAnimationFrame(updateLod));
+  // (label LOD is native now: min-zoomed-font-size — zero JS inside zoom
+  // events, which is also the class of bug the harness rules ban)
   cy.on("layoutstop dragfree pan zoom", schedulePersist);
   // drag-to-connect re-arms per cy instance; any re-render leaves draw mode
   try { eh?.destroy(); } catch { /* previous instance already gone */ }
   eh = typeof cy.edgehandles === "function" ? cy.edgehandles({
     canConnect: (s, t) => !!inferAssert(s.data(), t.data()),
     edgeParams: () => ({ data: { label: "" } }),
-    snap: false,
+    // snap: grabbing the nearest node compensates for dense maps — a fixed
+    // hit test mis-grabbed neighbors at 1k-node densities
+    snap: true,
   }) : null;
   setDrawMode(false);
   cy.on("ehcomplete", (ev, src, tgt, added) => {
@@ -366,8 +414,6 @@ function render(keepPositions, freshLayout) {
     cy.viewport({ zoom: savedState.zoom, pan: savedState.pan });
   }
   restoredView = true;
-  lodShown = null;
-  updateLod();
   const c = C();
   document.getElementById("legend").innerHTML =
     `<span><span class="sw" style="background:${c.module}"></span>module</span>` +
@@ -517,6 +563,19 @@ function dismissRow(d, gap, key) {
     <button type="submit" class="secondary">Dismiss</button></form>`;
 }
 
+const PAGE = 50; // per-section page size; "show more" reveals the next page
+const gapsOpen = {}; // section open/closed + page state survives re-renders
+function gapSection(key, title, cls, rows, renderRow, note) {
+  if (!rows.length) return "";
+  const st = gapsOpen[key] ?? (gapsOpen[key] = { open: key === "unresolved", page: 1 });
+  const shown = rows.slice(0, st.page * PAGE);
+  return `<details class="gap-sec" data-sec="${key}"${st.open ? " open" : ""}>
+    <summary class="${cls}">${title} (${rows.length})</summary>
+    ${shown.map(renderRow).join("")}
+    ${rows.length > shown.length ? `<button type="button" class="secondary more" data-more="${key}">Show ${Math.min(PAGE, rows.length - shown.length)} more (${shown.length}/${rows.length})</button>` : ""}
+    ${note || ""}
+  </details>`;
+}
 function renderGaps() {
   renderAssertions();
   const g = document.getElementById("gaps");
@@ -525,24 +584,40 @@ function renderGaps() {
   const orphans = G.topics.filter((t) => t.warnings && (t.warnings.orphan_produce || t.warnings.orphan_consume));
   const drift = G.tables.filter((t) => t.warnings && t.warnings.drift_no_changeset);
   const uncalled = G.endpoints.filter((e) => e.warnings && e.warnings.no_caller);
-  g.innerHTML = `<h3>Gaps — the graph needs a human (${items.length + drift.length + declUnused.length})</h3>
-    ${items.map((it, i) => `<div class="gap-item">
+  // Collapsible per-kind sections with counts and paging: the flat list was
+  // 27,000px of scroll at 1k nodes — a worklist with no landmarks isn't one.
+  g.innerHTML = `<h3>Gaps — the graph needs a human (${items.length + drift.length + declUnused.length + orphans.length + uncalled.length})</h3>
+    ${gapSection("unresolved", "Unresolved expressions", "err", items, (it) => `<div class="gap-item">
       <div class="err">unresolved: <b>${esc(it.expression)}</b> (${esc(it.direction)})</div>
       <div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div>
       <form class="annotate" data-assert='${esc(JSON.stringify({ kind: "kafka", file: it.path, line: it.line, direction: it.direction }))}'>
         <input name="topic" placeholder="Resolved topic name" value="${esc(it.expression.replace(/\{\?\}/g, ""))}">
         <textarea name="evidence" placeholder="Evidence (≥20 chars): how did you resolve it? Quote the constant/config/profile."></textarea>
         <select name="confidence"><option>high</option><option selected>medium</option><option>low</option></select>
-        <button type="submit">Assert resolved topic</button></form></div>`).join("")}
-    ${declUnused.length ? `<h4 class="warn">Declared in config, unused</h4>` + declUnused.map((it) => `<div class="gap-item${it.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(it.topic)}</b> — ${esc(it.config_key)} declares it, but no producer or consumer references it.<div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div>${dismissRow(it.dismissed, "declared_unused", it.topic)}</div>`).join("") : ""}
-    ${drift.length ? `<h4 class="err">Drift tables</h4>` + drift.map((t) => `<div class="gap-item"><span class="err">⚠</span> <b>${esc(t.table)}</b> — no changeset. Click its node to assert.</div>`).join("") : ""}
-    ${orphans.length ? `<h4 class="warn">Orphan topics</h4>` + orphans.map((t) => `<div class="gap-item${t.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(t.topic)}</b> — ${t.warnings.orphan_produce ? "no consumer" : "no producer"} found. Often a real bug: investigate before silencing.${dismissRow(t.dismissed, "orphan_topic", t.topic)}</div>`).join("") : ""}
-    ${uncalled.length ? `<h4 class="warn">Endpoints with no caller</h4>` + uncalled.slice(0, 10).map((e) => `<div class="gap-item"><span class="warn">⚠</span> ${esc(e.method)} <b>${esc(e.path)}</b><div class="site"><a data-open="${esc(e.file)}:${e.line}">${esc(e.file)}:${e.line}</a></div></div>`).join("") + (uncalled.length > 10 ? `<div class="muted">…and ${uncalled.length - 10} more uncalled endpoints (query http_map)</div>` : "") : ""}`;
+        <button type="submit">Assert resolved topic</button></form></div>`)}
+    ${gapSection("declared", "Declared in config, unused", "warn", declUnused, (it) => `<div class="gap-item${it.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(it.topic)}</b> — ${esc(it.config_key)} declares it, but no producer or consumer references it.<div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div>${dismissRow(it.dismissed, "declared_unused", it.topic)}</div>`)}
+    ${gapSection("drift", "Drift tables", "err", drift, (t) => `<div class="gap-item"><span class="err">⚠</span> <b>${esc(t.table)}</b> — no changeset. Click its node to assert.</div>`)}
+    ${gapSection("orphans", "Orphan topics", "warn", orphans, (t) => `<div class="gap-item${t.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(t.topic)}</b> — ${t.warnings.orphan_produce ? "no consumer" : "no producer"} found. Often a real bug: investigate before silencing.${dismissRow(t.dismissed, "orphan_topic", t.topic)}</div>`)}
+    ${gapSection("uncalled", "Endpoints with no caller", "warn", uncalled, (e) => `<div class="gap-item"><span class="warn">⚠</span> ${esc(e.method)} <b>${esc(e.path)}</b><div class="site"><a data-open="${esc(e.file)}:${e.line}">${esc(e.file)}:${e.line}</a></div></div>`,
+      `<div class="muted">the full list answers to http_map</div>`)}`;
+  g.querySelectorAll("details.gap-sec").forEach((d) => d.addEventListener("toggle", () => {
+    (gapsOpen[d.dataset.sec] ?? (gapsOpen[d.dataset.sec] = { page: 1 })).open = d.open;
+  }));
+  g.querySelectorAll("button[data-more]").forEach((b) => b.addEventListener("click", () => {
+    gapsOpen[b.dataset.more].page += 1;
+    renderGaps();
+  }));
   bindDetailHandlers(g);
 }
 
 let citeBox = null; // the evidence textarea nearest the clicked cite link
 function bindDetailHandlers(root) {
+  // jump links are real interactive elements: focusable, activatable by keyboard
+  root.querySelectorAll("a[data-open], a[data-cite]").forEach((a) => {
+    a.setAttribute("tabindex", "0");
+    a.setAttribute("role", "link");
+    a.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); a.click(); } });
+  });
   root.querySelectorAll("a[data-open]").forEach((a) => a.addEventListener("click", () => {
     const [p, l] = a.dataset.open.split(/:(?=\d+$)/);
     vscode.postMessage({ type: "openFile", path: p, line: Number(l) || 1 });
@@ -587,24 +662,53 @@ function bindDetailHandlers(root) {
 }
 
 let endpointsInit = false;
+/* A live refresh (agent commit, git hook, teammate pull) used to REBUILD the
+   side-panel DOM mid-keystroke and erase a half-typed annotation — data loss
+   in the product's core human loop, firing exactly when the tool is used as
+   intended (agent editing in parallel). If any evidence form is in use, the
+   refresh parks behind a passive pill and applies on submit or on click. */
+let pendingData = null;
+function hasLiveDraft() {
+  const a = document.activeElement;
+  if (a && a.closest && a.closest("#details form, #gaps form")) return true;
+  return [...document.querySelectorAll("#details form input, #details form textarea, #gaps form input, #gaps form textarea")]
+    .some((el) => el.value !== el.defaultValue && el.value.trim() !== "");
+}
+function applyData(m) {
+  G = m.graph;
+  if (m.saved) savedState = m.saved;
+  if (!endpointsInit) {
+    // sane default: draw the endpoints layer unless it would wallpaper the map
+    tEndpoints.checked = (G.endpoints || []).length <= 60;
+    endpointsInit = true;
+  }
+  render(m.keepPositions); renderGaps();
+  // selection survives a refresh: re-resolve the node in the NEW graph and
+  // re-render its (possibly changed) details, instead of dropping to blank
+  if (selected) {
+    const n = cy.getElementById(selected.id);
+    if (n && n.nonempty()) { n.select(); selected = n.data(); showDetails(selected); focusOn(n); }
+    else { selected = null; resetDetails(); }
+  }
+}
+function applyPending() {
+  const pill = document.getElementById("refreshPill");
+  if (pill) pill.style.display = "none";
+  if (!pendingData) return;
+  const m = pendingData; pendingData = null;
+  applyData(m);
+}
+document.addEventListener("submit", () => setTimeout(applyPending, 150), true);
 window.addEventListener("message", (ev) => {
   const m = ev.data;
   if (m.type === "data") {
-    G = m.graph;
-    if (m.saved) savedState = m.saved;
-    if (!endpointsInit) {
-      // sane default: draw the endpoints layer unless it would wallpaper the map
-      tEndpoints.checked = (G.endpoints || []).length <= 60;
-      endpointsInit = true;
+    if (hasLiveDraft()) {
+      pendingData = m;
+      const pill = document.getElementById("refreshPill");
+      if (pill) pill.style.display = "flex";
+      return;
     }
-    render(m.keepPositions); renderGaps();
-    // selection survives a refresh: re-resolve the node in the NEW graph and
-    // re-render its (possibly changed) details, instead of dropping to blank
-    if (selected) {
-      const n = cy.getElementById(selected.id);
-      if (n && n.nonempty()) { n.select(); selected = n.data(); showDetails(selected); focusOn(n); }
-      else { selected = null; resetDetails(); }
-    }
+    applyData(m);
   }
   if (m.type === "toast") toast(m.message, m.isError);
   if (m.type === "citation" && citeBox) {
@@ -667,8 +771,22 @@ function graphToSvg() {
 function exportImage(format) {
   if (!cy) return;
   if (format === "png") {
-    vscode.postMessage({ type: "saveImage", format: "png",
-      dataUri: cy.png({ output: "base64uri", full: true, scale: 2, bg: C().bg }) });
+    // Canvas dimension limits are silent: past them, cy.png() hands back a
+    // blank/truncated image and the user discovers it in the PR. Clamp the
+    // scale so width×height stays under the safe limit, and sanity-check the
+    // payload before saving; SVG (first-party serializer) has no such limit.
+    const bb = cy.elements().boundingBox();
+    const MAXDIM = 16000;
+    let scale = 2;
+    const need = Math.max(bb.w, bb.h) || 1;
+    if (need * scale > MAXDIM) scale = Math.max(0.2, MAXDIM / need);
+    const dataUri = cy.png({ output: "base64uri", full: true, scale, bg: C().bg });
+    if (!dataUri || dataUri.length < 1000) {
+      toast("PNG export failed (canvas too large?) — use SVG for very large graphs.", true);
+      return;
+    }
+    if (scale < 2) toast(`Large graph — exported at reduced scale (${scale.toFixed(2)}x). SVG stays lossless at any size.`);
+    vscode.postMessage({ type: "saveImage", format: "png", dataUri });
   } else {
     vscode.postMessage({ type: "saveImage", format: "svg", text: graphToSvg() });
   }
@@ -676,6 +794,7 @@ function exportImage(format) {
 document.getElementById("exportPng").addEventListener("click", () => exportImage("png"));
 document.getElementById("exportSvg").addEventListener("click", () => exportImage("svg"));
 document.getElementById("drawEdge").addEventListener("click", () => setDrawMode(!drawing));
+document.getElementById("refreshApply").addEventListener("click", applyPending);
 
 document.getElementById("refresh").addEventListener("click", () => vscode.postMessage({ type: "refresh" }));
 document.getElementById("staleReindex").addEventListener("click", () => {
@@ -717,18 +836,26 @@ function runSearch() {
   }).filter((it) => it.s > 0).sort((a, b) => b.s - a.s || a.label.length - b.label.length).slice(0, 12);
   sActive = 0;
   resultsEl.innerHTML = sItems.map((it, i) =>
-    `<div class="item${i === 0 ? " active" : ""}" data-i="${i}" role="option"><span class="tag">${it.kind}</span><span>${esc(it.label)}</span></div>`).join("")
+    `<div class="item${i === 0 ? " active" : ""}" data-i="${i}" id="sr-${i}" role="option" aria-selected="${i === 0}"><span class="tag">${it.kind}</span><span>${esc(it.label)}</span></div>`).join("")
     || `<div class="item muted">no matches</div>`;
   resultsEl.classList.add("on");
+  resultsEl.setAttribute("role", "listbox");
+  searchEl.setAttribute("aria-expanded", "true");
+  searchEl.setAttribute("aria-activedescendant", sItems.length ? "sr-0" : "");
   resultsEl.querySelectorAll(".item[data-i]").forEach((d) => d.addEventListener("click", () => jumpTo(sItems[Number(d.dataset.i)])));
 }
 function jumpTo(it) {
   if (!it || !cy) return;
   resultsEl.classList.remove("on");
   searchEl.blur();
-  if (it.kind === "endpoint" && !tEndpoints.checked) { tEndpoints.checked = true; render(true); renderGaps(); }
-  const n = cy.getElementById(it.id);
-  if (!n || n.empty()) return;
+  // a hit on a hidden layer auto-reveals it (silent no-op was the one wrong
+  // option: the node existed, the search "found nothing")
+  const toggleOf = { endpoint: tEndpoints, topic: tTopics, table: tTables };
+  const tg = toggleOf[it.kind];
+  if (tg && !tg.checked) { tg.checked = true; render(true); renderGaps(); toast(`Shown from the hidden ${it.kind} layer.`); }
+  let n = cy.getElementById(it.id);
+  if ((!n || n.empty()) && !tTests.checked) { tTests.checked = true; render(true); renderGaps(); n = cy.getElementById(it.id); }
+  if (!n || n.empty()) { toast(`'${it.label}' is not in the current graph (capped export? run Refresh).`, true); return; }
   cy.animate({ fit: { eles: n.closedNeighborhood(), padding: 120 }, duration: 450, easing: "ease-in-out" });
   cy.$(":selected").unselect();
   n.select();
@@ -742,11 +869,16 @@ searchEl.addEventListener("keydown", (ev) => {
     ev.preventDefault();
     if (!sItems.length) return;
     sActive = (sActive + (ev.key === "ArrowDown" ? 1 : sItems.length - 1)) % sItems.length;
-    resultsEl.querySelectorAll(".item[data-i]").forEach((d, i) => d.classList.toggle("active", i === sActive));
+    resultsEl.querySelectorAll(".item[data-i]").forEach((d, i) => {
+      d.classList.toggle("active", i === sActive);
+      d.setAttribute("aria-selected", String(i === sActive));
+    });
+    searchEl.setAttribute("aria-activedescendant", `sr-${sActive}`);
   } else if (ev.key === "Enter") {
     jumpTo(sItems[sActive]);
   } else if (ev.key === "Escape") {
     resultsEl.classList.remove("on");
+    searchEl.setAttribute("aria-expanded", "false");
     searchEl.blur();
   }
 });

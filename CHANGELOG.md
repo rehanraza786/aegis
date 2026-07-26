@@ -191,6 +191,33 @@ The post-review release. Highlights, roughly in the order they landed:
   briefs so none of it can drift again. PRIVACY/SECURITY grew the missing
   exhibits: webview CSP, stdio-only transports, the inert vendored SDK HTTP
   deps, and the worker-pool / webview-write-path execution contexts.
+- **The graph view stays an instrument at scale.** First, the data-loss bug:
+  a live refresh (agent commit, hook, teammate pull) used to rebuild the
+  side panel mid-keystroke and erase a half-typed annotation — the refresh
+  now parks behind a passive "graph updated" pill while any evidence form is
+  in use and applies on submit or click (headless-verified). Layout is
+  staged by size: cytoscape-fcose (MIT, bundled self-contained, suite
+  egress-gate covered) replaces cose for fresh layouts — measured 982ms at
+  240 nodes and 1.7s at 500 where cose took 2s and ~10s — and past ~800
+  nodes a legible grid renders in under 2s where cose took 27+ seconds
+  (1,002 nodes: 1.9s, with a toast saying so). Label level-of-detail is
+  native now (`min-zoomed-font-size` — the hand-rolled zoom-handler JS and
+  its 700ms threshold stall are deleted); panning rides
+  `textureOnViewport`/`hideEdgesOnViewport` past real sizes, and big maps
+  use straight edges (arrows intact, no bezier math). The seed-position box
+  grows with √n (a fixed 1000×620 box guaranteed mis-taps at 1k nodes) and
+  drag-to-connect snaps to the nearest node. The gaps panel became an
+  actual worklist: collapsible per-kind sections with counts, sticky
+  headers, and 50-a-page "show more" (the flat list was 27,000px of scroll
+  at 1k nodes). Search auto-reveals hits on hidden layers (with a toast)
+  instead of silently doing nothing; PNG export clamps its scale under the
+  canvas limit and sanity-checks the payload instead of silently saving a
+  blank file (the toast suggests SVG for huge maps); draw mode latches with
+  a visible banner and `aria-pressed`. Accessibility sweep: jump links are
+  keyboard-focusable with link roles, toasts are `aria-live`, search is a
+  proper combobox (arrow keys + `aria-activedescendant`), and edge kinds
+  carry non-color redundancy (per-kind arrow shapes; dashes stay the
+  asserted channel). The side panel is resizable.
 
 ## 0.1.0
 
