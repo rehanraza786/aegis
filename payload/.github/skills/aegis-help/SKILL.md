@@ -21,6 +21,8 @@ Always prefer the cheapest thing that answers the question. The ladder is
 | What calls this? | `find_callers`, then `find_references` to be certain |
 | What breaks if I change this? | the **change-impact-analysis** skill |
 | About to edit these files — what must I check? | `change_check` — blast radius, tests, seam warnings, ADRs |
+| WHY does editing A affect B? | `explain_path` — the hop-by-hop evidence chain |
+| What has the graph saved us lately? | `usage_report` — bytes served vs naive reads, local ledger |
 | I'm new here / how does this work? | the **codebase-orientation** skill |
 | Follow this request/event end to end | the **flow-tracing** skill |
 | Why isn't X arriving in Y? | the **flow-tracing** skill (debug mode) |

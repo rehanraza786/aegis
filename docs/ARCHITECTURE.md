@@ -96,7 +96,7 @@ UI-scale ceiling (`maxExportItems`) with the same warnings-first rule.
 
 ## Serving
 
-Each edition's `server` registers the same 26 MCP tools, 4 server-rendered
+Each edition's `server` registers the same 28 MCP tools, 4 server-rendered
 prompts (`/aegis-impact`, `/aegis-orient`, `/aegis-resolve-gap`,
 `/aegis-release-check`), and 7 `ariadne://` resources with real subscription
 support (`resources/updated` + `list_changed` fan out when the index moves) — a
