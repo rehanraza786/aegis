@@ -10,6 +10,7 @@ import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextp
 import { z } from "zod";
 import Database from "better-sqlite3";
 import { execFileSync, execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 import { pathsMatch } from "./http.mjs";
@@ -33,23 +34,85 @@ function git(args) {
 const REPO_ROOT = git(["rev-parse", "--show-toplevel"]) || process.cwd();
 const GR_DIR = path.join(process.env.ARIADNE_HOME ?? REPO_ROOT, ".ariadne");
 const DB_PATH = path.join(GR_DIR, "index.db");
+// Workspace base: roots live directly under it in multi-root mode ("." = base).
+const WS_BASE = path.dirname(GR_DIR);
+const rootDir = (pref) => (pref === "." ? WS_BASE : path.join(WS_BASE, pref));
+
+// One porcelain entry per dirty path (renames yield the NEW path; the origin
+// token is consumed alongside). Mirrors the indexer, so "dirty" always means
+// the same thing on both sides of the stamp.
+function porcelainEntries(dir) {
+  let raw = "";
+  try {
+    raw = execFileSync("git", ["status", "--porcelain", "-z"],
+      { encoding: "utf8", timeout: 15_000, cwd: dir, maxBuffer: 16 * 1024 * 1024 });
+  } catch { return []; }
+  const out = [];
+  const toks = raw.split("\0");
+  for (let i = 0; i < toks.length; i++) {
+    const e = toks[i];
+    if (e.length < 4) continue;
+    const st = e.slice(0, 2);
+    if (st === "!!") continue;
+    const rel = e.slice(3);
+    // The index writing itself must never count as dirt (index.db/-wal mtimes
+    // move on every run) — or freshness could not converge in single-root
+    // repos that keep .ariadne unignored.
+    if (rel === ".ariadne" || rel.startsWith(".ariadne/") || rel.includes("/.ariadne/")) {
+      if (st[0] === "R" || st[0] === "C" || st[1] === "R" || st[1] === "C") i++;
+      continue;
+    }
+    if (st[0] === "R" || st[0] === "C" || st[1] === "R" || st[1] === "C") i++;
+    out.push({ st, rel });
+  }
+  return out;
+}
+// Same fingerprint format the indexer stamps as worktree_sig:<prefix> (sorted
+// "st|rel|size|mtime_ms" lines, sha1; clean = "").
+function worktreeSigFrom(dir, ents) {
+  if (!ents.length) return "";
+  const lines = [];
+  for (const { st, rel } of ents) {
+    try {
+      const s = fs.statSync(path.join(dir, rel));
+      lines.push(`${st}|${rel}|${s.size}|${Math.floor(s.mtimeMs)}`);
+    } catch { lines.push(`${st}|${rel}|gone`); }
+  }
+  return createHash("sha1").update(lines.sort().join("\n")).digest("hex");
+}
 
 let _db = null;
+let _dbSig = null;
 function db() {
   if (!fs.existsSync(DB_PATH)) {
+    _db = null;
     throw new Error("Index not found. Build it with: node .ariadne/indexer.mjs --full");
   }
+  // pull-index.sh and the indexer's corruption recovery REPLACE the file (mv):
+  // the old handle never errors, it just serves the deleted inode forever —
+  // stale counts, and a subscription watcher that never fires. Same
+  // (st_ino, st_dev) revalidation as the Python edition.
+  const st = fs.statSync(DB_PATH);
+  const sig = `${st.ino}:${st.dev}`;
+  if (_db && _dbSig !== sig) { try { _db.close(); } catch { /* replaced underneath us */ } _db = null; }
   if (!_db) {
     _db = new Database(DB_PATH, { readonly: true, fileMustExist: true });
     _db.pragma("busy_timeout = 5000");
+    _dbSig = sig;
   }
   return _db;
 }
 // The indexer may replace the DB underneath us; reopen on any sqlite error once.
+// better-sqlite3 stringifies without the code ("SqliteError: no such table: x"),
+// so the e.code check is the one that actually fires.
 function withDb(fn) {
   try { return fn(db()); }
   catch (e) {
-    if (String(e).includes("SQLITE")) { try { _db?.close(); } catch {} _db = null; return fn(db()); }
+    if (String(e).includes("SQLITE") || String(e?.code ?? "").startsWith("SQLITE")) {
+      try { _db?.close(); } catch { /* half-open */ }
+      _db = null;
+      return fn(db());
+    }
     throw e;
   }
 }
@@ -166,16 +229,51 @@ const server = new McpServer({ name: "ariadne", version: "2.0.0" });
 function statusData() {
   return withDb((d) => {
     const c = (sql) => d.prepare(sql).get().c;
-    const indexed = d.prepare("SELECT value FROM meta WHERE key='last_sha'").get()?.value ?? null;
-    const head = git(["rev-parse", "HEAD"]);
+    const meta = (k) => d.prepare("SELECT value FROM meta WHERE key=?").get(k)?.value ?? null;
+    const indexed = meta("last_sha");
+    // Per-root freshness (same rule as graph_export): the indexer stamps one
+    // last_sha:<prefix> per root ("." = single root). Comparing last_sha with
+    // the server's OWN cwd lied in multi-root workspaces — the cwd isn't a
+    // repo there, so fresh sat at false forever and the release-check prompt
+    // sent every reviewer into a reindex loop that could not converge.
+    // Freshness also folds in the WORKTREE signature: an uncommitted edit the
+    // index hasn't absorbed means fresh:false even while SHAs match.
+    const shaRows = d.prepare("SELECT key, value FROM meta WHERE key LIKE 'last_sha:%'").all();
+    const roots = [];
+    let dirtyTotal = 0, checked = 0, matched = 0;
+    for (const r of shaRows) {
+      const pref = r.key.slice("last_sha:".length);
+      const dir = rootDir(pref);
+      let head = null;
+      try { head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", timeout: 15_000, cwd: dir }).trim() || null; } catch { /* not a repo */ }
+      const ents = head != null ? porcelainEntries(dir) : [];
+      const dirty = ents.length;
+      const sigStored = meta(`worktree_sig:${pref}`);
+      const sigNow = head != null ? worktreeSigFrom(dir, ents) : null;
+      // A pre-worktree-stamp index (sigStored null) is judged on SHAs alone.
+      const fresh = head == null ? null
+        : head === r.value && (sigStored == null || sigStored === sigNow);
+      if (head != null) { checked++; if (fresh) matched++; }
+      dirtyTotal += dirty;
+      roots.push({ root: pref, indexed_sha: r.value, head_sha: head, dirty_worktree: dirty, fresh });
+    }
+    let fresh, head_sha;
+    if (shaRows.length) {
+      fresh = checked === shaRows.length ? matched === checked : null;
+      head_sha = shaRows.length === 1 ? roots[0].head_sha : null;
+    } else { // legacy index without per-root stamps
+      head_sha = git(["rev-parse", "HEAD"]) || null;
+      fresh = indexed === head_sha;
+    }
     return { files: c("SELECT COUNT(*) c FROM files"), symbols: c("SELECT COUNT(*) c FROM symbols"),
-      edges: c("SELECT COUNT(*) c FROM edges"), indexed_sha: indexed, head_sha: head, fresh: indexed === head,
+      edges: c("SELECT COUNT(*) c FROM edges"), indexed_sha: indexed, head_sha, fresh,
+      dirty_worktree: dirtyTotal, ...(roots.length > 1 ? { roots } : {}),
       payload_version: PAYLOAD_VERSION };
   });
 }
 
 tool(server, "index_status",
-  "Check index freshness: file/symbol/edge counts and whether the indexed git SHA matches HEAD. Call first if results seem stale.",
+  "Check index freshness: file/symbol/edge counts, whether the indexed git SHA matches HEAD, and dirty_worktree (uncommitted paths — the incremental indexer absorbs them; fresh:false until it has). Call first if results seem stale.",
   {}, () => statusData());
 
 tool(server, "search_code",
@@ -491,10 +589,25 @@ tool(server, "decision_trace",
     const rec = d.prepare("SELECT * FROM decisions WHERE id=?").get(id.toUpperCase());
     if (!rec) return `No decision '${id}'.`;
     const chain = [];
+    // A supersession CYCLE between two ADRs (A→B→A) used to spin this loop
+    // forever — synchronously, so the ENTIRE server stopped answering. Track
+    // visited ids; a repeat ends the walk and is flagged in the output.
+    const seen = new Set();
+    let cycle = false;
     let cur = rec;
-    while (cur) { chain.push(cur); cur = cur.superseded_by ? d.prepare("SELECT * FROM decisions WHERE id=?").get(cur.superseded_by) : null; }
+    while (cur) {
+      if (seen.has(cur.id)) { cycle = true; break; }
+      seen.add(cur.id);
+      chain.push(cur);
+      cur = cur.superseded_by ? d.prepare("SELECT * FROM decisions WHERE id=?").get(cur.superseded_by) : null;
+    }
     let back = d.prepare("SELECT * FROM decisions WHERE superseded_by=?").get(rec.id);
-    while (back) { chain.unshift(back); back = d.prepare("SELECT * FROM decisions WHERE superseded_by=?").get(back.id); }
+    while (back) {
+      if (seen.has(back.id)) { cycle = true; break; }
+      seen.add(back.id);
+      chain.unshift(back);
+      back = d.prepare("SELECT * FROM decisions WHERE superseded_by=?").get(back.id);
+    }
     const links = d.prepare("SELECT kind, target FROM decision_links WHERE decision_id=?").all(rec.id);
     const topics = new Set(d.prepare("SELECT DISTINCT topic FROM msg_edges").all().map((r) => r.topic));
     const tables = new Set(d.prepare("SELECT DISTINCT tbl FROM db_access UNION SELECT DISTINCT tbl FROM db_defs").all().map((r) => r.tbl));
@@ -505,18 +618,41 @@ tool(server, "decision_trace",
         return `${l.kind}:${l.target}${exists ? "" : "  ⚠️ no longer exists in the graph (decision drift)"}`;
       }),
       summary: rec.summary, source: rec.source_path,
+      ...(cycle ? { warning: "supersession cycle detected in this chain — fix the ADR frontmatter" } : {}),
     };
   }));
 
 tool(server, "save_decision",
-  "Capture a decision made in this conversation into durable decision memory: writes a git-versioned ADR markdown file (docs/adr/) AND indexes it immediately. Use when the human and you settle an architectural/design choice. supersedes: optional ADR id this replaces.",
+  "Capture a decision made in this conversation into durable decision memory: writes a git-versioned ADR markdown file (docs/adr/) AND indexes it immediately. Use when the human and you settle an architectural/design choice. supersedes: optional ADR id this replaces. root: in a multi-root workspace, which repo the ADR belongs to.",
   { title: z.string().min(5).max(150), decision: z.string().min(20).max(2000),
     rationale: z.string().min(10).max(2000), alternatives: z.string().max(1000).optional(),
-    supersedes: z.string().max(30).optional() },
-  ({ title, decision, rationale, alternatives, supersedes }) => {
-    const adrDir = path.join(REPO_ROOT, "docs", "adr");
+    supersedes: z.string().max(30).optional(), root: z.string().max(200).optional() },
+  ({ title, decision, rationale, alternatives, supersedes, root }) => {
+    // Anchor the ADR inside a git-versioned ROOT the indexer parses. Writing
+    // under the multi-root workspace PARENT (the old REPO_ROOT fallback =
+    // process cwd) "succeeded", then the next reindex started from DELETE FROM
+    // decisions and never re-parsed the file — the decision silently vanished.
+    const prefixes = withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
+      .map((r) => r.key.slice("last_sha:".length));
+    let baseDir = REPO_ROOT;
+    let sourceBase = REPO_ROOT;
+    if (prefixes.some((p) => p !== ".")) { // multi-root workspace
+      const pick = root ?? (prefixes.length === 1 ? prefixes[0] : null);
+      if (!pick || !prefixes.includes(pick)) {
+        return `Multi-root workspace: pass root=<repo> so the ADR lands in a git-versioned repo the indexer parses. Roots: ${prefixes.join(", ")}.`;
+      }
+      baseDir = rootDir(pick);
+      sourceBase = WS_BASE;
+    }
+    const adrDir = path.join(baseDir, "docs", "adr");
     fs.mkdirSync(adrDir, { recursive: true });
+    // Ids are workspace-global: seed from the decisions table (ADRs may live in
+    // OTHER roots' docs/adr) and top up with this directory's own files.
     let max = 0;
+    try {
+      max = withDb((d) => d.prepare(
+        "SELECT COALESCE(MAX(CAST(SUBSTR(id, 5) AS INTEGER)), 0) m FROM decisions WHERE id LIKE 'ADR-%'").get().m) || 0;
+    } catch { /* fresh DB without the table yet */ }
     for (const f of fs.readdirSync(adrDir)) {
       const m = f.match(/ADR-(\d+)/i);
       if (m) max = Math.max(max, parseInt(m[1], 10));
@@ -538,13 +674,13 @@ tool(server, "save_decision",
               valid_until TEXT, superseded_by TEXT, source_path TEXT, summary TEXT)`);
       d.exec("CREATE TABLE IF NOT EXISTS decision_links(decision_id TEXT, kind TEXT, target TEXT)");
       d.prepare("INSERT OR REPLACE INTO decisions(id, title, status, decided_at, valid_until, superseded_by, source_path, summary) VALUES(?,?,?,?,NULL,NULL,?,?)")
-        .run(id, title, "accepted", today, path.relative(REPO_ROOT, file), decision.slice(0, 400));
+        .run(id, title, "accepted", today, path.relative(sourceBase, file), decision.slice(0, 400));
       if (supersedes) {
         d.prepare("UPDATE decisions SET valid_until=?, superseded_by=?, status='superseded' WHERE id=?")
           .run(today, id, supersedes.toUpperCase());
       }
     } finally { d.close(); }
-    return `${id} saved to ${path.relative(REPO_ROOT, file)} (git-versioned) and indexed. It will be re-parsed on every reindex; commit the file to share it.`;
+    return `${id} saved to ${path.relative(sourceBase, file)} (git-versioned) and indexed. It will be re-parsed on every reindex; commit the file to share it.`;
   });
 
 tool(server, "save_insight",
@@ -1263,7 +1399,7 @@ prompt(server, "aegis-release-check",
     const stale = staleAssertions(d);
     const n = drift.length + orphanP.length + orphanC.length + uncalled.length + unresolved.length + declared.length + stale.length;
     const lines = [
-      `Pre-release review, from the live graph (index fresh: ${st.fresh}${st.fresh ? "" : " — reindex before trusting this"}):`,
+      `Pre-release review, from the live graph (index fresh: ${st.fresh}${st.fresh === false ? " — reindex before trusting this" : ""}):`,
       "",
       `1. Schema drift — code touching tables no changeset defines (${drift.length}): ${capList(drift, 10).join(", ") || "none"}. -> db_map table:<name>`,
       `2. Orphan topics — produced but never consumed (${orphanP.length}): ${capList(orphanP, 10).join(", ") || "none"}; consumed but never produced (${orphanC.length}): ${capList(orphanC, 10).join(", ") || "none"}. -> message_flow topic:<name>`,
