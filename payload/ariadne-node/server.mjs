@@ -67,6 +67,29 @@ function porcelainEntries(dir) {
   }
   return out;
 }
+// Freshness checks shell out to git; on the hot path (index_status,
+// plan_context, every prompt render) that is 10-20ms of synchronous child
+// process per root, per call. A 2s TTL is correctness-safe: the graph itself
+// only moves on reindex, and a 2s-stale dirty count converges on the next call.
+const _statusCache = new Map(); // dir -> { ts, head, ents, sig }
+const STATUS_TTL_MS = 2000;
+function rootStatus(dir, live = false) {
+  const now = Date.now();
+  const c = _statusCache.get(dir);
+  // `live` skips the cache READ (still refreshes it): index_status is the
+  // authoritative freshness answer an agent acts on — it must not serve a
+  // 2s-old view of a file the agent wrote 100ms ago. Prompt garnish and
+  // resource reads keep the amortized path.
+  if (!live && c && now - c.ts < STATUS_TTL_MS) return c;
+  let head = null;
+  try { head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", timeout: 15_000, cwd: dir }).trim() || null; } catch { /* not a repo */ }
+  const ents = head != null ? porcelainEntries(dir) : [];
+  const sig = head != null ? worktreeSigFrom(dir, ents) : null;
+  const rec = { ts: now, head, ents, sig };
+  _statusCache.set(dir, rec);
+  return rec;
+}
+
 // Same fingerprint format the indexer stamps as worktree_sig:<prefix> (sorted
 // "st|rel|size|mtime_ms" lines, sha1; clean = "").
 function worktreeSigFrom(dir, ents) {
@@ -128,12 +151,44 @@ const hasWarning = (r) => r && typeof r === "object" &&
 
 /** Cap rows and bytes. Entries carrying warnings are kept FIRST and never dropped.
  *  a truncated dump that silently discards the drift warning is worse than useless. */
-function budget(result) {
+const NESTED_CAP = cfg.maxNestedRows ?? 20;
+// The old budget() capped only the TOP-level array; every list one level down
+// (blast_radius.by_depth[].files, http_map endpoints[].callers, …) blew
+// through unbounded and the byte-chop then truncated MID-JSON — measured on a
+// 3.8k-file fixture, http_map emitted 24KB of cut-off JSON and blast_radius
+// lost its tests_affected field (the tool's stated purpose). Now every nested
+// list is capped warnings-first with an explicit "…and N more" tail; byte
+// pressure gets a STRUCTURED second pass (tighter caps, still valid JSON)
+// before the blind chop; and when rows were dropped anywhere the response
+// opens with a `budget` field instead of silently serving a partial view.
+function capDeep(x, stats, isRoot = true, cap = NESTED_CAP) {
+  if (Array.isArray(x)) {
+    let arr = x;
+    if (!isRoot && arr.length > cap) {
+      const warned = arr.filter(hasWarning);
+      const plain = arr.filter((r) => !hasWarning(r));
+      const kept = [...warned, ...plain].slice(0, cap);
+      stats.rows_capped += x.length - kept.length;
+      arr = [...kept, `…and ${x.length - kept.length} more (narrow the query for the rest)`];
+    }
+    return arr.map((v) => capDeep(v, stats, false, cap));
+  }
+  if (x && typeof x === "object") {
+    const o = {};
+    for (const [k, v] of Object.entries(x)) o[k] = capDeep(v, stats, false, cap);
+    return o;
+  }
+  return x;
+}
+function shapeResult(result, stats, cap) {
+  if (typeof result === "string") return result;
+  result = capDeep(result, stats, true, cap);
   if (Array.isArray(result) && result.length > MAX_ROWS) {
     const total = result.length;
     const warned = result.filter(hasWarning);
     const plain = result.filter((r) => !hasWarning(r));
     const kept = [...warned, ...plain].slice(0, MAX_ROWS);
+    stats.rows_capped += total - kept.length;
     result = {
       showing: kept.length,
       of: total,
@@ -141,7 +196,22 @@ function budget(result) {
       results: kept,
     };
   }
-  let out = typeof result === "string" ? result : JSON.stringify(result, null, 1);
+  // budget report FIRST, so even a byte-chop cannot eat the fact that rows fell
+  if (stats.rows_capped && result && typeof result === "object" && !Array.isArray(result)) {
+    result = { budget: { rows_capped: stats.rows_capped }, ...result };
+  }
+  return result;
+}
+function budget(result) {
+  const raw = result;
+  let stats = { rows_capped: 0 };
+  let shaped = shapeResult(raw, stats, NESTED_CAP);
+  let out = typeof shaped === "string" ? shaped : JSON.stringify(shaped, null, 1);
+  if (out.length > MAX_BYTES && typeof raw !== "string") {
+    stats = { rows_capped: 0 };
+    shaped = shapeResult(raw, stats, 5);
+    out = typeof shaped === "string" ? shaped : JSON.stringify(shaped, null, 1);
+  }
   if (out.length > MAX_BYTES) {
     out = out.slice(0, MAX_BYTES) +
       `\n\n… [truncated at ${MAX_BYTES} chars to protect context. Narrow the query, pass a filter argument, or query one item at a time.]`;
@@ -226,7 +296,7 @@ const server = new McpServer({ name: "ariadne", version: "2.0.0" });
 
 // Shared with the ariadne://status resource and the release-check prompt: one
 // implementation of "how fresh is the graph", never three drifting copies.
-function statusData() {
+function statusData(live = false) {
   return withDb((d) => {
     const c = (sql) => d.prepare(sql).get().c;
     const meta = (k) => d.prepare("SELECT value FROM meta WHERE key=?").get(k)?.value ?? null;
@@ -244,12 +314,9 @@ function statusData() {
     for (const r of shaRows) {
       const pref = r.key.slice("last_sha:".length);
       const dir = rootDir(pref);
-      let head = null;
-      try { head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", timeout: 15_000, cwd: dir }).trim() || null; } catch { /* not a repo */ }
-      const ents = head != null ? porcelainEntries(dir) : [];
+      const { head, ents, sig: sigNow } = rootStatus(dir, live);
       const dirty = ents.length;
       const sigStored = meta(`worktree_sig:${pref}`);
-      const sigNow = head != null ? worktreeSigFrom(dir, ents) : null;
       // A pre-worktree-stamp index (sigStored null) is judged on SHAs alone.
       const fresh = head == null ? null
         : head === r.value && (sigStored == null || sigStored === sigNow);
@@ -274,7 +341,7 @@ function statusData() {
 
 tool(server, "index_status",
   "Check index freshness: file/symbol/edge counts, whether the indexed git SHA matches HEAD, and dirty_worktree (uncommitted paths — the incremental indexer absorbs them; fresh:false until it has). Call first if results seem stale.",
-  {}, () => statusData());
+  {}, () => statusData(true));
 
 tool(server, "search_code",
   "Full-text search over all code. Returns matching chunks with path and start line. Use for 'where is X handled/configured/used' questions instead of reading files.",
@@ -442,8 +509,11 @@ function blastData(d, p, depth) {
     const prod = rows.filter((r) => !r.is_test);
     if (prod.length) levels.push([...new Set(prod.map((r) => r.path))].sort());
   }
-  return { file: p, affected_total: levels.reduce((a, l) => a + l.length, 0), by_depth: levels,
-    ...(hasTest ? { tests_affected: [...testsAffected].sort(), tests_affected_total: testsAffected.size } : {}) };
+  // conclusions BEFORE bulk: if the byte-chop ever fires, it must eat tail
+  // paths, not tests_affected (the tool's stated purpose)
+  return { file: p, affected_total: levels.reduce((a, l) => a + l.length, 0),
+    ...(hasTest ? { tests_affected_total: testsAffected.size, tests_affected: [...testsAffected].sort() } : {}),
+    by_depth: levels };
 }
 
 tool(server, "blast_radius",
@@ -778,7 +848,10 @@ tool(server, "assert_edge",
     file: z.string().min(1).max(400),
     line: z.number().int(),
     evidence: z.string().min(20).max(600),
-    confidence: z.enum(["high", "medium", "low"]),
+    // optional like the Python edition (defaults medium): a REQUIRED field the
+    // other edition defaults meant identical assertions produced different
+    // records, and cross-edition dedupe treated equivalents as distinct
+    confidence: z.enum(["high", "medium", "low"]).optional(),
     topic: z.string().max(200).optional(),
     direction: z.enum(["produce", "consume"]).optional(),
     table: z.string().max(120).optional(),
@@ -805,7 +878,7 @@ tool(server, "assert_edge",
       catch (e) { return `docs/graph-assertions.json exists but is not valid JSON (${e.message}). Fix or remove it first; refusing to overwrite the team's assertions.`; }
       if (!Array.isArray(list)) return "docs/graph-assertions.json is not a JSON array. Fix it first; refusing to overwrite the team's assertions.";
     }
-    const rec = { ...a, author: "assistant", source_hash: hash, asserted_at: new Date().toISOString().slice(0, 10) };
+    const rec = { ...a, confidence: a.confidence ?? "medium", author: "assistant", source_hash: hash, asserted_at: new Date().toISOString().slice(0, 10) };
     // replace an identical prior assertion rather than duplicating
     list = list.filter((x) => !(x.kind === a.kind && x.file === a.file && x.line === a.line
       && x.topic === a.topic && x.table === a.table && x.path === a.path));
@@ -970,6 +1043,51 @@ tool(server, "db_map",
     });
   }));
 
+// ---- HTTP correlation, bucketed and memoized per index epoch ----
+// The old shape recomputed the full endpoints×calls cross-product INSIDE every
+// http_map call — measured 1.5s of synchronous event-loop block at 1.2k
+// endpoints × 3k calls (the single-threaded server answers nothing meanwhile),
+// with identical inputs every time until the next reindex. Candidate buckets
+// by (method, segment-count — covering the leading-{} strip and dynamic-tail
+// cases pathsMatch defines) prune the pairing without changing its result,
+// and the whole correlation is memoized against meta.last_run.
+const _httpMemo = new Map();
+function httpCorrelation(d, prodOnly, hasTest) {
+  const epoch = d.prepare("SELECT value FROM meta WHERE key='last_run'").get()?.value ?? "0";
+  const key = `${epoch}|${prodOnly ? 1 : 0}`;
+  const hit = _httpMemo.get(key);
+  if (hit) return hit;
+  const where = prodOnly && hasTest ? " WHERE f.is_test=0" : "";
+  const eps = d.prepare(`SELECT e.method, e.path, e.norm, f.path fp, e.line, e.detail${hasTest ? ", f.is_test" : ""}
+    FROM http_endpoints e JOIN files f ON f.id=e.file_id${where} ORDER BY e.norm`).all();
+  const calls = d.prepare(`SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client${hasTest ? ", f.is_test" : ""}
+    FROM http_calls c JOIN files f ON f.id=c.file_id${where} ORDER BY c.norm`).all();
+  const byBucket = new Map(); // "METHOD|nsegs" -> call indices
+  const tails = new Map();    // METHOD -> indices of dynamic-tail ({**}) calls
+  const nsegs = (x) => x.split("/").length;
+  calls.forEach((c, i) => {
+    if (c.norm.split("/").pop() === "{**}") {
+      const a = tails.get(c.method) ?? []; a.push(i); tails.set(c.method, a);
+      return;
+    }
+    const n = nsegs(c.norm);
+    for (const k of c.norm.startsWith("/{}/") ? [n, n - 1] : [n]) {
+      const kk = `${c.method}|${k}`;
+      const a = byBucket.get(kk) ?? []; a.push(i); byBucket.set(kk, a);
+    }
+  });
+  const matchesByEp = eps.map((e) => {
+    const cand = [...(byBucket.get(`${e.method}|${nsegs(e.norm)}`) ?? []), ...(tails.get(e.method) ?? [])];
+    return cand.filter((i) => pathsMatch(calls[i].norm, e.norm));
+  });
+  const matchedCalls = new Set();
+  for (const m of matchesByEp) for (const i of m) matchedCalls.add(i);
+  const rec = { eps, calls, matchesByEp, matchedCalls };
+  _httpMemo.set(key, rec);
+  if (_httpMemo.size > 4) _httpMemo.delete(_httpMemo.keys().next().value);
+  return rec;
+}
+
 tool(server, "http_map",
   "Full-stack HTTP seam: correlate REST endpoints (Spring controllers) with every caller (TS/React fetch/axios, Java RestTemplate/WebClient/Feign) matched on method + normalized path ({id}, :id, ${expr} all correlate). No args = full map with orphans (endpoints nobody calls; calls hitting no known endpoint). Pass path to filter.",
   { path: z.string().max(300).optional() },
@@ -981,17 +1099,8 @@ tool(server, "http_map",
     const hasTest = d.prepare("SELECT COUNT(*) c FROM pragma_table_info('files') WHERE name='is_test'").get().c;
     if (!pf && nEp > SUMMARY_THRESHOLD) {
       // orphan math is production-only: a WireMock stub or a test caller cures nothing
-      const eps0 = d.prepare(`SELECT e.method, e.path, e.norm FROM http_endpoints e${hasTest ? " JOIN files f ON f.id=e.file_id WHERE f.is_test=0" : ""}`).all();
-      const calls0 = d.prepare(`SELECT c.method, c.path, c.norm, c.client FROM http_calls c${hasTest ? " JOIN files f ON f.id=c.file_id WHERE f.is_test=0" : ""}`).all();
-      const matched = new Set();
-      const orphanEps = [];
-      for (const e of eps0) {
-        let any = false;
-        calls0.forEach((c, i) => {
-          if (c.method === e.method && pathsMatch(c.norm, e.norm)) { matched.add(i); any = true; }
-        });
-        if (!any) orphanEps.push(`${e.method} ${e.path}`);
-      }
+      const { eps: eps0, calls: calls0, matchesByEp: mm, matchedCalls: matched } = httpCorrelation(d, true, hasTest);
+      const orphanEps = eps0.filter((_, i) => !mm[i].length).map((e) => `${e.method} ${e.path}`);
       const cap = (a) => (a.length > 25 ? [...a.slice(0, 25), `…and ${a.length - 25} more`] : a);
       return {
         summary: `${nEp} endpoints, ${calls0.length} client calls.`,
@@ -1002,20 +1111,13 @@ tool(server, "http_map",
         next: "Full listing: docs/generated/http-map.md. For callers of one route: http_map path:<fragment>.",
       };
     }
-    const eps = d.prepare(`SELECT e.method, e.path, e.norm, f.path fp, e.line, e.detail${hasTest ? ", f.is_test" : ""}
-      FROM http_endpoints e JOIN files f ON f.id=e.file_id ORDER BY e.norm`).all();
-    const calls = d.prepare(`SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client${hasTest ? ", f.is_test" : ""}
-      FROM http_calls c JOIN files f ON f.id=c.file_id ORDER BY c.norm`).all();
+    const { eps, calls, matchesByEp, matchedCalls } = httpCorrelation(d, false, hasTest);
     if (!eps.length && !calls.length) return "No REST endpoints or HTTP clients detected.";
-    const matchedCalls = new Set();
     const out = [];
-    for (const e of eps) {
+    for (let ei = 0; ei < eps.length; ei++) {
+      const e = eps[ei];
       if (pf && !e.norm.includes(pf) && !e.path.includes(pf)) continue;
-      const callers = calls.filter((c, i) => {
-        const ok = (c.method === e.method || c.method === "GET" && e.method === "GET") && pathsMatch(c.norm, e.norm);
-        if (ok) matchedCalls.add(i);
-        return ok;
-      });
+      const callers = matchesByEp[ei].map((i) => calls[i]);
       const prodCallers = callers.filter((c) => !c.is_test);
       const testCallers = callers.filter((c) => c.is_test);
       // an endpoint defined in a test file (WireMock/contract stub) is labeled, never an orphan
@@ -1228,6 +1330,7 @@ tool(server, "reindex",
       { cwd: REPO_ROOT, timeout: 600_000 },
       (err, stdout, stderr) => {
         try { _db?.close(); } catch {} _db = null; // pick up the fresh DB
+        _statusCache.clear(); // freshness must not serve the pre-reindex worktree state
         notifyIndexMoved(); // subscribed resource readers refetch instead of going stale
         resolve((stdout + stderr).trim() || (err ? `reindex failed: ${err.message}` : "done"));
       });
@@ -1438,8 +1541,31 @@ async function exportJson() {
 }
 
 resource(server, "graph", "ariadne://graph",
-  { description: "The full graph-export JSON snapshot (modules, topics, tables, endpoints, gaps, annotations) — the same contract the graph view renders. Cached until the index moves.", mimeType: "application/json" },
+  { description: "UI-SCALE, not context-scale: the full graph-export JSON snapshot (modules, topics, tables, endpoints, gaps, annotations) — the contract the graph view renders, easily hundreds of KB on a real workspace. Agents should use module_map/context_pack/plan_context, or read ariadne://graph/summary for a budgeted overview. Cached until the index moves.", mimeType: "application/json" },
   () => exportJson());
+
+resource(server, "graph-summary", "ariadne://graph/summary",
+  { description: "A ~1KB summary of the graph snapshot: per-layer counts, the highest-degree modules, and gap totals. The agent-safe way to glance at the whole graph; drill down with tools, not with ariadne://graph.", mimeType: "application/json" },
+  async () => {
+    const g = JSON.parse(await exportJson());
+    const modules = g.modules ?? [];
+    // degree = deps out + deps in, from the module dep lists the export carries
+    const deg = new Map(modules.map((m) => [m.id, (m.deps ?? []).length]));
+    for (const m of modules) for (const d2 of m.deps ?? []) deg.set(d2, (deg.get(d2) ?? 0) + 1);
+    const top = modules.map((m) => ({ id: m.id, files: m.files, degree: deg.get(m.id) ?? 0 }))
+      .sort((a, b) => b.degree - a.degree).slice(0, 10);
+    const gf = g.generated_from ?? {};
+    return {
+      counts: { modules: gf.modules_total ?? modules.length, files: gf.files ?? null, symbols: gf.symbols ?? null,
+        topics: gf.topics_total ?? (g.topics ?? []).length, tables: gf.tables_total ?? (g.tables ?? []).length,
+        endpoints: gf.endpoints_total ?? (g.endpoints ?? []).length,
+        gaps: (g.gaps ?? []).length, annotations: (g.annotations ?? []).length },
+      top_modules_by_degree: top,
+      ...(gf.fresh != null ? { fresh: gf.fresh } : {}),
+      ...(gf.indexed_sha ? { indexed_sha: gf.indexed_sha } : {}),
+      next: "Details: module_map, context_pack(target), plan_context(task). Full snapshot (UI-scale): ariadne://graph.",
+    };
+  });
 
 resource(server, "status", "ariadne://status",
   { description: "Index freshness: counts, indexed SHA vs HEAD, payload version. The resource twin of the index_status tool.", mimeType: "application/json" },
@@ -1498,7 +1624,14 @@ resource(server, "assertions", "ariadne://assertions",
         }
       });
     } catch { /* no index yet: serve the raw ledger */ }
-    return { assertions: list, note: "stale=true means the evidence file changed since the assertion was recorded — re-affirm or retract it." };
+    // Newest-first, capped: the ledger grows linearly with team knowledge and
+    // this resource carries no tool budget — an agent reading it should get
+    // the recent layer, not an unbounded dump.
+    const total = list.length;
+    const capped = list.slice(-200).reverse();
+    return { total, showing: capped.length, assertions: capped,
+      note: "stale=true means the evidence file changed since the assertion was recorded — re-affirm or retract it."
+        + (total > capped.length ? " Older entries: docs/graph-assertions.json (git-versioned)." : "") };
   });
 
 // ---- updated-notifications: the agent-side twin of the graph view's watcher.

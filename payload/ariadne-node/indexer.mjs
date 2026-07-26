@@ -326,6 +326,7 @@ function connect(forIndexing = false) {
       id INTEGER PRIMARY KEY, file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
       name TEXT, kind TEXT, line INTEGER, signature TEXT, parent TEXT);
     CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+    CREATE INDEX IF NOT EXISTS idx_symbols_qname ON symbols(parent || '.' || name);
     CREATE TABLE IF NOT EXISTS calls(
       src_symbol INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
       callee TEXT, line INTEGER);
