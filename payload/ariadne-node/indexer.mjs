@@ -294,6 +294,13 @@ function connect(forIndexing = false) {
     db.pragma("quick_check");
   } catch (e) {
     if (/SQLITE_CORRUPT|not a database|malformed|corrupt/i.test((e.message ?? "") + (e.code ?? ""))) {
+      // Destructive recovery is an INDEXING decision. A read-only open
+      // (--status on a corrupt DB) used to rotate the file aside and hand the
+      // caller a fresh empty index — report instead, and leave the evidence.
+      if (!forIndexing) {
+        try { db?.close(); } catch { /* half-open */ }
+        throw new Error(`Index at ${DB_PATH} is corrupt (${e.code ?? e.message}). Run --rebuild (or --incremental) to recover.`);
+      }
       const aside = DB_PATH + ".corrupt-" + Date.now();
       try { db?.close(); } catch { /* half-open */ }
       try { fs.renameSync(DB_PATH, aside); } catch { /* best effort */ }
@@ -444,14 +451,73 @@ function repoFiles() {
   const out = [];
   for (const root of ROOTS) {
     const prefix = prefixOf(root);
-    for (const line of git(["ls-files"], { cwd: root, maxBuffer: 64 * 1024 * 1024 }).split("\n")) {
-      if (!line) continue;
-      const parts = line.split("/");
-      if (parts.some((p) => config.skipDirs.includes(p))) continue;
-      if (LANG_BY_EXT[path.extname(line).toLowerCase()]) out.push(prefix ? `${prefix}/${line}` : line);
+    // -z: NUL separators and no C-quoting — a café.java arrives verbatim instead
+    // of as "caf\303\251.java", whose quoted extname missed LANG_BY_EXT and
+    // silently dropped the file from the graph (tabs/newlines in paths too).
+    // --others --exclude-standard: untracked-but-not-ignored files. A file an
+    // agent just created enters the graph NOW, not at the next `git add`.
+    for (const args of [["ls-files", "-z"], ["ls-files", "-z", "--others", "--exclude-standard"]]) {
+      for (const line of git(args, { cwd: root, maxBuffer: 64 * 1024 * 1024 }).split("\0")) {
+        if (!line) continue;
+        const parts = line.split("/");
+        if (parts.some((p) => config.skipDirs.includes(p))) continue;
+        if (LANG_BY_EXT[path.extname(line).toLowerCase()]) out.push(prefix ? `${prefix}/${line}` : line);
+      }
     }
   }
   return out;
+}
+
+// One porcelain entry per dirty path (renames yield the NEW path; the origin
+// token is consumed alongside). Shared by the incremental union and the
+// worktree signature, so the two can never disagree about what "dirty" means.
+function porcelainEntries(root) {
+  // Raw exec, NOT the trimming git() helper: porcelain entries can START with
+  // a space (" M path") and trim() would eat the first entry's status byte.
+  let raw = "";
+  try {
+    raw = execFileSync("git", ["status", "--porcelain", "-z"],
+      { encoding: "utf8", timeout: 30_000, cwd: root, maxBuffer: 16 * 1024 * 1024 });
+  } catch { return []; }
+  const out = [];
+  if (!raw) return out;
+  const toks = raw.split("\0");
+  for (let i = 0; i < toks.length; i++) {
+    const e = toks[i];
+    if (e.length < 4) continue;
+    const st = e.slice(0, 2);
+    if (st === "!!") continue; // ignored
+    const rel = e.slice(3);
+    // The index writing itself must never count as dirt (index.db/-wal mtimes
+    // move on every run) — or freshness could not converge in single-root
+    // repos that keep .ariadne unignored.
+    if (rel === ".ariadne" || rel.startsWith(".ariadne/") || rel.includes("/.ariadne/")) {
+      if (st[0] === "R" || st[0] === "C" || st[1] === "R" || st[1] === "C") i++;
+      continue;
+    }
+    let origin = null;
+    if (st[0] === "R" || st[0] === "C" || st[1] === "R" || st[1] === "C") origin = toks[++i] ?? null;
+    out.push({ st, rel, origin });
+  }
+  return out;
+}
+
+/** Content-sensitive fingerprint of the uncommitted state: HEAD alone cannot
+ *  answer "is the index fresh?" once the worktree is indexed too. Format is
+ *  shared byte-for-byte with the Python edition (sorted "st|rel|size|mtime_ms"
+ *  lines, sha1) so a runtime switch on a shared DB never fakes staleness.
+ *  Clean tree = "". */
+function worktreeSig(root) {
+  const ents = porcelainEntries(root);
+  if (!ents.length) return "";
+  const lines = [];
+  for (const { st, rel } of ents) {
+    try {
+      const s = fs.statSync(path.join(root, rel));
+      lines.push(`${st}|${rel}|${s.size}|${Math.floor(s.mtimeMs)}`);
+    } catch { lines.push(`${st}|${rel}|gone`); }
+  }
+  return createHash("sha1").update(lines.sort().join("\n")).digest("hex");
 }
 
 // Prepared statements at connection lifetime. indexFile used to db.prepare()
@@ -646,22 +712,43 @@ async function computeAndApply(db, files, force, onApplied) {
         resolve();
       } catch (e) { reject(e); }
     };
+    const idle = [];
     const assign = (w) => {
       if (dead || next >= files.length) return;
+      // Bounded buffering: results apply in submission order, so one slow
+      // FIRST file used to buffer the entire corpus's compute output in
+      // `pending`. Park the worker instead; drain() releases it as the
+      // ordered apply catches up.
+      if (pending.size > 4 * n) { idle.push(w); return; }
       const i = next++;
       w.postMessage({ i, rel: files[i], prev: prev.get(files[i]) ?? null, force });
+    };
+    const failover = (why) => {
+      if (dead) return;
+      dead = true;
+      log("WARN", `parallel extract worker failed (${why}); finishing sequentially`);
+      finish();
+      pending.clear();
+      sequentialRemainder();
     };
     for (let k = 0; k < Math.min(n, files.length); k++) {
       const w = new Worker(new URL(import.meta.url), { workerData: { ariadneExtractWorker: true } });
       workers.push(w);
-      w.on("message", (m) => { if (dead) return; pending.set(m.i, m.rec); assign(w); drain(); });
-      w.on("error", (err) => {
+      w.on("message", (m) => {
         if (dead) return;
-        dead = true;
-        log("WARN", `parallel extract worker failed (${err.message}); finishing sequentially`);
-        finish();
-        pending.clear();
-        sequentialRemainder();
+        pending.set(m.i, m.rec);
+        assign(w);
+        drain();
+        while (idle.length && pending.size <= 4 * n) assign(idle.pop());
+      });
+      w.on("error", (err) => failover(err.message));
+      // A worker that dies without an `error` event (process.exit() in a
+      // parser, OOM kill) only ever fires `exit`. Unhandled, the pool waited
+      // forever inside the open transaction, holding the index lock. The
+      // applied>=length guard keeps deliberate terminate() calls silent.
+      w.on("exit", (code) => {
+        if (dead || applied >= files.length) return;
+        failover(`worker exited with code ${code}`);
       });
       assign(w);
     }
@@ -729,6 +816,12 @@ async function kafkaPass(db, scopePrefixes = null) {
   const tracked = repoFiles();
   const configMap = loadConfigMap(REPO_ROOT, tracked, log);
   const idByPath = new Map(db.prepare("SELECT id, path, hash FROM files").all().map((r) => [r.path, r]));
+  // One-time hygiene for DBs written before the files-row guard below existed:
+  // orphan NULL-fid rows never matched a per-file delete (file_id IN (...) skips
+  // NULL), so duplicates accumulated unprunably and poisoned the drift math.
+  for (const t of ["msg_edges", "msg_topics", "db_defs", "db_access", "http_endpoints", "http_calls"]) {
+    db.prepare(`DELETE FROM ${t} WHERE file_id IS NULL`).run();
+  }
 
   // ---- config fingerprint: any change to application*.yml|properties forces a full pass ----
   const cfgPaths = tracked.filter((p) => /(^|\/)(application|bootstrap)[^/]*\.(ya?ml|properties)$/.test(p)).sort();
@@ -765,7 +858,12 @@ async function kafkaPass(db, scopePrefixes = null) {
   }
 
   // ---- global maps (constants + entities) from per-file cache; recompute only on hash miss ----
-  const javaish = tracked.filter((p) => /\.(java|kts?)$/.test(p));
+  // Only files that HAVE a files row participate: a tracked file over
+  // maxFileBytes (or unreadable) has no row, so extracting it could only
+  // produce orphan NULL-fid rows — and re-reading a skipped 100MB dump every
+  // run is pure waste. (Parity: the Python edition's dirty predicate already
+  // treated missing==missing as clean; now both editions skip identically.)
+  const javaish = tracked.filter((p) => idByPath.has(p) && /\.(java|kts?)$/.test(p));
   // Snapshot of what we last EXTRACTED, taken before the map loop updates it.
   // Files whose content hash has moved on since then are the ones needing re-extraction.
   // (Reindexing a file cascades its correlation rows away, so this set must be exact.)
@@ -828,13 +926,26 @@ async function kafkaPass(db, scopePrefixes = null) {
     for (const [k, v] of Object.entries(consts)) if (!constants.has(k)) constants.set(k, v);
     for (const [k, v] of Object.entries(ents)) entityTables.set(k, v);
   }
+  // Deleted definitions are semantic deltas too: removing Topics.java (sole
+  // definition of ORDERS_TOPIC) must re-extract every file that MENTIONED the
+  // key, or dependents keep their stale resolved edges forever. Diff the
+  // doomed cache rows into changedTokens BEFORE pruning them; an unparseable
+  // row widens fully rather than guessing.
+  for (const row of db.prepare("SELECT constants, entities FROM extract_cache WHERE path NOT IN (SELECT path FROM files)").all()) {
+    try {
+      const keys = [...Object.keys(JSON.parse(row.constants)), ...Object.keys(JSON.parse(row.entities))];
+      if (keys.length) { mapsChanged = true; for (const k of keys) changedTokens.add(k); }
+    } catch { mapsChanged = true; widen = true; }
+  }
   db.prepare("DELETE FROM extract_cache WHERE path NOT IN (SELECT path FROM files)").run();
   for (const [k, v] of Object.entries(config.tableNameOverrides ?? {})) entityTables.set(k, String(v).toLowerCase());
 
   // ---- scope: re-extract only the FILES whose content actually changed ----
   // A global change (config value, topic constant, entity mapping) can alter how
   // every other file resolves, so that widens automatically to a full re-extract.
-  const candidates = tracked.filter((p) => /\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs|py|rb|prisma)$/.test(p) || inExtFiles(p));
+  // Files-row membership is required for the same reason as `javaish` above:
+  // no row means nothing to attach extraction output to.
+  const candidates = tracked.filter((p) => idByPath.has(p) && (/\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs|py|rb|prisma)$/.test(p) || inExtFiles(p)));
   // token-scoped: a semantic change with a small, known key set widens only to
   // files that MENTION a changed key — extraction output for a file that never
   // references any changed constant/entity/config key is invariant under the
@@ -845,7 +956,9 @@ async function kafkaPass(db, scopePrefixes = null) {
   for (const p of candidates) {
     const cur = idByPath.get(p)?.hash;
     const seen = extractedAt.get(p);
-    if (!seen || seen !== cur) dirty.add(p);
+    // missing==missing is CLEAN (mirrors the Python predicate): a path with
+    // neither a files row nor a cache stamp has nothing to re-extract.
+    if ((seen ?? null) !== (cur ?? null)) dirty.add(p);
   }
   if (fullWiden) {
     for (const p of candidates) dirty.add(p);
@@ -1166,6 +1279,11 @@ function stamp(db) {
   for (const root of ROOTS) {
     db.prepare("INSERT OR REPLACE INTO meta VALUES(?, ?)").run(
       `last_sha:${prefixOf(root) || "."}`, git(["rev-parse", "HEAD"], { cwd: root }));
+    // What the worktree looked like when this index was built. index_status
+    // compares it with the live signature: `fresh` can no longer say true
+    // while an agent's uncommitted edit sits outside the graph.
+    db.prepare("INSERT OR REPLACE INTO meta VALUES(?, ?)").run(
+      `worktree_sig:${prefixOf(root) || "."}`, worktreeSig(root));
   }
   db.prepare("INSERT OR REPLACE INTO meta VALUES('last_sha', ?)").run(git(["rev-parse", "HEAD"], { cwd: ROOTS[0] }));
   db.prepare("INSERT OR REPLACE INTO meta VALUES('last_run', ?)").run(String(Date.now() / 1000));
@@ -1244,27 +1362,52 @@ async function incrementalIndex(db) {
     if (!row?.value) return fullIndex(db);
     let diff;
     try {
-      diff = execFileSync("git", ["diff", "--name-status", row.value, "HEAD"],
+      // -z: NUL-separated STATUS, path[, path] records — no C-quoting, so
+      // non-ASCII/tab/newline paths survive (they used to miss LANG_BY_EXT).
+      diff = execFileSync("git", ["diff", "--name-status", "-z", row.value, "HEAD"],
         { encoding: "utf8", cwd: root, timeout: 30_000 });
     } catch { log("WARN", `Stamped SHA unreachable in ${p || "repo"}; doing full index`); return fullIndex(db); }
-    for (const line of diff.split("\n")) {
-      if (!line) continue;
-      const parts = line.split("\t");
-      const status = parts[0];
-      const pref = (x) => (p ? `${p}/${x}` : x);
-      if (status.startsWith("R") && parts.length === 3) { deleted.push(pref(parts[1])); changed.push(pref(parts[2])); }
-      else if (status === "D") deleted.push(pref(parts[1]));
-      else changed.push(pref(parts[parts.length - 1]));
+    const pref = (x) => (p ? `${p}/${x}` : x);
+    const toks = diff.split("\0");
+    for (let i = 0; i < toks.length; i++) {
+      const status = toks[i];
+      if (!status) continue;
+      if ((status.startsWith("R") || status.startsWith("C")) && toks[i + 2] !== undefined) {
+        deleted.push(pref(toks[++i])); changed.push(pref(toks[++i]));
+      } else if (status.startsWith("D")) deleted.push(pref(toks[++i]));
+      else changed.push(pref(toks[++i]));
+    }
+    // Working-tree union: the commit diff sees only committed work. An agent's
+    // in-flight edit (tracked, modified or staged) and brand-new untracked
+    // files land here via porcelain; a file deleted on disk but not yet
+    // committed is a real deletion for the graph. False positives are free —
+    // the hash fast-path no-ops any file whose bytes didn't actually change.
+    for (const ent of porcelainEntries(root)) {
+      if (ent.origin) deleted.push(pref(ent.origin));
+      if (ent.st.includes("D") && !fs.existsSync(path.join(root, ent.rel))) deleted.push(pref(ent.rel));
+      else changed.push(pref(ent.rel));
     }
   }
-  const relevant = changed.filter((p) => LANG_BY_EXT[path.extname(p).toLowerCase()]
+  const relevant = [...new Set(changed)].filter((p) => LANG_BY_EXT[path.extname(p).toLowerCase()]
     && !p.split("/").some((s) => config.skipDirs.includes(s)));
   const total = db.prepare("SELECT COUNT(*) c FROM files").get().c || 1;
   if (relevant.length > Math.max(50, 0.4 * total)) { log("INFO", "Diff too large; full reindex"); return fullIndex(db); }
 
+  // Reconcile against the live universe: an UNTRACKED file that was indexed
+  // and then deleted appears in neither the commit diff nor porcelain (a
+  // vanished untracked path has no status at all) — set-diff the files table
+  // against repoFiles() so its rows can't outlive it.
+  const present = new Set(repoFiles());
+  for (const r of db.prepare("SELECT path FROM files").all()) {
+    if (!present.has(r.path)) deleted.push(r.path);
+  }
   return inTx(db, async () => {
   const S = stmts(db);
-  for (const p of deleted) {
+  // Deletion wins whenever the path is gone from disk (worktree delete of a
+  // file the commit-diff also touched); a path that exists and is queued for
+  // reindex just gets reindexed — its row swap needs no prior delete.
+  const gone = [...new Set(deleted)].filter((p) => !relevant.includes(p) || !fs.existsSync(absPath(p)));
+  for (const p of gone) {
     S.delFileByPath.run(p);
     S.delChunksByPath.run(p);
   }
@@ -1279,7 +1422,7 @@ async function incrementalIndex(db) {
   rebuildEdges(db, touched);
   await kafkaPass(db, null);
   stamp(db);
-  log("INFO", `Incremental index: ${relevant.length} changed, ${deleted.length} deleted`);
+  log("INFO", `Incremental index: ${relevant.length} changed, ${gone.length} deleted`);
   });
 }
 
@@ -1296,6 +1439,10 @@ function status(db) {
 // is main-thread-only, so a worker never tries to index on its own.
 if (!isMainThread && workerData?.ariadneExtractWorker) {
   parentPort.on("message", async (t) => {
+    // Suite hook: a worker that dies WITHOUT an `error` event (only `exit`
+    // fires on process.exit/OOM-kill) must not hang the pool. Inert unless the
+    // env names a path fragment.
+    if (process.env.ARIADNE_TEST_WORKER_CRASH && t.rel.includes(process.env.ARIADNE_TEST_WORKER_CRASH)) process.exit(3);
     let rec = null;
     try { rec = await computeFile(t.rel, t.prev, t.force); }
     catch (e) { log("DEBUG", `worker compute failed for ${t.rel}: ${e.message}`); rec = null; }
@@ -1308,7 +1455,8 @@ if (isMainThread) {
 if (MULTI) log("INFO", `Workspace mode: ${ROOTS.length} repos: ${ROOTS.map(r=>path.basename(r)).join(", ")}`);
 const mode = process.argv[2] ?? "--status";
 if (mode === "--status") {
-  status(connect());
+  try { status(connect()); }
+  catch (e) { console.error(String(e?.message ?? e)); process.exitCode = 1; }
 } else if (mode === "--approve-extensions") {
   const { approved, changed } = approveAll(path.join(GR_DIR, "extensions"));
   console.log(approved.length

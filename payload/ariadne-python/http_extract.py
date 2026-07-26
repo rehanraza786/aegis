@@ -159,7 +159,23 @@ def extract_ts_http(text):
                       "norm": norm, "line": _line(text, start), "client": client})
 
     for m in FETCH_RE.finditer(text):
-        opts = re.search(r"method\s*:\s*[`\"'](\w+)", text[m.start():m.start() + 300])
+        # Look for `method:` only inside THIS call's argument list. The old flat
+        # 300-char window read past the closing paren and stole the NEXT call's
+        # method (a GET labeled POST breaks correlation). Depth-counted walk to
+        # the call's own `)`, still capped at 300 chars as a runaway guard.
+        start = m.end()
+        end = min(len(text), start + 300)
+        depth = 1  # already inside the call's parens
+        for i in range(start, min(len(text), start + 300)):
+            ch = text[i]
+            if ch in "({[":
+                depth += 1
+            elif ch in ")}]":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        opts = re.search(r"method\s*:\s*[`\"'](\w+)", text[start:end])
         push(opts.group(1) if opts else "GET", m.group(2), m.start(), m.end(), "fetch")
     for m in AXIOS_METHOD_RE.finditer(text):
         push(m.group(1), m.group(3), m.start(), m.end(), "axios")
@@ -171,7 +187,7 @@ def extract_ts_http(text):
 def paths_match(call_norm, ep_norm):
     if _segs_match(call_norm, ep_norm):
         return True
-    # fetch(`${API_BASE}/api/orders`) normalizes to /{}/api/orders: that leading
+    # A fetch call on `${API_BASE}/api/orders` normalizes to /{}/api/orders: that leading
     # placeholder is a base-URL/origin variable, not a path segment, and env-based
     # base URLs are the dominant frontend pattern. Retry with it stripped, call
     # side only, so those calls still correlate with /api/orders endpoints.

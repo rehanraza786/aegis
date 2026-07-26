@@ -20,7 +20,9 @@ function git(args) {
   catch { return ""; }
 }
 const REPO_ROOT = git(["rev-parse", "--show-toplevel"]) || process.cwd();
-const DB_PATH = path.join(REPO_ROOT, ".ariadne", "index.db");
+// ARIADNE_HOME points at the shared workspace DB (same rule as indexer/server);
+// without it, shared-workspace SCIP data landed in a repo-local DB nothing serves.
+const DB_PATH = path.join(process.env.ARIADNE_HOME ?? REPO_ROOT, ".ariadne", "index.db");
 const DEFINITION_ROLE = 0x1;
 
 const args = process.argv.slice(2);

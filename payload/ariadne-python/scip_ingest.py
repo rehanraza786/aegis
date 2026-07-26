@@ -21,6 +21,7 @@ Requires: pip install protobuf   (scip_pb2.py is bundled alongside this file)
 
 import sqlite3
 import subprocess
+import os
 import sys
 import time
 from pathlib import Path
@@ -32,7 +33,9 @@ REPO_ROOT = Path(
     subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
     or "."
 ).resolve()
-DB_PATH = REPO_ROOT / ".ariadne" / "index.db"
+# ARIADNE_HOME points at the shared workspace DB (same rule as indexer/server);
+# without it, shared-workspace SCIP data landed in a repo-local DB nothing serves.
+DB_PATH = Path(os.environ.get("ARIADNE_HOME", REPO_ROOT)) / ".ariadne" / "index.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scip_defs(
