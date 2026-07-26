@@ -366,6 +366,66 @@ describe("orders api", () => { it("fetches orders by id", async () => { await ax
     w(ws / "docs/features/001-payment-flow/spec.md", "- **FR-001**: x\n- **FR-002**: [NEEDS CLARIFICATION: y]\n")
 
 
+
+# ------------------------------------------------------------- egress gate
+# Security invariant #1: code never leaves the machine. This gate greps every
+# first-party source (payload/ + extension/, vendored webview bundles INCLUDED)
+# for network-capable primitives and pins the result to exactly the opt-in,
+# user-invoked paths PRIVACY.md documents. New network code — in a batch, a
+# vendored bundle, an extractor — fails the suite here, before anything runs.
+NET_ALLOW = {
+    "payload/ariadne-node/enrich.mjs",   # opt-in enrichment CLI (refuses to run without a key)
+    "payload/ariadne-python/enrich.py",  # opt-in enrichment CLI (refuses to run without a key)
+    "payload/pull-index.sh",             # user-invoked pull of YOUR OWN CI artifact
+}
+# Call-capable primitives only: URLs in prose/regex sources don't match, real
+# network constructions do.
+NET_PATTERNS = [
+    r"\bfetch\s*\(",
+    r"\bXMLHttpRequest\b", r"\bnew\s+WebSocket\b", r"\bEventSource\s*\(", r"\bsendBeacon\b",
+    r"\bcreateServer\s*\(", r"\.listen\s*\(",
+    r"""require\(\s*["'](?:node:)?(?:https?|net|tls|dgram)["']\s*\)""",
+    r"""from\s+["'](?:node:)?(?:https?|net|tls|dgram)["']""",
+    r"^\s*import\s+(?:urllib|requests|httpx|aiohttp|socket|http\.client)\b",
+    r"^\s*from\s+(?:urllib|requests|httpx|aiohttp|socket|http\.client)\b",
+    r"\burlopen\s*\(", r"\brequests\.(?:get|post|put|delete|patch)\s*\(",
+    r"\bsocket\.create_connection\b", r"\bsocket\.socket\s*\(",
+    r"\bcurl\s", r"\bwget\s",
+]
+
+
+def egress_gate():
+    print("== egress gate (code never leaves the machine)")
+    pats = [re.compile(p, re.M) for p in NET_PATTERNS]
+    hit_files = set()
+    for root in (TOOLKIT / "payload", TOOLKIT / "extension"):
+        for f in root.rglob("*"):
+            if f.suffix not in {".mjs", ".py", ".sh", ".js", ".html"} or "node_modules" in f.parts:
+                continue
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if any(p.search(text) for p in pats):
+                hit_files.add(f.relative_to(TOOLKIT).as_posix())
+    offenders = sorted(hit_files - NET_ALLOW)
+    check("no network primitives outside the allowlist (enrich.*, pull-index.sh)",
+          not offenders, "; ".join(offenders)[:400])
+    check("the allowlisted egress paths are still the only ones (pin: update NET_ALLOW deliberately)",
+          hit_files & NET_ALLOW == NET_ALLOW, str(sorted(hit_files & NET_ALLOW)))
+    # The MCP servers must construct ONLY the stdio transport.
+    nsv = (TOOLKIT / "payload/ariadne-node/server.mjs").read_text(encoding="utf-8", errors="replace")
+    psv = (TOOLKIT / "payload/ariadne-python/server.py").read_text(encoding="utf-8", errors="replace")
+    check("node server is stdio-only (no HTTP/SSE transport constructed)",
+          "StdioServerTransport" in nsv and not re.search(r"SSEServerTransport|StreamableHTTPServerTransport", nsv))
+    check("python server is stdio-only (no HTTP/SSE transport constructed)",
+          "stdio" in psv and not re.search(r"sse_app|streamable_http|uvicorn", psv))
+    # Webview CSP: nothing loads, nothing phones home, scripts are nonce-gated.
+    gv = (TOOLKIT / "extension/graph-view.html").read_text(encoding="utf-8", errors="replace")
+    check("webview CSP pins default-src 'none' with nonce'd scripts",
+          "default-src 'none'" in gv and "script-src 'nonce-" in gv)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runtime", choices=["node", "python"], required=True)
@@ -373,6 +433,8 @@ def main():
     args = ap.parse_args()
     rt = args.runtime
     exe = ["node"] if rt == "node" else [py]
+
+    egress_gate()
 
     tmp = Path(tempfile.mkdtemp(prefix="aegis-test-"))
     ws = tmp / "ws"
@@ -506,6 +568,10 @@ def main():
     check("second full all cached", re.search(r"0 \(re\)indexed", out2) is not None, out2[-300:])
     adr = ws / "docs-repo" / "adr" / "ADR-007.md"
     adr.write_text(adr.read_text() + "\nchanged\n")
+    # committed before the stamping --full: the incremental tests below assert
+    # exact change counts, and the worktree union (batch 18) sees dirt too
+    git(["add", "-A"], ws / "docs-repo")
+    git(["commit", "-qm", "adr note"], ws / "docs-repo")
     code, out3 = run(exe + [idx, "--full"], ws)
     check("changed md reindexes exactly 1", re.search(r"1 \(re\)indexed", out3) is not None, out3[-300:])
     pdf = ws / "docs-repo" / "spec.pdf"
@@ -684,6 +750,98 @@ await c.close();
           db.execute("SELECT COUNT(*) FROM edges e JOIN files s ON s.id=e.src JOIN files d ON d.id=e.dst "
                      "WHERE s.path LIKE '%OrderPublisherTest.java' AND d.path LIKE '%OrderPublisher.java' "
                      "AND e.kind='import'").fetchone()[0] == 1)
+    db.close()
+
+    # ---- worktree freshness: the agent-editing loop (batch 18) ----
+    # An UNTRACKED file (agent just created it) enters the graph on incremental,
+    # an uncommitted edit to a tracked file is absorbed, the worktree signature
+    # is stamped, and restoring cleanliness converges back to a clean stamp.
+    osvc = ws / "order-service"
+    newf = osvc / "src/main/java/com/acme/ScratchHelper.java"
+    w(newf, "package com.acme;\npublic class ScratchHelper { public void ping() {} }\n")
+    dao2 = osvc / "src/main/java/com/acme/OrderPublisher.java"
+    dao2_orig = dao2.read_text(encoding="utf-8")
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    h0 = db.execute("SELECT hash FROM files WHERE path LIKE '%OrderPublisher.java'").fetchone()[0]
+    db.close()
+    dao2.write_text(dao2_orig + "// wip: uncommitted agent edit\n", encoding="utf-8")
+    code, owt = run(exe + [idx, "--incremental"], ws)
+    check("incremental exits 0 with a dirty worktree", code == 0, owt[-300:])
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("UNTRACKED file enters the graph without git add",
+          db.execute("SELECT 1 FROM symbols WHERE name='ScratchHelper'").fetchone() is not None)
+    check("uncommitted edit to a tracked file is absorbed (hash moved)",
+          db.execute("SELECT hash FROM files WHERE path LIKE '%OrderPublisher.java'").fetchone()[0] != h0)
+    sig = db.execute("SELECT value FROM meta WHERE key='worktree_sig:order-service'").fetchone()
+    check("worktree signature stamped per root (dirty -> non-empty)",
+          sig is not None and sig[0] != "")
+    db.close()
+    # restore: delete the scratch file, revert the edit; incremental absorbs both
+    newf.unlink()
+    dao2.write_text(dao2_orig, encoding="utf-8")
+    code, owt2 = run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("deleting the untracked file removes it from the graph",
+          db.execute("SELECT 1 FROM symbols WHERE name='ScratchHelper'").fetchone() is None)
+    check("clean worktree stamps an empty signature (freshness converges)",
+          (db.execute("SELECT value FROM meta WHERE key='worktree_sig:order-service'").fetchone() or [None])[0] == "")
+    db.close()
+
+    # ---- non-ASCII filenames survive -z path parsing (batch 18) ----
+    caf = osvc / "src/main/java/com/acme/Caf\u00e9Service.java"
+    w(caf, "package com.acme;\npublic class Caf\u00e9Service { public void brew() {} }\n")
+    git(["add", "-A"], osvc)
+    git(["commit", "-qm", "non-ascii"], osvc)
+    run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("non-ASCII filename is indexed verbatim (no C-quoted path)",
+          db.execute("SELECT 1 FROM files WHERE path LIKE '%Caf\u00e9Service.java'").fetchone() is not None
+          and db.execute("SELECT 1 FROM files WHERE path LIKE '%\\303%'").fetchone() is None)
+    db.close()
+
+    # ---- config-delta scoping covers DELETIONS (batch 18) ----
+    # A deleted sole-definition constants file must re-extract its dependents,
+    # or they keep a stale resolved edge forever.
+    topics = osvc / "src/main/java/com/acme/ScratchTopics.java"
+    prod = osvc / "src/main/java/com/acme/ScratchProducer.java"
+    w(topics, 'package com.acme;\npublic class ScratchTopics { public static final String SCRATCH_TOPIC = "scratch.events"; }\n')
+    w(prod, 'package com.acme;\nimport org.springframework.kafka.core.KafkaTemplate;\n'
+            'public class ScratchProducer { KafkaTemplate<String,String> kafkaTemplate;\n'
+            '  void fire() { kafkaTemplate.send(ScratchTopics.SCRATCH_TOPIC, "x"); } }\n')
+    git(["add", "-A"], osvc)
+    git(["commit", "-qm", "scratch topic"], osvc)
+    run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("constant-driven producer resolves before the deletion",
+          db.execute("SELECT 1 FROM msg_edges WHERE topic='scratch.events' AND direction='produce'").fetchone() is not None)
+    db.close()
+    git(["rm", "-q", "src/main/java/com/acme/ScratchTopics.java"], osvc)
+    git(["commit", "-qm", "drop scratch topic"], osvc)
+    code, odel = run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("deleting the sole definition re-extracts the dependent (no stale resolved edge)",
+          db.execute("SELECT 1 FROM msg_edges WHERE topic='scratch.events' AND direction='produce'").fetchone() is None,
+          odel[-300:])
+    db.close()
+    prod.unlink()
+    git(["add", "-A"], osvc)
+    git(["commit", "-qm", "drop scratch producer"], osvc)
+    run(exe + [idx, "--incremental"], ws)
+
+    # ---- oversized tracked files stay OUT of the graph, with no NULL-fid rows (batch 18) ----
+    big = osvc / "src/main/java/com/acme/GiantChangelog.java"
+    w(big, ('package com.acme;\n@javax.persistence.Entity @javax.persistence.Table(name="giants")\n'
+            "public class GiantChangelog {\n") + ("// filler\n" * 170000) + "}\n")
+    git(["add", "-A"], osvc)
+    git(["commit", "-qm", "giant"], osvc)
+    run(exe + [idx, "--incremental"], ws)
+    run(exe + [idx, "--incremental"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    check("oversized tracked file gets no files row (skip is total)",
+          db.execute("SELECT 1 FROM files WHERE path LIKE '%GiantChangelog%'").fetchone() is None)
+    nulls = sum(db.execute(f"SELECT COUNT(*) FROM {t} WHERE file_id IS NULL").fetchone()[0]
+                for t in ("msg_edges", "msg_topics", "db_defs", "db_access", "http_endpoints", "http_calls"))
+    check("no NULL-fid seam rows after repeated incrementals (parity: both editions skip)", nulls == 0, str(nulls))
     db.close()
 
     # ---- context_pack: one call, focused, budgeted ----
@@ -1133,7 +1291,72 @@ await c.subscribeResource({ uri: "ariadne://graph" });
 await call("reindex", { mode: "incremental" });
 const dl = Date.now() + 10000;
 while (Date.now() < dl && !(got.includes("updated:ariadne://status") && got.includes("updated:ariadne://graph") && got.includes("list_changed"))) await new Promise((r) => setTimeout(r, 200));
+
+// ---- batch 18: multi-root save_decision anchoring ----
+const sdRefuse = await call("save_decision", { title: "Probe anchor refusal", decision: "This decision exists to verify multi-root anchoring behavior.", rationale: "Anchoring test needs it." });
+const sdOk = await call("save_decision", { title: "Probe anchor rooted", decision: "This decision exists to verify multi-root anchoring behavior.", rationale: "Anchoring test needs it.", root: "docs-repo" });
+import fs from "node:fs";
+import path from "node:path";
+import Database from "better-sqlite3";
+const adrDir = path.join(process.cwd(), "docs-repo", "docs", "adr");
+const probeAdr = fs.existsSync(adrDir) ? fs.readdirSync(adrDir).filter((f) => f.includes("probe-anchor-rooted")) : [];
+const dbw = new Database(path.join(process.cwd(), ".ariadne", "index.db"));
+dbw.pragma("busy_timeout = 10000");
+for (const f of probeAdr) fs.rmSync(path.join(adrDir, f)); // leave the fixture as we found it
+dbw.prepare("DELETE FROM decisions WHERE title LIKE 'Probe anchor%'").run();
+
+// ---- batch 18: a supersession cycle must not hang the server ----
+dbw.prepare("INSERT OR REPLACE INTO decisions(id, title, status, decided_at, valid_until, superseded_by, source_path, summary) VALUES('ADR-901','Cycle A','superseded','2020-01-01',NULL,'ADR-902','x.md','a')").run();
+dbw.prepare("INSERT OR REPLACE INTO decisions(id, title, status, decided_at, valid_until, superseded_by, source_path, summary) VALUES('ADR-902','Cycle B','superseded','2020-01-02',NULL,'ADR-901','y.md','b')").run();
+let cycOk = false;
+try {
+  const tr = await Promise.race([call("decision_trace", { id: "ADR-901" }), new Promise((_, rej) => setTimeout(() => rej(new Error("hang")), 8000))]);
+  cycOk = String(tr).includes("cycle");
+} catch { cycOk = false; }
+dbw.prepare("DELETE FROM decisions WHERE id IN ('ADR-901','ADR-902')").run();
+
+// ---- batch 18: fresh tells the truth about the worktree ----
+const scratch = path.join(process.cwd(), "order-service", "src", "main", "java", "com", "acme", "ProbeScratch.java");
+fs.writeFileSync(scratch, "package com.acme;\\npublic class ProbeScratch {}\\n");
+const stDirty = JSON.parse(await call("index_status"));
+await call("reindex", { mode: "incremental" });
+const stAbsorbed = JSON.parse(await call("index_status"));
+fs.rmSync(scratch);
+await call("reindex", { mode: "incremental" });
+const stClean = JSON.parse(await call("index_status"));
+const freshOk = stDirty.fresh === false && stDirty.dirty_worktree >= 1
+  && stAbsorbed.fresh === true && stAbsorbed.dirty_worktree >= 1
+  && stClean.fresh === true && stClean.dirty_worktree === 0;
+
+// ---- batch 18: a replaced DB inode is picked up by the long-lived server ----
+// (POSIX-only: Windows cannot unlink a file another process holds open, and
+// pull-index's mv-replace is a POSIX pattern in the first place.)
+const dbPath = path.join(process.cwd(), ".ariadne", "index.db");
+const filesBefore = stClean.files;
+let inodeOk = true, restoredFiles = filesBefore;
+if (process.platform !== "win32") {
+  const tmp = dbPath + ".probe-swap";
+  fs.copyFileSync(dbPath, tmp);
+  const dbe = new Database(tmp);
+  dbe.prepare("DELETE FROM files WHERE path LIKE '%OrderPublisherTest.java'").run();
+  const filesExpect = dbe.prepare("SELECT COUNT(*) c FROM files").get().c;
+  dbe.close();
+  dbw.close();
+  fs.rmSync(dbPath + "-wal", { force: true });
+  fs.rmSync(dbPath + "-shm", { force: true });
+  fs.rmSync(dbPath);
+  fs.renameSync(tmp, dbPath);
+  const stSwap = JSON.parse(await call("index_status"));
+  inodeOk = stSwap.files === filesExpect && filesExpect < filesBefore;
+  await call("reindex", { mode: "full" }); // restore the row for everything downstream
+  restoredFiles = JSON.parse(await call("index_status")).files;
+} else { dbw.close(); }
+
 const out = {
+  sdRefuseOk: String(sdRefuse).startsWith("Multi-root workspace: pass root="),
+  sdRootedOk: String(sdOk).includes("saved to") && String(sdOk).includes("docs-repo"),
+  cycOk, freshOk, inodeOk,
+  restoredOk: restoredFiles === filesBefore,
   prompts,
   impactOk: impact.includes("OrderPublisher.java") && impact.includes("orders.created") && impact.includes("ADR-012") && impact.includes("OrderPublisherTest.java"),
   orientOk: orient.startsWith("Orientation for module order-service") && orient.includes("context_pack"),
@@ -1219,6 +1442,73 @@ async def main():
             want = {"updated:ariadne://status", "updated:ariadne://graph", "list_changed"}
             while asyncio.get_event_loop().time() < deadline and not want <= set(got):
                 await asyncio.sleep(0.2)
+
+            # ---- batch 18: multi-root save_decision anchoring ----
+            import os
+            import sqlite3 as sq
+            sd_refuse = await call("save_decision", {"title": "Probe anchor refusal", "decision": "This decision exists to verify multi-root anchoring behavior.", "rationale": "Anchoring test needs it."})
+            sd_ok = await call("save_decision", {"title": "Probe anchor rooted", "decision": "This decision exists to verify multi-root anchoring behavior.", "rationale": "Anchoring test needs it.", "root": "docs-repo"})
+            adr_dir = os.path.join(os.getcwd(), "docs-repo", "docs", "adr")
+            for f in (os.listdir(adr_dir) if os.path.isdir(adr_dir) else []):
+                if "probe-anchor-rooted" in f:
+                    os.remove(os.path.join(adr_dir, f))  # leave the fixture as we found it
+            dbw = sq.connect(os.path.join(os.getcwd(), ".ariadne", "index.db"), timeout=10)
+            dbw.execute("DELETE FROM decisions WHERE title LIKE 'Probe anchor%'")
+
+            # ---- batch 18: a supersession cycle must not hang the server ----
+            dbw.execute("INSERT OR REPLACE INTO decisions VALUES('ADR-901','Cycle A','superseded','2020-01-01',NULL,'ADR-902','x.md','a')")
+            dbw.execute("INSERT OR REPLACE INTO decisions VALUES('ADR-902','Cycle B','superseded','2020-01-02',NULL,'ADR-901','y.md','b')")
+            dbw.commit()
+            try:
+                tr = await asyncio.wait_for(call("decision_trace", {"id": "ADR-901"}), timeout=8)
+                cyc_ok = "cycle" in str(tr)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                cyc_ok = False
+            dbw.execute("DELETE FROM decisions WHERE id IN ('ADR-901','ADR-902')")
+            dbw.commit()
+
+            # ---- batch 18: fresh tells the truth about the worktree ----
+            scratch = os.path.join(os.getcwd(), "order-service", "src", "main", "java", "com", "acme", "ProbeScratch.java")
+            with open(scratch, "w") as fh:
+                fh.write("package com.acme;\\npublic class ProbeScratch {}\\n")
+            st_dirty = json.loads(await call("index_status", {}))
+            await s.call_tool("reindex", {"mode": "incremental"})
+            st_abs = json.loads(await call("index_status", {}))
+            os.remove(scratch)
+            await s.call_tool("reindex", {"mode": "incremental"})
+            st_clean = json.loads(await call("index_status", {}))
+            fresh_ok = (st_dirty.get("fresh") is False and st_dirty.get("dirty_worktree", 0) >= 1
+                        and st_abs.get("fresh") is True and st_abs.get("dirty_worktree", 0) >= 1
+                        and st_clean.get("fresh") is True and st_clean.get("dirty_worktree") == 0)
+
+            # ---- batch 18: a replaced DB inode is picked up by the long-lived server ----
+            # (POSIX-only: Windows cannot unlink a file another process holds open.)
+            db_path = os.path.join(os.getcwd(), ".ariadne", "index.db")
+            files_before = st_clean.get("files", 0)
+            inode_ok, restored_files = True, files_before
+            if sys.platform != "win32":
+                import shutil as sh
+                tmpdb = db_path + ".probe-swap"
+                sh.copyfile(db_path, tmpdb)
+                dbe = sq.connect(tmpdb)
+                dbe.execute("DELETE FROM files WHERE path LIKE '%OrderPublisherTest.java'")
+                files_expect = dbe.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+                dbe.commit(); dbe.close()
+                dbw.close()
+                for sfx in ("-wal", "-shm"):
+                    try:
+                        os.remove(db_path + sfx)
+                    except OSError:
+                        pass
+                os.remove(db_path)
+                os.replace(tmpdb, db_path)
+                st_swap = json.loads(await call("index_status", {}))
+                inode_ok = st_swap.get("files") == files_expect and files_expect < files_before
+                await s.call_tool("reindex", {"mode": "full"})
+                restored_files = json.loads(await call("index_status", {})).get("files")
+            else:
+                dbw.close()
+
             warn_s = json.dumps(cc.get("seam_warnings", {}))
             tests_pc = pc.get("tests") if isinstance(pc.get("tests"), dict) else {}
             out = {
@@ -1245,6 +1535,10 @@ async def main():
                         and "no-such-file.java" in cc["files"].get("not_in_index", []),
                 "notif": {"updated": "updated:ariadne://status" in got and "updated:ariadne://graph" in got,
                           "listChanged": "list_changed" in got},
+                "sdRefuseOk": str(sd_refuse).startswith("Multi-root workspace: pass root="),
+                "sdRootedOk": "saved to" in str(sd_ok) and "docs-repo" in str(sd_ok),
+                "cycOk": cyc_ok, "freshOk": fresh_ok, "inodeOk": inode_ok,
+                "restoredOk": restored_files == files_before,
             }
             print("SURFACE:" + json.dumps(out))
 
@@ -1280,6 +1574,19 @@ asyncio.run(main())
     check("resources/updated + list_changed arrive after reindex (subscription round-trip)",
           (sf.get("notif") or {}).get("updated") is True and (sf.get("notif") or {}).get("listChanged") is True,
           str(sf.get("notif")))
+    # ---- batch 18: freshness truth, multi-root anchoring, cycle guard, inode pickup ----
+    check("save_decision refuses an unanchored multi-root write (with guidance)",
+          sf.get("sdRefuseOk") is True, str(sf.get("sdRefuseOk")))
+    check("save_decision with root= writes into that repo's docs/adr",
+          sf.get("sdRootedOk") is True, str(sf.get("sdRootedOk")))
+    check("decision_trace survives a supersession cycle and flags it",
+          sf.get("cycOk") is True, str(sf.get("cycOk")))
+    check("fresh tells the truth about the worktree (dirty->false, absorbed->true, clean->0)",
+          sf.get("freshOk") is True, str(sf.get("freshOk")))
+    check("a mv-replaced index.db is picked up by the long-lived server (inode revalidation)",
+          sf.get("inodeOk") is True, str(sf.get("inodeOk")))
+    check("full reindex restores the fixture after the swap probe",
+          sf.get("restoredOk") is True, str(sf.get("restoredOk")))
 
     # ---- plugin hooks: pass extension populated todos table ----
     db = sqlite3.connect(ws / ".ariadne" / "index.db")
@@ -1617,6 +1924,61 @@ asyncio.run(main())
           and db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == pre_files
           and db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "6", omg2[-300:])
     db.close()
+
+    # ---- batch 18: corruption recovery is an INDEXING decision ----
+    dbf = ws / ".ariadne" / "index.db"
+    for c in (ws / ".ariadne").glob("index.db.corrupt-*"):
+        c.unlink()  # corpse left by the auto-recovery test above
+    for sfx in ("-wal", "-shm"):
+        try:
+            (ws / ".ariadne" / f"index.db{sfx}").unlink()
+        except OSError:
+            pass
+    dbf.write_bytes(b"this is not a sqlite database at all" * 100)
+    code, ocor = run(exe + [idx, "--status"], ws)
+    rotated = list((ws / ".ariadne").glob("index.db.corrupt-*"))
+    check("--status on a corrupt DB reports and refuses (exit!=0, no rotation)",
+          code != 0 and "corrupt" in ocor.lower() and not rotated, ocor[-200:])
+    check("the corrupt file is left in place as evidence",
+          dbf.read_bytes()[:20] == b"this is not a sqlite")
+    code, orec = run(exe + [idx, "--incremental"], ws)
+    rotated = list((ws / ".ariadne").glob("index.db.corrupt-*"))
+    db = sqlite3.connect(dbf)
+    check("an indexing run recovers: rotates the corpse aside and rebuilds",
+          code == 0 and len(rotated) == 1
+          and db.execute("SELECT COUNT(*) FROM files").fetchone()[0] > 0, orec[-300:])
+    db.close()
+    for r in rotated:
+        r.unlink()
+
+    # ---- batch 18: a worker that dies without an error event must not hang the pool ----
+    if rt == "node":
+        import time as _time
+        t0 = _time.time()
+        code, ocr = run(exe + [idx, "--rebuild", "--workers", "2"], ws,
+                        env={"ARIADNE_TEST_WORKER_CRASH": "OrderPublisher.java"})
+        check("pool fails over to sequential when a worker exits mid-file (no hang)",
+              code == 0 and "finishing sequentially" in ocr and _time.time() - t0 < 240, ocr[-300:])
+        db = sqlite3.connect(dbf)
+        check("failover run still indexes the crash-marked file",
+              db.execute("SELECT 1 FROM files WHERE path LIKE '%OrderPublisher.java'").fetchone() is not None)
+        db.close()
+
+    # ---- batch 18: pull-index refuses to swap under a live lock; sidecars die first ----
+    if os.name != "nt":  # the script is a bash tool; Windows users run it via git-bash
+        osvc_ar = ws / "order-service" / ".ariadne"
+        osvc_ar.mkdir(exist_ok=True)
+        lock = osvc_ar / ".index.lock"
+        lock.write_text("pid 1")
+        code, opl = run(["bash", str(TOOLKIT / "payload" / "pull-index.sh")], ws / "order-service")
+        lock.unlink()
+        check("pull-index refuses while an index run holds the lock",
+              code != 0 and ".index.lock" in opl, opl[-200:])
+        shutil.rmtree(osvc_ar, ignore_errors=True)
+    pl = (TOOLKIT / "payload" / "pull-index.sh").read_text(encoding="utf-8")
+    check("pull-index removes -wal/-shm sidecars before every DB install (install_db)",
+          "rm -f .ariadne/index.db-wal .ariadne/index.db-shm" in pl
+          and pl.count("install_db ") >= 4 and "mv \"$TMP/$ARTIFACT_PATH\" .ariadne/index.db" not in pl)
 
     print()
     if FAILURES:

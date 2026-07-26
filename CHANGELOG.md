@@ -135,6 +135,34 @@ The post-review release. Highlights, roughly in the order they landed:
   bundled self-contained; zero egress as always. The suite also gained a
   deterministic routing eval: canonical utterances must route to their
   intended skills by description token overlap, so trigger drift fails CI.
+- **Freshness tells the truth (and the suite gained an egress gate):** the
+  indexer now unions the WORKTREE into every pass — untracked files an agent
+  just created enter the graph without `git add`, uncommitted edits are
+  absorbed by `--incremental`, worktree deletions (even of untracked files)
+  are reconciled — and `index_status` judges `fresh` against a per-root
+  worktree signature as well as HEAD, reporting `dirty_worktree` and a
+  per-root breakdown in multi-root workspaces (where `fresh` used to sit at
+  false forever). Paths are read NUL-separated end to end, so non-ASCII
+  filenames stop silently vanishing from the graph. `save_decision` anchors
+  ADRs inside a git-versioned root (multi-root workspaces name one via
+  `root=`) instead of writing files a reindex would silently forget.
+  Hardening sweep: the Node server revalidates the index file's identity and
+  actually reopens on sqlite errors (a pulled/rebuilt index no longer serves
+  stale counts forever); `pull-index.sh` removes `-wal`/`-shm` sidecars
+  before installing a downloaded DB (no more replaying the old index's WAL
+  into the new file) and refuses to run under a live index lock; deleting a
+  constants/entity file re-extracts its dependents (config-delta scoping
+  covers deletions); a supersession cycle between ADRs is flagged instead of
+  hanging the server; a worker that dies without an `error` event fails over
+  to sequential instead of hanging the pool, and in-flight results are
+  bounded; oversized tracked files are skipped identically by both editions
+  (no more NULL-fid orphan rows); corruption recovery only runs on indexing
+  opens (`--status` reports instead of rotating your evidence away); SCIP
+  ingest honors `ARIADNE_HOME`; and a fetch call's `method:` can no longer be
+  stolen from the NEXT call by the attribution scan. The suite now opens with
+  a grep-level **egress gate**: any network-capable primitive outside the
+  three documented opt-in paths (enrich CLIs, pull-index) fails CI before
+  anything else runs — "code never leaves the machine" is machine-checked.
 
 ## 0.1.0
 
