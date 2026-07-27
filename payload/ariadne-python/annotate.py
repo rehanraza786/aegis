@@ -171,4 +171,4 @@ elif a.get("action") in ("retract", "reaffirm"):
         print(f"Reaffirmed {len(hits)} assertion(s) against the current {a.get('file')} (by: {author}). "
               "STALE clears on the next index.")
 else:
-    die('action must be "insight", "assert", "retract", or "reaffirm".')
+    die('action must be "insight", "assert", "dismiss", "retract", or "reaffirm".')

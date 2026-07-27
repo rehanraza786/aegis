@@ -30,3 +30,13 @@ issue affects vendored copies, the published packages, or both.
 - **Generated artifacts are data, not code** — assertions, insights, and
   decisions are JSON/markdown ingested with parameterized SQL; injection
   through them is in scope for reports.
+- **The worker pool re-executes indexer code in child processes.** Parallel
+  extraction (`worker_threads` / `ProcessPoolExecutor`) runs the same
+  trust-gated extractor set as the sequential path — a child worker can only
+  ever execute code the extensions.lock allowlist already approved. Anything
+  that lets a worker load code outside that gate is in scope.
+- **The graph view's write path is postMessage → the reviewed annotate CLI.**
+  The webview (CSP `default-src 'none'`, nonce-gated scripts) cannot execute
+  workspace content; its annotations travel as data through the same
+  parameterized ingestion as hand-written assertions. A webview payload that
+  reaches anything other than the annotate/save flows is in scope.

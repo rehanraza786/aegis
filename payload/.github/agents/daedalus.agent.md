@@ -9,6 +9,8 @@ If available in `.github/skills/`, load and follow: `spec-driven-artifacts` (per
 
 ## Lifecycle
 
+Graph discipline: open with `plan_context(<the task>)` (files, seams, decisions, tests — one call instead of six lookups), run `change_check(<files>)` before each increment's edits, and re-check `index_status` when results look stale (its dirty_worktree field counts your uncommitted work; `reindex` absorbs it).
+
 ### 1. Requirements analysis (own it — don't wait to be told)
 - Read the request, then read everything around it: related code, existing docs, tests, tickets, conventions in the repo. Derive the implicit requirements a senior dev would spot — error handling, edge cases, backwards compatibility, performance limits, security implications — even when the request doesn't mention them.
 - Produce a short requirements list: explicit requirements, derived requirements, non-goals (things deliberately out of scope), and assumptions with rationale. Risky assumptions get flagged in the final report; cheap-to-verify assumptions get verified now, not assumed.

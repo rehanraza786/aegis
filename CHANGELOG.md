@@ -120,8 +120,10 @@ The post-review release. Highlights, roughly in the order they landed:
   Config-delta scoping: an edited constant/entity/config key re-extracts only
   the files that mention a changed key instead of every candidate in the repo
   (full widen stays as the >50-key / unknown-map fallback). FTS moves to
-  external content: file text lives once in `chunk_text` (roughly halving
-  index.db), `snippet()`/`rank` read through, per-file chunk deletes ride a
+  external content: file text lives once in `chunk_text` (measured ~2.5×
+  faster cold per-file chunk deletes; on-disk size is roughly unchanged, since
+  FTS5 contentful tables store text in shadow tables, not twice), `snippet()`/
+  `rank` read through, per-file chunk deletes ride a
   plain B-tree index, and a pre-v6 index migrates itself with a one-time full
   rebuild on the next indexing run — while read-side opens (`--status`) leave
   it untouched.
@@ -163,6 +165,32 @@ The post-review release. Highlights, roughly in the order they landed:
   a grep-level **egress gate**: any network-capable primitive outside the
   three documented opt-in paths (enrich CLIs, pull-index) fails CI before
   anything else runs — "code never leaves the machine" is machine-checked.
+- **Token discipline closes its one hole (and the docs stop lying):** the
+  response budget now caps EVERY nested list (warnings first, explicit
+  "…and N more" tails), takes a structured tighter pass under byte pressure
+  instead of chopping mid-JSON, and opens with `budget: {rows_capped}`
+  whenever rows fell — measured on a 3.8k-file fixture, an unfiltered
+  `http_map` went from 24KB of cut-off JSON to 2.8KB of valid JSON.
+  Conclusions moved ahead of bulk (`blast_radius` reports its tests before
+  its path lists). New `ariadne://graph/summary` resource (~600B: per-layer
+  counts, top modules, gap totals) so agents stop drinking the UI-scale
+  `ariadne://graph` by accident; `ariadne://assertions` serves newest-first,
+  capped, with totals. HTTP correlation is bucketed by method+segment-count
+  and memoized per index epoch (was a full endpoints×calls cross-product
+  inside every call); freshness checks ride a 2s TTL cache that
+  `index_status` bypasses (live) and `reindex` clears; symbol resolution
+  rides a new qualified-name expression index (MULTI-INDEX OR instead of a
+  table scan). Cross-edition contract alignment: `assert_edge` no longer
+  stamps phantom `mode`/`method` defaults (Python) and defaults `confidence`
+  (Node) so both editions write byte-identical records; Python clamps
+  `limit<=0`, degrades on pre-`source` DBs, and serializes raw UTF-8
+  (`ensure_ascii=False`) like Node. The prompt layer finally teaches the
+  composites: skills/agents/engines.json/docgen lead with `plan_context` /
+  `change_check`, and the suite pins doc-quoted counts (tools, resources),
+  the PRIVACY grep's file set, toolHints ⊆ registry, and composites-taught
+  briefs so none of it can drift again. PRIVACY/SECURITY grew the missing
+  exhibits: webview CSP, stdio-only transports, the inert vendored SDK HTTP
+  deps, and the worker-pool / webview-write-path execution contexts.
 
 ## 0.1.0
 

@@ -17,6 +17,8 @@ environment, and the single most common thing an assistant gets wrong here.
 
 ## Step 1 — Establish the current truth
 
+> **One-call shortcut:** `change_check(<producer/consumer files>)` warns when you are about to edit the SOLE producer of a topic and names the consumers' tests; `plan_context(<the event task>)` finds all parties first if you don't know the files yet.
+
 - `message_flow` with no arguments — the whole topology (on large systems this
   is a summary with the complete warning lists; query per topic for sites,
   that's deliberate). Learn the naming convention in use (`orders.created`,

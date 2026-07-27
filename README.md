@@ -81,7 +81,7 @@ Open your workspace. One repo or a folder of repos both work. The extension offe
 
 Requirements: git, and either Node ≥18 or Python ≥3.10. VS Code ≥1.99 registers the MCP server automatically.
 
-There is a shell installer too, plus configuration and CI wiring, in [SETUP.md](SETUP.md). Going deeper: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how the engine works), [docs/TOOLS.md](docs/TOOLS.md) (all 24 tools), [EXTENDING.md](EXTENDING.md) (plug in your stack), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md).
+There is a shell installer too, plus configuration and CI wiring, in [SETUP.md](SETUP.md). Going deeper: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how the engine works), [docs/TOOLS.md](docs/TOOLS.md) (all 26 tools, the 4 server prompts, and the `ariadne://` resources), [EXTENDING.md](EXTENDING.md) (plug in your stack), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md).
 
 **Not on VS Code?** The engine installs like any package, for any MCP client:
 

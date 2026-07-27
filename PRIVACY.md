@@ -21,6 +21,15 @@ I would rather hear about it than have you assume the rest is true.
 
 The graph is a local SQLite file. The MCP server talks to your editor over stdio
 and does not bind a port, so there is nothing listening and nothing to reach.
+The graph view is a VS Code webview whose Content-Security-Policy is
+`default-src 'none'` with nonce-gated scripts and resources pinned to the
+extension's own `media/` directory — it cannot fetch, beacon, or open a socket
+even if handed hostile content. One honest footnote: the Node edition's
+`node_modules` VENDORS the MCP SDK, whose optional HTTP/SSE transports pull in
+packages like `express` and `eventsource` as transitive dependencies. AEGIS
+never constructs those transports — the code is inert on disk, only the stdio
+transport is ever instantiated, and the suite's egress gate (below) would fail
+if that changed.
 
 ## What talks to the network
 
@@ -74,9 +83,18 @@ The point of this file is that you should not have to take my word for it.
     # pull-index (your own CI), and nothing else.
     grep -rn "fetch(\|https://\|curl " payload/ariadne-node/*.mjs payload/ariadne-python/*.py payload/*.sh
 
-    # You get four hits: enrich.mjs and enrich.py (opt-in, covered above),
-    # pull-index.sh (your own CI), and install-hooks.sh, which is a nodejs.org
-    # link inside an error message telling you to go install Node.
+    # Every hit lands in exactly four files: enrich.mjs and enrich.py (the
+    # opt-in enrichment CLI, covered above), pull-index.sh (your own CI), and
+    # install-hooks.sh — a nodejs.org link inside an error message telling you
+    # to go install Node. If a hit appears in ANY other file, that is a bug.
+    #
+    # You do not have to run this by hand: the self-test suite opens with an
+    # egress gate (tests/run_tests.py) that sweeps payload/ AND extension/
+    # (vendored webview bundles included) for network-capable primitives and
+    # FAILS if anything outside enrich.*/pull-index.sh matches — plus checks
+    # that both servers construct only the stdio transport and that the
+    # webview CSP still reads default-src 'none'. "Code never leaves the
+    # machine" is a CI assertion, not a promise.
 
     # What the extension imports. vscode, fs, path, child_process (to run the
     # indexer in a terminal), and os (for a temp file during Copilot enrichment).

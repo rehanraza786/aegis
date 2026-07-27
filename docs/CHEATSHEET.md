@@ -14,6 +14,8 @@ Pin this. It is the whole thing.
 | "Why do we use Kafka, still current?" | The ADR, what superseded it, what's in force now |
 | "We just decided X, record it" | A numbered ADR, written and indexed |
 | "Why can't the graph resolve this topic?" | Where it's blind, and how to teach it |
+| "I'm starting task X" | `plan_context` — files, seams, decisions, tests: one call |
+| "About to edit these files" | `change_check` — blast radius, tests to re-run, seam warnings |
 
 ## Hand off bigger work
 
@@ -46,7 +48,7 @@ the gesture into a prefilled assertion — evidence still required, always.
 
 ## When something looks wrong
 
-`index_status`, is the graph fresh? (Hooks refresh on *commit*, not on save.)
+`index_status`, is the graph fresh? (`dirty_worktree` counts your uncommitted work; `reindex` absorbs it — untracked files included.)
 `graph_gaps`, what static analysis couldn't resolve, and why.
 A topic looks orphaned but a test uses it? By design: `message_flow` / `db_map` / `http_map` topology is production-only, test usage is listed separately and labeled `[TEST]`.
 Ask: *"aegis isn't working"*, the aegis-help skill diagnoses it.

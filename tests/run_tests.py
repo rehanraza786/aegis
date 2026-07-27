@@ -842,6 +842,14 @@ await c.close();
     nulls = sum(db.execute(f"SELECT COUNT(*) FROM {t} WHERE file_id IS NULL").fetchone()[0]
                 for t in ("msg_edges", "msg_topics", "db_defs", "db_access", "http_endpoints", "http_calls"))
     check("no NULL-fid seam rows after repeated incrementals (parity: both editions skip)", nulls == 0, str(nulls))
+    # batch 19: symbol resolution must ride indexes, not a table scan — the
+    # qualified-name expression index turns resolveTarget's OR into MULTI-INDEX
+    plan = "".join(str(r) for r in db.execute(
+        "EXPLAIN QUERY PLAN SELECT s.name FROM symbols s JOIN files f ON f.id=s.file_id "
+        "WHERE s.name=? OR (s.parent || '.' || s.name)=? ORDER BY (s.kind='class') DESC LIMIT 1",
+        ("OrderPublisher", "OrderPublisher")).fetchall())
+    check("resolveTarget-shaped lookup uses indexes (no SCAN over symbols)",
+          "idx_symbols_qname" in plan and "SCAN s" not in plan, plan[:200])
     db.close()
 
     # ---- context_pack: one call, focused, budgeted ----
@@ -1283,6 +1291,7 @@ const st = JSON.parse(await read("ariadne://status"));
 const adr = await read("ariadne://decisions/ADR-012");
 const graph = JSON.parse(await read("ariadne://graph"));
 const ctx = await read("ariadne://context");
+const gsum = JSON.parse(await read("ariadne://graph/summary"));
 const asr = JSON.parse(await read("ariadne://assertions"));
 const pc = JSON.parse(await call("plan_context", { task: "publish the order created event to kafka" }));
 const cc = JSON.parse(await call("change_check", { files: ["order-service/src/main/java/com/acme/OrderPublisher.java", "billing-service/src/main/java/com/acme/PaymentDao.java", "no-such-file.java"] }));
@@ -1314,6 +1323,12 @@ try {
   cycOk = String(tr).includes("cycle");
 } catch { cycOk = false; }
 dbw.prepare("DELETE FROM decisions WHERE id IN ('ADR-901','ADR-902')").run();
+
+// ---- batch 19: assert_edge writes the SAME record shape in both editions ----
+await call("assert_edge", { kind: "kafka", file: "order-service/src/main/java/com/acme/OrderPublisher.java", line: 5, evidence: "kafkaTemplate.send(ORDERS_TOPIC, ...) — topic and direction read directly from the send site.", topic: "probe.contract.check", direction: "produce" });
+const asr2 = JSON.parse(await read("ariadne://assertions"));
+const recA = (asr2.assertions ?? []).find((x) => x && x.topic === "probe.contract.check") ?? {};
+const contractOk = recA.confidence === "medium" && !("mode" in recA) && !("method" in recA) && recA.direction === "produce";
 
 // ---- batch 18: fresh tells the truth about the worktree ----
 const scratch = path.join(process.cwd(), "order-service", "src", "main", "java", "com", "acme", "ProbeScratch.java");
@@ -1355,7 +1370,7 @@ if (process.platform !== "win32") {
 const out = {
   sdRefuseOk: String(sdRefuse).startsWith("Multi-root workspace: pass root="),
   sdRootedOk: String(sdOk).includes("saved to") && String(sdOk).includes("docs-repo"),
-  cycOk, freshOk, inodeOk,
+  cycOk, freshOk, inodeOk, contractOk,
   restoredOk: restoredFiles === filesBefore,
   prompts,
   impactOk: impact.includes("OrderPublisher.java") && impact.includes("orders.created") && impact.includes("ADR-012") && impact.includes("OrderPublisherTest.java"),
@@ -1367,6 +1382,8 @@ const out = {
   stOk: typeof st.fresh === "boolean" && st.files > 0,
   adrOk: adr.includes("read-only queries"),
   graphOk: (graph.modules ?? []).length > 0 && (graph.topics ?? []).length > 0,
+  gsumOk: (gsum.counts?.modules ?? 0) > 0 && Array.isArray(gsum.top_modules_by_degree) && JSON.stringify(gsum).length < 2000,
+  asrShapeOk: typeof asr.total === "number" && typeof asr.showing === "number",
   ctxOk: ctx.includes("test files indexed"),
   asrOk: (asr.assertions ?? []).some((a) => a.author === "copilot"),
   annOk: ann("find_symbol").readOnlyHint === true && ann("save_insight").readOnlyHint === false && ann("reindex").readOnlyHint === false,
@@ -1430,6 +1447,7 @@ async def main():
             adr = await read("ariadne://decisions/ADR-012")
             graph = json.loads(await read("ariadne://graph"))
             ctx = await read("ariadne://context")
+            gsum = json.loads(await read("ariadne://graph/summary"))
             asr = json.loads(await read("ariadne://assertions"))
             pc = json.loads(await call("plan_context", {"task": "publish the order created event to kafka"}))
             cc = json.loads(await call("change_check", {"files": [
@@ -1466,6 +1484,13 @@ async def main():
                 cyc_ok = False
             dbw.execute("DELETE FROM decisions WHERE id IN ('ADR-901','ADR-902')")
             dbw.commit()
+
+            # ---- batch 19: assert_edge writes the SAME record shape in both editions ----
+            await call("assert_edge", {"kind": "kafka", "file": "order-service/src/main/java/com/acme/OrderPublisher.java", "line": 5, "evidence": "kafkaTemplate.send(ORDERS_TOPIC, ...) — topic and direction read directly from the send site.", "topic": "probe.contract.check", "direction": "produce"})
+            asr2 = json.loads(await read("ariadne://assertions"))
+            rec_a = next((x for x in asr2.get("assertions", []) if isinstance(x, dict) and x.get("topic") == "probe.contract.check"), {})
+            contract_ok = (rec_a.get("confidence") == "medium" and "mode" not in rec_a
+                           and "method" not in rec_a and rec_a.get("direction") == "produce")
 
             # ---- batch 18: fresh tells the truth about the worktree ----
             scratch = os.path.join(os.getcwd(), "order-service", "src", "main", "java", "com", "acme", "ProbeScratch.java")
@@ -1523,6 +1548,10 @@ async def main():
                 "stOk": isinstance(st.get("fresh"), bool) and st.get("files", 0) > 0,
                 "adrOk": "read-only queries" in adr,
                 "graphOk": len(graph.get("modules", [])) > 0 and len(graph.get("topics", [])) > 0,
+                "gsumOk": gsum.get("counts", {}).get("modules", 0) > 0
+                          and isinstance(gsum.get("top_modules_by_degree"), list)
+                          and len(json.dumps(gsum)) < 2000,
+                "asrShapeOk": isinstance(asr.get("total"), int) and isinstance(asr.get("showing"), int),
                 "ctxOk": "test files indexed" in ctx,
                 "asrOk": any(a.get("author") == "copilot" for a in asr.get("assertions", [])),
                 "annOk": ann("find_symbol").readOnlyHint is True and ann("save_insight").readOnlyHint is False
@@ -1537,7 +1566,7 @@ async def main():
                           "listChanged": "list_changed" in got},
                 "sdRefuseOk": str(sd_refuse).startswith("Multi-root workspace: pass root="),
                 "sdRootedOk": "saved to" in str(sd_ok) and "docs-repo" in str(sd_ok),
-                "cycOk": cyc_ok, "freshOk": fresh_ok, "inodeOk": inode_ok,
+                "cycOk": cyc_ok, "freshOk": fresh_ok, "inodeOk": inode_ok, "contractOk": contract_ok,
                 "restoredOk": restored_files == files_before,
             }
             print("SURFACE:" + json.dumps(out))
@@ -1557,13 +1586,17 @@ asyncio.run(main())
     check("aegis-resolve-gap serves the top gap with the assert contract", sf.get("gapOk") is True)
     check("aegis-release-check aggregates drift/orphans for review", sf.get("relOk") is True)
     check("aegis-release-check honors dismissals (audit.q excluded)", sf.get("relDismissed") is True)
-    check("resource registry served over the protocol (5 static + decisions template)",
+    check("resource registry served over the protocol (6 static + decisions template)",
           sf.get("res") == ["ariadne://assertions", "ariadne://context", "ariadne://decisions",
-                            "ariadne://graph", "ariadne://status"]
+                            "ariadne://graph", "ariadne://graph/summary", "ariadne://status"]
           and sf.get("tpl") == ["ariadne://decisions/{id}"], str(sf.get("res")))
     check("ariadne://status serves freshness JSON", sf.get("stOk") is True)
     check("ariadne://decisions/<id> serves the ADR source", sf.get("adrOk") is True)
     check("ariadne://graph serves the export snapshot", sf.get("graphOk") is True)
+    check("ariadne://graph/summary is a <2KB budgeted overview with counts and top modules",
+          sf.get("gsumOk") is True, str(sf.get("gsumOk")))
+    check("ariadne://assertions is capped newest-first with total/showing",
+          sf.get("asrShapeOk") is True, str(sf.get("asrShapeOk")))
     check("ariadne://context serves the agent orientation pack", sf.get("ctxOk") is True)
     check("ariadne://assertions serves the human knowledge layer", sf.get("asrOk") is True)
     check("tool annotations visible over the protocol (readOnlyHint)", sf.get("annOk") is True)
@@ -1581,6 +1614,8 @@ asyncio.run(main())
           sf.get("sdRootedOk") is True, str(sf.get("sdRootedOk")))
     check("decision_trace survives a supersession cycle and flags it",
           sf.get("cycOk") is True, str(sf.get("cycOk")))
+    check("assert_edge record shape is cross-edition canonical (no phantom mode/method; confidence defaults)",
+          sf.get("contractOk") is True, str(sf.get("contractOk")))
     check("fresh tells the truth about the worktree (dirty->false, absorbed->true, clean->0)",
           sf.get("freshOk") is True, str(sf.get("freshOk")))
     check("a mv-replaced index.db is picked up by the long-lived server (inode revalidation)",
@@ -1842,11 +1877,12 @@ asyncio.run(main())
           node_prompts == py_prompts == {"aegis-impact", "aegis-orient", "aegis-resolve-gap", "aegis-release-check"},
           str(sorted(node_prompts ^ py_prompts)))
     # resource registry parity: the ariadne:// URIs are the cross-edition contract
-    node_res = set(_re2.findall(r'resource\(server, "[a-z]+", (?:new ResourceTemplate\()?"(ariadne://[^"]+)"', node_src))
+    node_res = set(_re2.findall(r'resource\(server, "[a-z-]+", (?:new ResourceTemplate\()?"(ariadne://[^"]+)"', node_src))
     py_res = set(_re2.findall(r'@mcp\.resource\("(ariadne://[^"]+)"', py_src))
-    check("node and python resource registries match (6 URIs)",
-          node_res == py_res == {"ariadne://graph", "ariadne://status", "ariadne://context",
-                                 "ariadne://decisions", "ariadne://decisions/{id}", "ariadne://assertions"},
+    check("node and python resource registries match (7 URIs)",
+          node_res == py_res == {"ariadne://graph", "ariadne://graph/summary", "ariadne://status",
+                                 "ariadne://context", "ariadne://decisions", "ariadne://decisions/{id}",
+                                 "ariadne://assertions"},
           str(sorted(node_res ^ py_res)))
     # one version identity across every manifest: npm, PyPI, and the CHANGELOG
     node_ver = json.loads((TOOLKIT / "payload" / "ariadne-node" / "package.json").read_text(encoding="utf-8"))["version"]
@@ -1865,6 +1901,46 @@ asyncio.run(main())
     check("docs/TOOLS.md documents every MCP prompt", not undoc_prompts, str(undoc_prompts))
     undoc_res = sorted(u for u in node_res if f"`{u}`" not in tools_doc)
     check("docs/TOOLS.md documents every ariadne:// resource", not undoc_res, str(undoc_res))
+    # ---- prose doc-pins (batch 19): quoted numbers must equal the registry,
+    # and the prompt-layer must know the composites exist. Three of the claims
+    # below went stale precisely because they were hand-written constants.
+    readme = (TOOLKIT / "README.md").read_text(encoding="utf-8")
+    arch = (TOOLKIT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
+    m_r = re.search(r"all (\d+) tools", readme)
+    m_a = re.search(r"same (\d+) MCP tools", arch)
+    check("README/ARCHITECTURE quote the real tool count (pinned to the registry)",
+          m_r and m_a and int(m_r.group(1)) == len(node_reg) == int(m_a.group(1)),
+          f"README={m_r and m_r.group(1)} ARCH={m_a and m_a.group(1)} registry={len(node_reg)}")
+    m_t = re.search(r"plus 4 server-rendered prompts and (\d+) `ariadne://`", tools_doc)
+    check("TOOLS.md header quotes the real resource count",
+          m_t and int(m_t.group(1)) == len(node_res), str(m_t and m_t.group(1)))
+    # PRIVACY's self-check grep must keep landing ONLY in the four named files
+    priv_hits = set()
+    import glob as _glob
+    for pat in ("payload/ariadne-node/*.mjs", "payload/ariadne-python/*.py", "payload/*.sh"):
+        for f in _glob.glob(str(TOOLKIT / pat)):
+            text = Path(f).read_text(encoding="utf-8", errors="replace")
+            if re.search(r"fetch\(|https://|curl ", text):
+                priv_hits.add(Path(f).name)
+    check("PRIVACY.md's own grep lands only in enrich.*, pull-index.sh, install-hooks.sh",
+          priv_hits == {"enrich.mjs", "enrich.py", "pull-index.sh", "install-hooks.sh"}, str(sorted(priv_hits)))
+    # engines.json toolHints: every tool it names must exist, composites included
+    eng = json.loads((TOOLKIT / "payload" / "engines.json").read_text(encoding="utf-8"))
+    hints = eng["ariadne"]["toolHints"]
+    named = set(re.findall(r"\b([a-z][a-z0-9_]{3,})\b", hints)) & (node_reg | {"plan_context", "change_check"})
+    check("engines.json toolHints name only real tools and lead with the composites",
+          named <= node_reg and {"plan_context", "change_check"} <= named
+          and hints.index("plan_context") < hints.index("module_map"), str(sorted(named - node_reg)))
+    # the composites must be taught wherever agents learn tool usage
+    ladder_files = [TOOLKIT / "payload" / ".github" / "skills" / "change-impact-analysis" / "SKILL.md",
+                    TOOLKIT / "payload" / ".github" / "skills" / "codebase-orientation" / "SKILL.md",
+                    TOOLKIT / "payload" / ".github" / "agents" / "argus.agent.md",
+                    TOOLKIT / "payload" / ".github" / "agents" / "daedalus.agent.md"]
+    missing_comp = [f.name for f in ladder_files
+                    if "plan_context" not in f.read_text(encoding="utf-8")
+                    and "change_check" not in f.read_text(encoding="utf-8")]
+    check("skills/agents teach the composite tools (no expensive-path-only briefs)",
+          not missing_comp, str(missing_comp))
     # the two constitution templates must never drift apart again
     check("constitution templates are identical (payload/ vs spec-driven-artifacts/)",
           (TOOLKIT / "payload" / "constitution-template.md").read_bytes()

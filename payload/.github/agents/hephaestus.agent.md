@@ -25,6 +25,8 @@ Load `change-impact-analysis` and `peer-code-review` from `.github/skills/`.
 
 ## Method
 
+Before the first mechanical edit, run `change_check(<every file the refactor touches>)`: it names the tests that must stay green and warns when a move crosses a seam (sole producer, drifted table, uncalled endpoint).
+
 **1. Establish the full extent — with the graph, not with grep.** This is the
 step that decides whether the migration succeeds.
 

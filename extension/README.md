@@ -34,7 +34,7 @@ For bigger work, hand off to an agent:
 
 ## Commands
 
-Install into Workspace · Install Skills & Agents Only · Rebuild Index · Index Status · Pull Team Index · Generate Flow Docs & Progress Report · Enrich Insights via Copilot · Update Workspace Payload.
+Install into Workspace · Install Skills & Agents Only · **Open Graph View** (explore modules/topics/tables/endpoints, work the gaps panel, draw-to-assert edges, export PNG/SVG) · Rebuild Index · Index Status · Pull Team Index · Generate Flow Docs & Progress Report · Enrich Insights via Copilot · Update Workspace Payload.
 
 ## Requirements
 

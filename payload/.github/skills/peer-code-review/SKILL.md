@@ -28,6 +28,8 @@ Do not freestyle.
 
 ## Pass 0: Establish context (do not review yet)
 
+> **One-call shortcut:** `change_check(<the changed files>)` returns the blast radius, seam warnings, governing decisions, and tests to re-run for the whole diff in one call — the graph half of Pass 0. `/aegis-release-check` renders the release-level version (drift, orphans, stale assertions) as a brief.
+
 1. What is this change supposed to do? Read the ticket/spec/story and the
    acceptance criteria. If none exist, infer intent from the code and state
    your inference explicitly — findings about "adherence to spec" are only as

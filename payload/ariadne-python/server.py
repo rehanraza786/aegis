@@ -77,6 +77,34 @@ def _porcelain_entries(cwd):
     return out
 
 
+_STATUS_CACHE = {}
+_STATUS_TTL = 2.0
+
+
+def _root_status(cwd, live=False):
+    """Freshness checks shell out to git; on the hot path that is 10-20ms of
+    synchronous child process per root, per call. A 2s TTL is correctness-safe:
+    the graph only moves on reindex, and a stale dirty count converges on the
+    next call. Parity: rootStatus (Node)."""
+    now = time.time()
+    c = _STATUS_CACHE.get(str(cwd))
+    # `live` skips the cache READ (still refreshes it): index_status is the
+    # authoritative freshness answer an agent acts on — it must not serve a
+    # 2s-old view of a file the agent wrote 100ms ago.
+    if not live and c and now - c["ts"] < _STATUS_TTL:
+        return c
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                              text=True, cwd=cwd, timeout=15).stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        head = None
+    ents = _porcelain_entries(cwd) if head is not None else []
+    sig = _worktree_sig_from(cwd, ents) if head is not None else None
+    rec = {"ts": now, "head": head, "ents": ents, "sig": sig}
+    _STATUS_CACHE[str(cwd)] = rec
+    return rec
+
+
 def _worktree_sig_from(cwd, ents):
     """Same fingerprint format the indexer stamps as worktree_sig:<prefix>
     (sorted "st|rel|size|mtime_ms" lines, sha1; clean = "")."""
@@ -110,24 +138,77 @@ MAX_BYTES = _cfg.get("maxToolBytes", 24000)
 SUMMARY_THRESHOLD = _cfg.get("summaryThreshold", 40)
 
 
+def _clamp(n, lo, hi):
+    """Parity with Node's clamp(): limit<=0 used to reach SQLite as LIMIT -1
+    (= unlimited) and nest unbounded rows under the byte-chop only."""
+    try:
+        return max(lo, min(hi, int(n)))
+    except (TypeError, ValueError):
+        return lo
+
+
 def _has_warning(r):
     return isinstance(r, dict) and any(k in r for k in
                                        ("warning", "warnings", "unresolved_expressions", "unmatched_calls"))
 
 
-def budget(result):
-    """Cap rows and bytes. Warning-bearing entries are kept FIRST and never dropped.
-    a truncated dump that silently discards the drift warning is worse than useless."""
+NESTED_CAP = int(_cfg.get("maxNestedRows", 20))
+
+
+def _cap_deep(x, stats, is_root=True, cap=None):
+    """Cap EVERY nested list warnings-first with an explicit tail. The old
+    budget() capped only the top-level array; nested lists blew through
+    unbounded and the byte-chop then truncated mid-JSON (measured: http_map at
+    24KB; blast_radius losing tests_affected). Parity: capDeep (Node)."""
+    cap = NESTED_CAP if cap is None else cap
+    if isinstance(x, list):
+        arr = x
+        if not is_root and len(arr) > cap:
+            warned = [r for r in arr if _has_warning(r)]
+            plain = [r for r in arr if not _has_warning(r)]
+            kept = (warned + plain)[:cap]
+            stats["rows_capped"] += len(x) - len(kept)
+            arr = kept + [f"…and {len(x) - len(kept)} more (narrow the query for the rest)"]
+        return [_cap_deep(v, stats, False, cap) for v in arr]
+    if isinstance(x, dict):
+        return {k: _cap_deep(v, stats, False, cap) for k, v in x.items()}
+    return x
+
+
+def _shape_result(result, stats, cap):
+    """capDeep + top-level row cap + budget-first field. Parity: shapeResult."""
+    if isinstance(result, str):
+        return result
+    result = _cap_deep(result, stats, True, cap)
     if isinstance(result, list) and len(result) > MAX_ROWS:
         total = len(result)
         warned = [r for r in result if _has_warning(r)]
         plain = [r for r in result if not _has_warning(r)]
         kept = (warned + plain)[:MAX_ROWS]
+        stats["rows_capped"] += total - len(kept)
         result = {"showing": len(kept), "of": total,
                   "note": "Truncated to protect context (warnings kept first, never dropped). "
                           "Narrow with a filter argument, or raise 'limit'.",
                   "results": kept}
-    out = result if isinstance(result, str) else json.dumps(result, indent=1)
+    # budget report FIRST, so even a byte-chop cannot eat the fact rows fell
+    if stats["rows_capped"] and isinstance(result, dict):
+        result = {"budget": {"rows_capped": stats["rows_capped"]}, **result}
+    return result
+
+
+def budget(result):
+    """Cap rows and bytes. Warning-bearing entries are kept FIRST and never dropped.
+    a truncated dump that silently discards the drift warning is worse than useless.
+    Byte pressure gets a STRUCTURED second pass (tighter caps, still valid JSON)
+    before the blind chop ever fires. Parity: budget (Node)."""
+    raw = result
+    stats = {"rows_capped": 0}
+    shaped = _shape_result(raw, stats, NESTED_CAP)
+    out = shaped if isinstance(shaped, str) else json.dumps(shaped, indent=1, ensure_ascii=False)
+    if len(out) > MAX_BYTES and not isinstance(raw, str):
+        stats = {"rows_capped": 0}
+        shaped = _shape_result(raw, stats, 5)
+        out = shaped if isinstance(shaped, str) else json.dumps(shaped, indent=1, ensure_ascii=False)
     if len(out) > MAX_BYTES:
         out = out[:MAX_BYTES] + (f"\n\n… [truncated at {MAX_BYTES} chars to protect context. "
                                  "Narrow the query, pass a filter argument, or query one item at a time.]")
@@ -245,7 +326,7 @@ def _payload_version():
         return "unknown"
 
 
-def _status_data():
+def _status_data(live=False):
     """Shared with the ariadne://status resource and the release-check prompt:
     one implementation of "how fresh is the graph", never three drifting copies."""
     con = db()
@@ -270,15 +351,10 @@ def _status_data():
     for r in sha_rows:
         pref = r["key"][len("last_sha:"):]
         d = _root_dir(pref)
-        try:
-            head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
-                                  text=True, cwd=d, timeout=15).stdout.strip() or None
-        except (OSError, subprocess.SubprocessError):
-            head = None
-        ents = _porcelain_entries(d) if head is not None else []
-        dirty = len(ents)
+        rs = _root_status(d, live)
+        head, sig_now = rs["head"], rs["sig"]
+        dirty = len(rs["ents"])
         sig_stored = meta(f"worktree_sig:{pref}")
-        sig_now = _worktree_sig_from(d, ents) if head is not None else None
         # A pre-worktree-stamp index (sig_stored None) is judged on SHAs alone.
         fresh = None if head is None else (
             head == r["value"] and (sig_stored is None or sig_stored == sig_now))
@@ -308,7 +384,7 @@ def _status_data():
 @mcp.tool(annotations=RO)
 def index_status() -> str:
     """Check index freshness: file/symbol/edge counts, whether the indexed git SHA matches HEAD, and dirty_worktree (uncommitted paths — the incremental indexer absorbs them; fresh:false until it has). Call this first if results seem stale."""
-    return _status_data()
+    return _status_data(live=True)
 
 
 @mcp.tool(annotations=RO)
@@ -319,7 +395,7 @@ def search_code(query: str, limit: int = 8) -> str:
     rows = con.execute(
         "SELECT path, start_line, snippet(chunks, 2, '>>>', '<<<', ' … ', 24) AS snippet "
         "FROM chunks WHERE chunks MATCH ? ORDER BY rank LIMIT ?",
-        (safe, min(limit, 25))).fetchall()
+        (safe, _clamp(limit, 1, 25))).fetchall()
     encl = con.execute
     out = []
     for r in rows:
@@ -463,6 +539,7 @@ def file_outline(path: str) -> str:
     dependents = con.execute("SELECT f2.path FROM edges e JOIN files f2 ON f2.id=e.src WHERE e.dst=?",
                              (f["id"],)).fetchall()
     return {"path": path, "lang": f["lang"], "lines": f["lines"],
+            "symbol_count": len(syms),
             "symbols": [dict(s) for s in syms],
             "imports": [d["path"] for d in deps],
             "imported_by": [d["path"] for d in dependents]}
@@ -494,10 +571,13 @@ def _blast_data(con, path, depth):
         if prod:
             levels.append(sorted({r["path"] for r in prod}))
     total = sum(len(x) for x in levels)
-    out = {"file": path, "affected_total": total, "by_depth": levels}
+    # conclusions BEFORE bulk: if the byte-chop ever fires, it must eat tail
+    # paths, not tests_affected (the tool's stated purpose)
+    out = {"file": path, "affected_total": total}
     if has_test:
-        out["tests_affected"] = sorted(tests_affected)
         out["tests_affected_total"] = len(tests_affected)
+        out["tests_affected"] = sorted(tests_affected)
+    out["by_depth"] = levels
     return out
 
 
@@ -542,7 +622,7 @@ def hotspots(limit: int = 10) -> str:
     con = db()
     rows = con.execute(
         "SELECT f.path, COUNT(e.src) dependents FROM files f JOIN edges e ON e.dst=f.id "
-        "GROUP BY f.id ORDER BY dependents DESC LIMIT ?", (min(limit, 30),)).fetchall()
+        "GROUP BY f.id ORDER BY dependents DESC LIMIT ?", (_clamp(limit, 1, 30),)).fetchall()
     return fmt(rows)
 
 
@@ -553,7 +633,7 @@ def find_callers(name: str, limit: int = 40) -> str:
     rows = con.execute(
         "SELECT s.name AS caller, s.parent, f.path, c.line FROM calls c "
         "JOIN symbols s ON s.id=c.src_symbol JOIN files f ON f.id=s.file_id "
-        "WHERE c.callee=? ORDER BY f.path, c.line LIMIT ?", (name, min(limit, 100))).fetchall()
+        "WHERE c.callee=? ORDER BY f.path, c.line LIMIT ?", (name, _clamp(limit, 1, 100))).fetchall()
     return fmt(rows) if rows else "No callers recorded (AST may not cover this language; try find_references)."
 
 
@@ -582,7 +662,7 @@ def find_references(name: str, limit: int = 40) -> str:
     for d in defs:
         refs = con.execute(
             "SELECT path, line FROM scip_refs WHERE symbol=? ORDER BY path, line LIMIT ?",
-            (d["symbol"], min(limit, 100))).fetchall()
+            (d["symbol"], _clamp(limit, 1, 100))).fetchall()
         out.append({"symbol": d["symbol"], "defined": f"{d['path']}:{d['line']}",
                     "doc": (d["docs"] or "")[:150],
                     "reference_count": len(refs),
@@ -852,13 +932,13 @@ def _gaps_data(con, n):
 @mcp.tool(annotations=RO)
 def graph_gaps(limit: int = 20) -> str:
     """Where static analysis is BLIND, the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, and drift tables, each with file:line. Investigate, then record what you work out with assert_edge. This is how the graph gets better instead of staying wrong."""
-    return _gaps_data(db(), min(max(limit, 1), 60))
+    return _gaps_data(db(), _clamp(limit, 1, 60))
 
 
 @mcp.tool(annotations=WR)
 def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str = "medium",
-                topic: str = "", direction: str = "", table: str = "", mode: str = "rw",
-                method: str = "GET", path: str = "") -> str:
+                topic: str = "", direction: str = "", table: str = "", mode: str = "",
+                method: str = "", path: str = "") -> str:
     """Record a fact you DERIVED by reading code that static analysis could not resolve, a runtime-assembled Kafka topic, dynamic SQL, a gateway-rewritten route. kind: kafka|db|http_endpoint|http_call. Writes docs/graph-assertions.json (git-committed and reviewable, like an ADR) and enters the graph tagged with your name, never mistaken for a parsed fact. Requires evidence: quote the code that convinced you."""
     if kind not in ("kafka", "db", "http_endpoint", "http_call"):
         return "kind must be kafka|db|http_endpoint|http_call."
@@ -903,7 +983,7 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
                                   and x.get("path") == (path or None))]
     lst.append(rec)
     af.parent.mkdir(parents=True, exist_ok=True)
-    af.write_text(json.dumps(lst, indent=2) + "\n", encoding="utf-8")
+    af.write_text(json.dumps(lst, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return (f"Asserted and recorded in docs/graph-assertions.json ({len(lst)} total). It enters the graph on "
             f"the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically "
             f"if {file} changes. Commit the file to share it with the team.")
@@ -951,7 +1031,11 @@ def message_flow(topic: str = "") -> str:
             "busiest_topics": [dict(r) for r in sorted(per, key=lambda r: -(r["p"] + r["c"]))[:10]],
             "next": "Full listing: docs/generated/message-flows.md. For sites on one topic: message_flow topic:<name>.",
         }
-    q = ("SELECT m.topic, m.direction, f.path, m.line, m.resolved, m.via, m.system, m.source"
+    # a pre-`source` DB (older payload built the index) degrades like Node
+    # instead of hard-failing the whole tool on an unknown column
+    has_src = con.execute("SELECT COUNT(*) FROM pragma_table_info('msg_edges') WHERE name='source'").fetchone()[0]
+    q = ("SELECT m.topic, m.direction, f.path, m.line, m.resolved, m.via, m.system"
+         + (", m.source" if has_src else "")
          + (", f.is_test" if has_test else "") + " FROM msg_edges m "
          "JOIN files f ON f.id=m.file_id " + ("WHERE m.topic=? " if topic else "") + "ORDER BY m.topic, m.direction")
     rows = con.execute(q, (topic,) if topic else ()).fetchall()
@@ -1087,6 +1171,48 @@ def db_map(table: str = "") -> str:
     return out
 
 
+_HTTP_MEMO = {}
+
+
+def _http_correlation(con, prod_only, has_test):
+    """Bucketed + memoized endpoint↔call correlation (parity: httpCorrelation,
+    Node). The old shape recomputed the full endpoints×calls cross-product
+    inside every http_map call — measured 1.5s at 1.2k×3k, identical inputs
+    every time until the next reindex. Buckets by (method, segment count —
+    covering the leading-{} strip and dynamic-tail cases paths_match defines)
+    prune the pairing without changing its result; memoized per meta.last_run."""
+    from http_extract import paths_match
+    row = con.execute("SELECT value FROM meta WHERE key='last_run'").fetchone()
+    key = (row[0] if row else "0", bool(prod_only))
+    hit = _HTTP_MEMO.get(key)
+    if hit:
+        return hit
+    where = " WHERE f.is_test=0" if (prod_only and has_test) else ""
+    eps = con.execute("SELECT e.method, e.path, e.norm, f.path fp, e.line" + (", f.is_test" if has_test else "")
+                      + " FROM http_endpoints e JOIN files f ON f.id=e.file_id" + where + " ORDER BY e.norm").fetchall()
+    calls = con.execute("SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client" + (", f.is_test" if has_test else "")
+                        + " FROM http_calls c JOIN files f ON f.id=c.file_id" + where + " ORDER BY c.norm").fetchall()
+    by_bucket, tails = {}, {}
+    for i, c in enumerate(calls):
+        segs = c["norm"].split("/")
+        if segs[-1] == "{**}":
+            tails.setdefault(c["method"], []).append(i)
+            continue
+        n = len(segs)
+        for k in ((n, n - 1) if c["norm"].startswith("/{}/") else (n,)):
+            by_bucket.setdefault((c["method"], k), []).append(i)
+    matches_by_ep = []
+    for e in eps:
+        cand = by_bucket.get((e["method"], len(e["norm"].split("/"))), []) + tails.get(e["method"], [])
+        matches_by_ep.append([i for i in cand if paths_match(calls[i]["norm"], e["norm"])])
+    matched = {i for m in matches_by_ep for i in m}
+    rec = (eps, calls, matches_by_ep, matched)
+    _HTTP_MEMO[key] = rec
+    while len(_HTTP_MEMO) > 4:
+        _HTTP_MEMO.pop(next(iter(_HTTP_MEMO)))
+    return rec
+
+
 @mcp.tool(annotations=RO)
 def http_map(path: str = "") -> str:
     """Full-stack HTTP seam: correlate REST endpoints (Spring controllers) with every caller (TS/React fetch/axios, Java RestTemplate/WebClient/Feign) matched on method + normalized path. Includes orphan endpoints and unmatched calls."""
@@ -1097,21 +1223,9 @@ def http_map(path: str = "") -> str:
     n_ep = con.execute("SELECT COUNT(*) FROM http_endpoints").fetchone()[0]
     has_test = con.execute("SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='is_test'").fetchone()[0]
     if not path and n_ep > SUMMARY_THRESHOLD:
-        from http_extract import paths_match as _pm
         # orphan math is production-only: a WireMock stub or a test caller cures nothing
-        eps0 = con.execute("SELECT e.method, e.path, e.norm FROM http_endpoints e"
-                           + (" JOIN files f ON f.id=e.file_id WHERE f.is_test=0" if has_test else "")).fetchall()
-        calls0 = con.execute("SELECT c.method, c.path, c.norm, c.client FROM http_calls c"
-                             + (" JOIN files f ON f.id=c.file_id WHERE f.is_test=0" if has_test else "")).fetchall()
-        matched, orphans = set(), []
-        for e in eps0:
-            hit = False
-            for i, c in enumerate(calls0):
-                if c["method"] == e["method"] and _pm(c["norm"], e["norm"]):
-                    matched.add(i)
-                    hit = True
-            if not hit:
-                orphans.append(f"{e['method']} {e['path']}")
+        eps0, calls0, mm, matched = _http_correlation(con, True, has_test)
+        orphans = [f"{e['method']} {e['path']}" for i, e in enumerate(eps0) if not mm[i]]
         cap = lambda a: (a[:25] + [f"…and {len(a) - 25} more"]) if len(a) > 25 else a  # noqa: E731
         return {
             "summary": f"{n_ep} endpoints, {len(calls0)} client calls.",
@@ -1122,22 +1236,14 @@ def http_map(path: str = "") -> str:
             },
             "next": "Full listing: docs/generated/http-map.md. For one route: http_map path:<fragment>.",
         }
-    eps = con.execute("SELECT e.method, e.path, e.norm, f.path fp, e.line" + (", f.is_test" if has_test else "")
-                      + " FROM http_endpoints e JOIN files f ON f.id=e.file_id ORDER BY e.norm").fetchall()
-    calls = con.execute("SELECT c.method, c.path, c.norm, f.path fp, c.line, c.client" + (", f.is_test" if has_test else "")
-                        + " FROM http_calls c JOIN files f ON f.id=c.file_id ORDER BY c.norm").fetchall()
+    eps, calls, matches_by_ep, matched = _http_correlation(con, False, has_test)
     if not eps and not calls:
         return "No REST endpoints or HTTP clients detected."
-    matched = set()
     out = []
-    for e in eps:
+    for ei, e in enumerate(eps):
         if path and path not in e["norm"] and path not in e["path"]:
             continue
-        callers = []
-        for i, c in enumerate(calls):
-            if c["method"] == e["method"] and paths_match(c["norm"], e["norm"]):
-                matched.add(i)
-                callers.append(c)
+        callers = [calls[i] for i in matches_by_ep[ei]]
         prod_callers = [c for c in callers if not (has_test and c["is_test"])]
         test_callers = [c for c in callers if has_test and c["is_test"]]
         # an endpoint defined in a test file (WireMock/contract stub) is labeled, never an orphan
@@ -1400,6 +1506,7 @@ async def reindex(mode: str = "incremental") -> str:
     # and kills the server. The node edition is async for the same reason.
     import anyio
     out = await anyio.to_thread.run_sync(_run)
+    _STATUS_CACHE.clear()  # freshness must not serve the pre-reindex worktree state
     await _notify_after_reindex()  # subscribed resource readers refetch instead of going stale
     return out
 
@@ -1707,7 +1814,7 @@ def _current_run():
 
 
 @mcp.resource("ariadne://graph", name="graph", mime_type="application/json",
-              description="The full graph-export JSON snapshot (modules, topics, tables, endpoints, gaps, annotations) — the same contract the graph view renders. Cached until the index moves.")
+              description="UI-SCALE, not context-scale: the full graph-export JSON snapshot (modules, topics, tables, endpoints, gaps, annotations) — the contract the graph view renders, easily hundreds of KB on a real workspace. Agents should use module_map/context_pack/plan_context, or read ariadne://graph/summary for a budgeted overview. Cached until the index moves.")
 async def resource_graph() -> str:
     key = _current_run()
     if key and _export_cache["key"] == key and _export_cache["json"]:
@@ -1729,11 +1836,42 @@ async def resource_graph() -> str:
     return out
 
 
+@mcp.resource("ariadne://graph/summary", name="graph-summary", mime_type="application/json",
+              description="A ~1KB summary of the graph snapshot: per-layer counts, the highest-degree modules, and gap totals. The agent-safe way to glance at the whole graph; drill down with tools, not with ariadne://graph.")
+async def resource_graph_summary() -> str:
+    raw = await resource_graph()
+    try:
+        g = json.loads(raw)
+    except ValueError:
+        return raw  # the export error message, verbatim
+    modules = g.get("modules", [])
+    deg = {m.get("id"): len(m.get("deps", [])) for m in modules}
+    for m in modules:
+        for d2 in m.get("deps", []):
+            deg[d2] = deg.get(d2, 0) + 1
+    top = sorted(({"id": m.get("id"), "files": m.get("files"), "degree": deg.get(m.get("id"), 0)}
+                  for m in modules), key=lambda x: -x["degree"])[:10]
+    gf = g.get("generated_from", {})
+    out = {"counts": {"modules": gf.get("modules_total", len(modules)), "files": gf.get("files"),
+                      "symbols": gf.get("symbols"),
+                      "topics": gf.get("topics_total", len(g.get("topics", []))),
+                      "tables": gf.get("tables_total", len(g.get("tables", []))),
+                      "endpoints": gf.get("endpoints_total", len(g.get("endpoints", []))),
+                      "gaps": len(g.get("gaps", [])), "annotations": len(g.get("annotations", []))},
+           "top_modules_by_degree": top}
+    if gf.get("fresh") is not None:
+        out["fresh"] = gf.get("fresh")
+    if gf.get("indexed_sha"):
+        out["indexed_sha"] = gf.get("indexed_sha")
+    out["next"] = "Details: module_map, context_pack(target), plan_context(task). Full snapshot (UI-scale): ariadne://graph."
+    return json.dumps(out, indent=1, ensure_ascii=False)
+
+
 @mcp.resource("ariadne://status", name="status", mime_type="application/json",
               description="Index freshness: counts, indexed SHA vs HEAD, payload version. The resource twin of the index_status tool.")
 def resource_status() -> str:
     try:
-        return json.dumps(_status_data(), indent=1)
+        return json.dumps(_status_data(), indent=1, ensure_ascii=False)
     except Exception as e:  # noqa: BLE001
         return f"Error reading status: {e}"
 
@@ -1759,7 +1897,7 @@ def resource_decisions() -> str:
             if r["valid_until"]:
                 e["valid_until"], e["superseded_by"] = r["valid_until"], r["superseded_by"]
             rows.append(e)
-        return json.dumps({"decisions": rows, "note": "Read one ADR in full at ariadne://decisions/<id>."}, indent=1)
+        return json.dumps({"decisions": rows, "note": "Read one ADR in full at ariadne://decisions/<id>."}, indent=1, ensure_ascii=False)
     except Exception as e:  # noqa: BLE001
         return f"Error reading decisions: {e}"
 
@@ -1790,7 +1928,7 @@ def resource_decision(id: str) -> str:
 def resource_assertions() -> str:
     af = REPO_ROOT / "docs" / "graph-assertions.json"
     if not af.exists():
-        return json.dumps({"assertions": [], "note": "No graph-assertions.json yet — assert_edge (or the graph view) creates it."}, indent=1)
+        return json.dumps({"assertions": [], "note": "No graph-assertions.json yet — assert_edge (or the graph view) creates it."}, indent=1, ensure_ascii=False)
     try:
         lst = json.loads(af.read_text(encoding="utf-8"))
     except Exception as e:  # noqa: BLE001
@@ -1806,8 +1944,15 @@ def resource_assertions() -> str:
                     a["stale"] = True
     except Exception:  # noqa: BLE001
         pass  # no index yet: serve the raw ledger
-    return json.dumps({"assertions": lst,
-                       "note": "stale=true means the evidence file changed since the assertion was recorded — re-affirm or retract it."}, indent=1)
+    # Newest-first, capped: the ledger grows linearly with team knowledge and
+    # this resource carries no tool budget — an agent reading it should get
+    # the recent layer, not an unbounded dump.
+    total = len(lst)
+    capped = list(reversed(lst[-200:]))
+    return json.dumps({"total": total, "showing": len(capped), "assertions": capped,
+                       "note": "stale=true means the evidence file changed since the assertion was recorded — re-affirm or retract it."
+                       + (" Older entries: docs/graph-assertions.json (git-versioned)." if total > len(capped) else "")},
+                      indent=1, ensure_ascii=False)
 
 
 # ---- updated-notifications: the agent-side twin of the graph view's watcher.

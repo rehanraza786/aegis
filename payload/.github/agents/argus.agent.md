@@ -16,6 +16,8 @@ below is your fallback if the skill is absent.
 
 ## Procedure (fallback summary)
 
+Start every review with ONE `change_check(<changed files>)` call — blast radius, seam warnings, governing ADRs, tests to re-run, and assertions the diff stales, in a single budgeted response — then walk the passes below on what it surfaced. `/aegis-release-check` is the release-scope twin.
+
 **Context first**: read the ticket/spec and acceptance criteria; read the
 repo's lint configs and neighboring code — the repo's own conventions are the
 standard. Classify changed files by risk. If a the codebase-graph MCP tools (Ariadne or the engine configured in aegis.json) is
