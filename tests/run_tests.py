@@ -775,6 +775,9 @@ await c.close();
     sig = db.execute("SELECT value FROM meta WHERE key='worktree_sig:order-service'").fetchone()
     check("worktree signature stamped per root (dirty -> non-empty)",
           sig is not None and sig[0] != "")
+    check("wt_state marks the untracked file 2 and the dirty tracked file 1",
+          (db.execute("SELECT wt_state FROM files WHERE path LIKE '%ScratchHelper%'").fetchone() or [0])[0] == 2
+          and (db.execute("SELECT wt_state FROM files WHERE path LIKE '%OrderPublisher.java'").fetchone() or [0])[0] == 1)
     db.close()
     # restore: delete the scratch file, revert the edit; incremental absorbs both
     newf.unlink()
@@ -785,6 +788,8 @@ await c.close();
           db.execute("SELECT 1 FROM symbols WHERE name='ScratchHelper'").fetchone() is None)
     check("clean worktree stamps an empty signature (freshness converges)",
           (db.execute("SELECT value FROM meta WHERE key='worktree_sig:order-service'").fetchone() or [None])[0] == "")
+    check("wt_state resets to committed when the worktree is clean",
+          db.execute("SELECT COUNT(*) FROM files WHERE wt_state != 0").fetchone()[0] == 0)
     db.close()
 
     # ---- non-ASCII filenames survive -z path parsing (batch 18) ----
@@ -1336,6 +1341,10 @@ fs.writeFileSync(scratch, "package com.acme;\\npublic class ProbeScratch {}\\n")
 const stDirty = JSON.parse(await call("index_status"));
 await call("reindex", { mode: "incremental" });
 const stAbsorbed = JSON.parse(await call("index_status"));
+// ---- batch 21: dirty-state provenance is visible to the composites ----
+const ccDirty = JSON.parse(await call("change_check", { files: ["order-service/src/main/java/com/acme/ProbeScratch.java"] }));
+const wtOk = (ccDirty.per_file ?? []).some((f) => f.state === "untracked")
+  && JSON.stringify(ccDirty.seam_warnings ?? {}).includes("uncommitted");
 fs.rmSync(scratch);
 await call("reindex", { mode: "incremental" });
 const stClean = JSON.parse(await call("index_status"));
@@ -1367,7 +1376,18 @@ if (process.platform !== "win32") {
   restoredFiles = JSON.parse(await call("index_status")).files;
 } else { dbw.close(); }
 
+// ---- batch 21: explain_path + the ROI ledger ----
+const ep = JSON.parse(await call("explain_path", { source: "OrderPublisher", target: "BillingListener" }));
+const epOk = Array.isArray(ep.path) && ep.hops >= 2 && ep.path.some((h) => h.includes("orders.created"));
+const ur1 = JSON.parse(await call("usage_report", {}));
+await call("context_pack", { target: "OrderPublisher" });
+const ur2 = JSON.parse(await call("usage_report", {}));
+const urOk = typeof ur1.calls === "number" && ur2.calls > ur1.calls
+  && ur2.naive_read_bytes > 0 && typeof ur2.saved_pct === "number"
+  && (ur2.by_tool ?? []).some((t) => t.tool === "context_pack");
+
 const out = {
+  epOk, urOk, wtOk,
   sdRefuseOk: String(sdRefuse).startsWith("Multi-root workspace: pass root="),
   sdRootedOk: String(sdOk).includes("saved to") && String(sdOk).includes("docs-repo"),
   cycOk, freshOk, inodeOk, contractOk,
@@ -1499,6 +1519,10 @@ async def main():
             st_dirty = json.loads(await call("index_status", {}))
             await s.call_tool("reindex", {"mode": "incremental"})
             st_abs = json.loads(await call("index_status", {}))
+            # ---- batch 21: dirty-state provenance is visible to the composites ----
+            cc_dirty = json.loads(await call("change_check", {"files": ["order-service/src/main/java/com/acme/ProbeScratch.java"]}))
+            wt_ok = (any(f.get("state") == "untracked" for f in cc_dirty.get("per_file", []))
+                     and "uncommitted" in json.dumps(cc_dirty.get("seam_warnings", {})))
             os.remove(scratch)
             await s.call_tool("reindex", {"mode": "incremental"})
             st_clean = json.loads(await call("index_status", {}))
@@ -1534,6 +1558,16 @@ async def main():
             else:
                 dbw.close()
 
+            # ---- batch 21: explain_path + the ROI ledger ----
+            ep = json.loads(await call("explain_path", {"source": "OrderPublisher", "target": "BillingListener"}))
+            ep_ok = isinstance(ep.get("path"), list) and ep.get("hops", 0) >= 2 and any("orders.created" in h for h in ep["path"])
+            ur1 = json.loads(await call("usage_report", {}))
+            await call("context_pack", {"target": "OrderPublisher"})
+            ur2 = json.loads(await call("usage_report", {}))
+            ur_ok = (isinstance(ur1.get("calls"), int) and ur2.get("calls", 0) > ur1.get("calls", 0)
+                     and ur2.get("naive_read_bytes", 0) > 0 and isinstance(ur2.get("saved_pct"), (int, float))
+                     and any(t.get("tool") == "context_pack" for t in ur2.get("by_tool", [])))
+
             warn_s = json.dumps(cc.get("seam_warnings", {}))
             tests_pc = pc.get("tests") if isinstance(pc.get("tests"), dict) else {}
             out = {
@@ -1567,6 +1601,7 @@ async def main():
                 "sdRefuseOk": str(sd_refuse).startswith("Multi-root workspace: pass root="),
                 "sdRootedOk": "saved to" in str(sd_ok) and "docs-repo" in str(sd_ok),
                 "cycOk": cyc_ok, "freshOk": fresh_ok, "inodeOk": inode_ok, "contractOk": contract_ok,
+                "epOk": ep_ok, "urOk": ur_ok, "wtOk": wt_ok,
                 "restoredOk": restored_files == files_before,
             }
             print("SURFACE:" + json.dumps(out))
@@ -1616,6 +1651,12 @@ asyncio.run(main())
           sf.get("cycOk") is True, str(sf.get("cycOk")))
     check("assert_edge record shape is cross-edition canonical (no phantom mode/method; confidence defaults)",
           sf.get("contractOk") is True, str(sf.get("contractOk")))
+    check("explain_path walks producer→topic→consumer with per-hop evidence",
+          sf.get("epOk") is True, str(sf.get("epOk")))
+    check("usage_report: the ROI ledger counts calls, naive bytes, and saved_pct",
+          sf.get("urOk") is True, str(sf.get("urOk")))
+    check("dirty-state provenance: untracked file tagged in change_check with an uncommitted warning",
+          sf.get("wtOk") is True, str(sf.get("wtOk")))
     check("fresh tells the truth about the worktree (dirty->false, absorbed->true, clean->0)",
           sf.get("freshOk") is True, str(sf.get("freshOk")))
     check("a mv-replaced index.db is picked up by the long-lived server (inode revalidation)",
@@ -1858,8 +1899,8 @@ asyncio.run(main())
     py_ann = {name: ann for ann, name in _re2.findall(
         r"@mcp\.tool\(annotations=(RO|WR)\)\s*\n(?:async )?def ([a-z][a-z0-9_]*)", py_src)}
     py_reg = set(py_ann)
-    check("node and python tool registries match (26 tools)",
-          node_reg == py_reg and len(node_reg) == 26, str(sorted(node_reg ^ py_reg)))
+    check("node and python tool registries match (28 tools)",
+          node_reg == py_reg and len(node_reg) == 28, str(sorted(node_reg ^ py_reg)))
     # annotations: every tool annotated, identically across editions, and only
     # the four writers are non-read-only (hosts parallelize reads, gate writes)
     m_ann = _re2.search(r"const TOOL_ANNOTATIONS = \{(.*?)\};", node_src, _re2.S)
@@ -1896,7 +1937,7 @@ asyncio.run(main())
     # every prompt, and every resource URI — the doc is pinned to the registry
     tools_doc = (TOOLKIT / "docs" / "TOOLS.md").read_text(encoding="utf-8")
     undocumented = sorted(t for t in node_reg if f"`{t}`" not in tools_doc)
-    check("docs/TOOLS.md documents all 26 registered tools", not undocumented, str(undocumented))
+    check("docs/TOOLS.md documents all 28 registered tools", not undocumented, str(undocumented))
     undoc_prompts = sorted(p for p in node_prompts if f"`/{p}`" not in tools_doc)
     check("docs/TOOLS.md documents every MCP prompt", not undoc_prompts, str(undoc_prompts))
     undoc_res = sorted(u for u in node_res if f"`{u}`" not in tools_doc)

@@ -138,6 +138,19 @@ MAX_BYTES = _cfg.get("maxToolBytes", 24000)
 SUMMARY_THRESHOLD = _cfg.get("summaryThreshold", 40)
 
 
+def _wt_label(con, path_or_id):
+    """Dirty-state provenance label: '' (committed) | 'working-tree' | 'untracked'."""
+    try:
+        if isinstance(path_or_id, int):
+            row = con.execute("SELECT wt_state s FROM files WHERE id=?", (path_or_id,)).fetchone()
+        else:
+            row = con.execute("SELECT wt_state s FROM files WHERE path=?", (path_or_id,)).fetchone()
+        st = row["s"] if row else 0
+        return "untracked" if st == 2 else "working-tree" if st == 1 else ""
+    except sqlite3.Error:
+        return ""
+
+
 def _clamp(n, lo, hi):
     """Parity with Node's clamp(): limit<=0 used to reach SQLite as LIMIT -1
     (= unlimited) and nest unbounded rows under the byte-chop only."""
@@ -218,6 +231,52 @@ def budget(result):
 _raw_tool = mcp.tool
 
 
+# ---- context-ROI ledger: measure the tokens, don't claim them ----
+# Every response knows its own size, and the graph knows the size of the files
+# an answer SPANS (files.size) — what an agent would have read without the
+# tool. Appended locally to .ariadne/usage.jsonl; usage_report aggregates.
+# Zero egress: rows on your own disk, nothing else. Parity: Node's ledger().
+USAGE_PATH = DB_PATH.parent / "usage.jsonl"
+_ledger_local = threading.local()
+
+
+def note_files(paths):
+    bag = getattr(_ledger_local, "files", None)
+    if bag is not None:
+        for p in paths or []:
+            if p:
+                bag.add(p)
+
+
+def _naive_bytes(paths):
+    if not paths:
+        return 0
+    try:
+        con = db()
+        total = 0
+        for p in paths:
+            row = con.execute("SELECT size FROM files WHERE path=?", (p,)).fetchone()
+            total += (row["size"] or 0) if row else 0
+        return total
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _ledger(tool_name, bytes_out, paths):
+    try:
+        rec = {"ts": int(time.time()), "tool": tool_name, "bytes": bytes_out}
+        if paths:
+            rec["naive_bytes"] = _naive_bytes(paths)
+            rec["files"] = len(paths)
+        with open(USAGE_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        if USAGE_PATH.stat().st_size > 1024 * 1024:  # keep the newer half
+            lines = USAGE_PATH.read_text(encoding="utf-8").splitlines()
+            USAGE_PATH.write_text("\n".join(lines[len(lines) // 2:]) + "\n", encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass  # the ledger must never break a tool call
+
+
 def _budgeted_tool(*a, **k):
     deco = _raw_tool(*a, **k)
 
@@ -225,12 +284,20 @@ def _budgeted_tool(*a, **k):
         if inspect.iscoroutinefunction(fn):
             @functools.wraps(fn)
             async def ainner(*args, **kwargs):
-                return budget(await fn(*args, **kwargs))
+                _ledger_local.files = set()
+                out = budget(await fn(*args, **kwargs))
+                _ledger(fn.__name__, len(out), _ledger_local.files)
+                _ledger_local.files = None
+                return out
             return deco(ainner)
 
         @functools.wraps(fn)
         def inner(*args, **kwargs):
-            return budget(fn(*args, **kwargs))
+            _ledger_local.files = set()
+            out = budget(fn(*args, **kwargs))
+            _ledger(fn.__name__, len(out), _ledger_local.files)
+            _ledger_local.files = None
+            return out
         return deco(inner)
     return wrap
 
@@ -493,10 +560,15 @@ def context_pack(target: str) -> str:
     except sqlite3.Error:
         pass  # files.is_test / test_cases may predate this index build
 
+    note_files([fpath] + list(dependents) + (tests.get("files", []) if isinstance(tests, dict) else []))
+    wt = _wt_label(con, fpath)
     return {
         "target": (f"{(symbol['parent'] + '.') if symbol and symbol['parent'] else ''}{symbol['name']} ({symbol['kind']})"
                    if symbol else fpath),
         "file": fpath + (f":{symbol['line']}" if symbol else ""),
+        # dirty-state provenance: an agent must know when a fact rests on its
+        # own in-flight edit (committed facts carry no tag — token frugality)
+        **({"state": f"{wt} — this file's facts reflect UNCOMMITTED work"} if wt else {}),
         "module": mod,
         "outline": cap(outline, 25),
         "callers": callers or "none recorded (heuristic; use find_references for certainty)",
@@ -538,7 +610,10 @@ def file_outline(path: str) -> str:
                        (f["id"],)).fetchall()
     dependents = con.execute("SELECT f2.path FROM edges e JOIN files f2 ON f2.id=e.src WHERE e.dst=?",
                              (f["id"],)).fetchall()
+    note_files([path])
+    wt = _wt_label(con, path)
     return {"path": path, "lang": f["lang"], "lines": f["lines"],
+            **({"state": wt} if wt else {}),
             "symbol_count": len(syms),
             "symbols": [dict(s) for s in syms],
             "imports": [d["path"] for d in deps],
@@ -585,6 +660,7 @@ def _blast_data(con, path, depth):
 def blast_radius(path: str, depth: int = 2) -> str:
     """Find everything that transitively depends on a file (reverse dependency BFS up to `depth`). Call BEFORE modifying shared code to know what to re-test."""
     con = db()
+    note_files([path])
     return _blast_data(con, path, max(1, min(depth, 5))) or "File not in index."
 
 
@@ -1381,9 +1457,11 @@ def plan_context(task: str) -> str:
             f"SELECT target, summary FROM insights WHERE target IN ({','.join('?' * len(mods))})", mods)]
     except sqlite3.Error:
         pass  # no insights yet
+    note_files(seeds)
     return {
         "task_terms": terms,
-        "files_to_read": [{"path": p, "matched": why.get(p, [])[:4]} for p in seeds],
+        "files_to_read": [{"path": p, "matched": why.get(p, [])[:4],
+                           **({"state": w} if (w := _wt_label(con, p)) else {})} for p in seeds],
         "symbols": _cap_list(symbols, 12),
         "kafka": list(topics) or "none",
         "database": list(tables) or "none",
@@ -1403,6 +1481,7 @@ def change_check(files: list[str]) -> str:
     files = [f for f in files if f][:20]
     if not files:
         return "Pass the list of files you intend to edit."
+    note_files(files)
     known, unknown = [], []
     for p in files:
         f = con.execute("SELECT id, path FROM files WHERE path=?", (p,)).fetchone()
@@ -1421,7 +1500,9 @@ def change_check(files: list[str]) -> str:
             affected.update(lvl)
         tests_affected.update(b.get("tests_affected", []))
         seams = _file_seams(con, f["id"])
+        wt = _wt_label(con, f["id"])
         entry = {"path": f["path"],
+                 **({"state": wt} if wt else {}),
                  "direct_dependents": con.execute("SELECT COUNT(*) c FROM edges WHERE dst=?", (f["id"],)).fetchone()["c"]}
         if seams["topics"]:
             entry["kafka"] = [f"{t['direction']} {t['topic']}" for t in seams["topics"]]
@@ -1450,6 +1531,12 @@ def change_check(files: list[str]) -> str:
                 sole.append(f"{side} of {r['topic']} — a breaking change here orphans the topic")
     if sole:
         warn["sole_seam_side"] = sole
+    # facts resting on uncommitted work: fine while YOU are the editor, a trap
+    # when a reviewer or a second agent trusts them as committed truth
+    dirty_known = [f"{e['path']} ({e['state']})" for e in per_file if e.get("state")]
+    if dirty_known:
+        warn["based_on_uncommitted_state"] = [
+            f"{x} — commit (or verify) before treating downstream conclusions as durable" for x in dirty_known]
     drift = [r["tbl"] for r in con.execute(
         f"SELECT DISTINCT a.tbl FROM db_access a WHERE a.file_id IN ({id_marks}) "
         f"AND a.tbl NOT IN (SELECT tbl FROM db_defs)", kids)]
@@ -1486,6 +1573,163 @@ def change_check(files: list[str]) -> str:
         "next": "Re-run the tests listed after your edit. If a seam warning names a topic/table/endpoint, look at its other side first (message_flow/db_map/http_map).",
     }
     return out
+
+
+@mcp.tool(annotations=RO)
+def explain_path(source: str, target: str) -> str:
+    """WHY does editing A affect B? The shortest provenance-weighted path between two graph nodes — files, symbols, modules, topics (kafka:orders.created or just the topic name), tables (db:payments), endpoints (GET /api/x) — with per-hop evidence (kind + file:line + parsed/asserted provenance). blast_radius asserts the answer; this explains it, in ~300 tokens."""
+    src = source
+    to = target
+    if not src or not to:
+        return "Pass source and target (file, symbol, topic, table, or 'GET /path')."
+    con = db()
+
+    def resolve_node(raw):
+        t = raw.strip()
+        m_ep = re.match(r"^(GET|POST|PUT|DELETE|PATCH|HEAD)\s+(\S+)$", t, re.I)
+        if m_ep:
+            return (f"e:{m_ep.group(1).upper()} {m_ep.group(2)}", t)
+        bare = re.sub(r"^(kafka|topic):", "", t, flags=re.I)
+        if t != bare or con.execute("SELECT 1 FROM msg_edges WHERE topic=?", (bare,)).fetchone():
+            return (f"t:{bare}", bare)
+        tbl = re.sub(r"^(db|table):", "", t, flags=re.I)
+        if t != tbl or con.execute("SELECT 1 FROM db_access WHERE tbl=? UNION SELECT 1 FROM db_defs WHERE tbl=?", (tbl, tbl)).fetchone():
+            return (f"d:{tbl}", tbl)
+        hit = _resolve_target(con, t)
+        return (f"f:{hit[0]['path']}", hit[0]["path"]) if hit else None
+
+    a = resolve_node(src)
+    b = resolve_node(to)
+    if not a:
+        return f"'{src}' resolves to nothing in the graph (file, symbol, topic, table, or 'GET /path')."
+    if not b:
+        return f"'{to}' resolves to nothing in the graph (file, symbol, topic, table, or 'GET /path')."
+    if a[0] == b[0]:
+        return "Same node."
+
+    def path_of(fid):
+        r = con.execute("SELECT path FROM files WHERE id=?", (fid,)).fetchone()
+        return r["path"] if r else None
+
+    def neighbors(node):
+        out = []
+        kind, rest = node[0], node[2:]
+        if kind == "f":
+            r0 = con.execute("SELECT id FROM files WHERE path=?", (rest,)).fetchone()
+            if not r0:
+                return out
+            fid = r0["id"]
+            for r in con.execute("SELECT dst, kind FROM edges WHERE src=? LIMIT 200", (fid,)):
+                p2 = path_of(r["dst"])
+                if p2:
+                    out.append((f"f:{p2}", "references (SCIP)" if r["kind"] == "ref" else "imports", rest, None))
+            for r in con.execute("SELECT src, kind FROM edges WHERE dst=? LIMIT 200", (fid,)):
+                p2 = path_of(r["src"])
+                if p2:
+                    out.append((f"f:{p2}", "referenced by (SCIP)" if r["kind"] == "ref" else "imported by", p2, None))
+            for r in con.execute("SELECT topic, direction, line, source FROM msg_edges WHERE file_id=? LIMIT 60", (fid,)):
+                out.append((f"t:{r['topic']}", f"{r['direction']}s topic", f"{rest}:{r['line']}", r["source"]))
+            for r in con.execute("SELECT tbl, mode, line, source FROM db_access WHERE file_id=? LIMIT 60", (fid,)):
+                out.append((f"d:{r['tbl']}", f"{r['mode']} table", f"{rest}:{r['line']}", r["source"]))
+            for r in con.execute("SELECT method, path, line, source FROM http_endpoints WHERE file_id=? LIMIT 60", (fid,)):
+                out.append((f"e:{r['method']} {r['path']}", "serves endpoint", f"{rest}:{r['line']}", r["source"]))
+            for r in con.execute("SELECT method, norm, line, source FROM http_calls WHERE file_id=? LIMIT 60", (fid,)):
+                out.append((f"e:{r['method']} {r['norm']}", "calls endpoint", f"{rest}:{r['line']}", r["source"]))
+        elif kind == "t":
+            for r in con.execute("SELECT f.path, m.direction, m.line, m.source FROM msg_edges m "
+                                 "JOIN files f ON f.id=m.file_id WHERE m.topic=? LIMIT 120", (rest,)):
+                out.append((f"f:{r['path']}", "produced by" if r["direction"] == "produce" else "consumed by",
+                            f"{r['path']}:{r['line']}", r["source"]))
+        elif kind == "d":
+            for r in con.execute("SELECT f.path, a.mode, a.line, a.source FROM db_access a "
+                                 "JOIN files f ON f.id=a.file_id WHERE a.tbl=? LIMIT 120", (rest,)):
+                out.append((f"f:{r['path']}", f"{r['mode']}-accessed by", f"{r['path']}:{r['line']}", r["source"]))
+        elif kind == "e":
+            sp = rest.find(" ")
+            method, pth = rest[:sp], rest[sp + 1:]
+            for r in con.execute("SELECT f.path, e.line, e.source FROM http_endpoints e JOIN files f ON f.id=e.file_id "
+                                 "WHERE e.method=? AND (e.path=? OR e.norm=?) LIMIT 60", (method, pth, pth)):
+                out.append((f"f:{r['path']}", "served by", f"{r['path']}:{r['line']}", r["source"]))
+            for r in con.execute("SELECT f.path, c.line, c.source FROM http_calls c JOIN files f ON f.id=c.file_id "
+                                 "WHERE c.method=? AND (c.path=? OR c.norm=?) LIMIT 60", (method, pth, pth)):
+                out.append((f"f:{r['path']}", "called by", f"{r['path']}:{r['line']}", r["source"]))
+        return out
+
+    MAXHOPS, MAXEXPAND = 6, 4000
+    prev = {a[0]: None}
+    frontier = [a[0]]
+    expanded = 0
+    found = False
+    for _hop in range(MAXHOPS):
+        if not frontier or found:
+            break
+        nxt = []
+        for n in frontier:
+            expanded += 1
+            if expanded > MAXEXPAND:
+                break
+            for node, how, at, srcp in neighbors(n):
+                if node in prev:
+                    continue
+                prev[node] = (n, how, at, srcp)
+                if node == b[0]:
+                    found = True
+                    break
+                nxt.append(node)
+            if found:
+                break
+        frontier = nxt
+    if not found:
+        return (f"No path within {MAXHOPS} hops between '{a[1]}' and '{b[1]}' ({expanded} expansions). "
+                "They may connect through code the graph cannot see — graph_gaps lists the blind spots.")
+    hops = []
+    cur = b[0]
+    while prev.get(cur):
+        frm, how, at, srcp = prev[cur]
+        prov = f", {srcp}" if srcp and srcp != "static" else ""
+        hops.insert(0, f"{frm[2:]} —[{how}{prov} @ {at}]→ {cur[2:]}")
+        cur = frm
+    note_files([m.group(1) for h in hops for m in re.finditer(r"([\w./-]+\.[a-z]{1,4}):\d+", h)])
+    return {"from": a[1], "to": b[1], "hops": len(hops), "path": hops,
+            "note": "provenance rides each hop (parsed unless marked asserted:<author>); dashed-in-the-view = asserted here too"}
+
+
+@mcp.tool(annotations=RO)
+def usage_report(days: int = 7) -> str:
+    """The context-ROI ledger: how many bytes Ariadne served vs what the answered questions would have cost in raw file reads (the files each answer spans, measured from the index). Local-only (.ariadne/usage.jsonl); nothing leaves the machine. days: look-back window (default 7)."""
+    win = _clamp(days, 1, 90)
+    if not USAGE_PATH.exists():
+        return "No usage recorded yet — the ledger starts with the first tool call after this update."
+    cut = int(time.time()) - win * 86400
+    by_tool = {}
+    calls = bytes_served = naive = 0
+    for line in USAGE_PATH.read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("ts", 0) < cut:
+            continue
+        calls += 1
+        bytes_served += r.get("bytes", 0)
+        naive += r.get("naive_bytes", 0)
+        t = by_tool.setdefault(r.get("tool", "?"), {"calls": 0, "bytes": 0, "naive_bytes": 0})
+        t["calls"] += 1
+        t["bytes"] += r.get("bytes", 0)
+        t["naive_bytes"] += r.get("naive_bytes", 0)
+    if not calls:
+        return f"No usage in the last {win} day(s)."
+    top = [{"tool": k, **v} for k, v in sorted(by_tool.items(), key=lambda kv: -kv[1]["calls"])[:8]]
+    return {"window_days": win, "calls": calls, "bytes_served": bytes_served,
+            "naive_read_bytes": naive,
+            "saved_pct": round((1 - bytes_served / naive) * 1000) / 10 if naive > 0 else None,
+            "note": ("naive_read_bytes = the on-disk size of the files each answer spans — what reading instead of "
+                     "asking would have cost. Local ledger, nothing leaves the machine.")
+            if naive > 0 else
+            "naive baseline appears once file-spanning tools (context_pack, plan_context, change_check…) are used.",
+            "by_tool": top}
 
 
 @mcp.tool(annotations=WR)

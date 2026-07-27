@@ -17,6 +17,7 @@ I would rather hear about it than have you assume the rest is true.
 | Knowledge base (Delphi) | `.github/knowledge/` | Yes by default. Gitignore it if you would rather it stayed per machine. |
 | Specs, plans, tasks, reviews | `docs/features/` | Yes. |
 | Generated docs | `docs/generated/` | Your choice. Gitignored by default, since they regenerate on every commit. |
+| Usage ledger | `.ariadne/usage.jsonl` | No. Gitignored with the rest of `.ariadne/`. Per-call byte counts (tool name, bytes served, bytes the spanned files measure on disk) so `usage_report` can tell you what the graph saved — no code, no paths, no content. |
 | Extension state | VS Code globalState | Local. It stores one flag: whether you have seen the setup prompt. |
 
 The graph is a local SQLite file. The MCP server talks to your editor over stdio

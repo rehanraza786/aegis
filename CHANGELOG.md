@@ -218,6 +218,28 @@ The post-review release. Highlights, roughly in the order they landed:
   proper combobox (arrow keys + `aria-activedescendant`), and edge kinds
   carry non-color redundancy (per-kind arrow shapes; dashes stay the
   asserted channel). The side panel is resizable.
+- **Three things no tool in this category has — all local, zero egress:**
+  *Dirty-state provenance.* Every file row carries `wt_state`
+  (committed / working-tree / untracked), stamped in the same porcelain pass
+  as the worktree signature. `context_pack`, `plan_context`, `file_outline`
+  tag facts that rest on uncommitted work; `change_check` warns
+  (`based_on_uncommitted_state`) before a reviewer or second agent treats
+  in-flight conclusions as durable truth. Watcher-based indexers see the
+  working tree but cannot make this distinction; git-anchored ones cannot
+  see the working tree — AEGIS now does both.
+  *The context-ROI ledger.* Every tool call appends (tool, bytes served,
+  on-disk bytes of the files the answer spans) to `.ariadne/usage.jsonl` —
+  no code, no content, gitignored — and `usage_report` answers "what did
+  the graph save us": calls, bytes served vs naive-read bytes, `saved_pct`,
+  per-tool breakdown. The token-savings claim every competitor markets is
+  MEASURED here, on your own repo.
+  *`explain_path`.* blast_radius asserts that A affects B; `explain_path`
+  proves it: the shortest path across imports, SCIP refs, topics, tables,
+  and endpoints with per-hop file:line evidence and parsed/asserted
+  provenance, ~300 tokens. Shift-click two nodes in the graph view and the
+  same path lights up live. Registry grows to 28 tools, suite-pinned in
+  both editions, and the demo media is re-recorded against the current UI
+  (45s, real fixture, headless capture).
 
 ## 0.1.0
 

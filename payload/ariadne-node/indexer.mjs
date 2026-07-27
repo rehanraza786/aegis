@@ -399,6 +399,11 @@ function connect(forIndexing = false) {
     try { db.exec(`ALTER TABLE ${t} ADD COLUMN source TEXT DEFAULT 'static'`); } catch { /* exists */ }
   }
   try { db.exec("ALTER TABLE files ADD COLUMN mtime REAL"); } catch { /* exists */ }
+  // dirty-state provenance: 0 = committed at last_sha, 1 = tracked with
+  // uncommitted changes, 2 = untracked. The worktree union (batch 18) made
+  // in-flight work visible; this column makes it DISTINGUISHABLE — an agent
+  // can tell which facts rest on its own uncommitted edits.
+  try { db.exec("ALTER TABLE files ADD COLUMN wt_state INTEGER DEFAULT 0"); } catch { /* exists */ }
   // `source` answers WHO derived a fact (parser vs author); is_test answers WHERE
   // the code lives (production vs test). Orthogonal axes: a parsed edge in a test
   // file stays source='static'. Never write test provenance into `source`.
@@ -508,8 +513,7 @@ function porcelainEntries(root) {
  *  shared byte-for-byte with the Python edition (sorted "st|rel|size|mtime_ms"
  *  lines, sha1) so a runtime switch on a shared DB never fakes staleness.
  *  Clean tree = "". */
-function worktreeSig(root) {
-  const ents = porcelainEntries(root);
+function worktreeSigFrom(root, ents) {
   if (!ents.length) return "";
   const lines = [];
   for (const { st, rel } of ents) {
@@ -1277,14 +1281,22 @@ async function runExtensionPasses(db, ctx) {
 }
 
 function stamp(db) {
+  const updState = db.prepare("UPDATE files SET wt_state=? WHERE path=?");
+  db.prepare("UPDATE files SET wt_state=0 WHERE wt_state != 0").run();
   for (const root of ROOTS) {
+    const prefix = prefixOf(root);
     db.prepare("INSERT OR REPLACE INTO meta VALUES(?, ?)").run(
-      `last_sha:${prefixOf(root) || "."}`, git(["rev-parse", "HEAD"], { cwd: root }));
+      `last_sha:${prefix || "."}`, git(["rev-parse", "HEAD"], { cwd: root }));
     // What the worktree looked like when this index was built. index_status
     // compares it with the live signature: `fresh` can no longer say true
     // while an agent's uncommitted edit sits outside the graph.
+    const ents = porcelainEntries(root);
     db.prepare("INSERT OR REPLACE INTO meta VALUES(?, ?)").run(
-      `worktree_sig:${prefixOf(root) || "."}`, worktreeSig(root));
+      `worktree_sig:${prefix || "."}`, worktreeSigFrom(root, ents));
+    // per-file dirty provenance rides the same porcelain pass
+    for (const { st, rel } of ents) {
+      updState.run(st === "??" ? 2 : 1, prefix ? `${prefix}/${rel}` : rel);
+    }
   }
   db.prepare("INSERT OR REPLACE INTO meta VALUES('last_sha', ?)").run(git(["rev-parse", "HEAD"], { cwd: ROOTS[0] }));
   db.prepare("INSERT OR REPLACE INTO meta VALUES('last_run', ?)").run(String(Date.now() / 1000));

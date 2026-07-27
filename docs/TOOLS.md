@@ -1,6 +1,6 @@
 # Ariadne tool reference
 
-All 26 MCP tools — plus 4 server-rendered prompts and 7 `ariadne://`
+All 28 MCP tools — plus 4 server-rendered prompts and 7 `ariadne://`
 resources — identical across both editions (a suite check pins the tool,
 prompt, and resource registries equal, and pins this document to them). Every
 result is budget-capped at EVERY nesting level (rows and bytes, warnings kept
@@ -9,7 +9,7 @@ were dropped anywhere, the response opens with a `budget: {rows_capped}`
 field, so a partial view always announces itself. Every error returns as a
 message the agent can adapt to, never a crash. Params marked ? are optional.
 
-Every tool carries MCP annotations: `readOnlyHint: true` on the 22 read-only
+Every tool carries MCP annotations: `readOnlyHint: true` on the 24 read-only
 tools, and the four writers (`save_decision`, `save_insight`, `assert_edge`,
 `reindex`) marked non-read-only and non-destructive — so hosts can parallelize
 reads and gate writes.
@@ -111,6 +111,18 @@ synthesized understanding, content-hash keyed.
 
 **`decisions`** (query?, target?, status?, as_of?) → ADRs with temporal
 validity; `as_of` time-travels.
+
+**`explain_path`** (source, target) → WHY editing A affects B: the shortest
+provenance-weighted path between two graph nodes — files, symbols, topics
+(`kafka:x` or the bare name), tables (`db:x`), endpoints (`GET /path`) — with
+per-hop evidence (kind + file:line + parsed/asserted provenance), in ~300
+tokens. `blast_radius` asserts the answer; this explains it. Shift-click two
+nodes in the graph view for the same path drawn live.
+
+**`usage_report`** (days?) → the context-ROI ledger: bytes served vs the
+on-disk size of the files each answer spans (what raw reads would have cost),
+per tool, with `saved_pct`. Local-only (`.ariadne/usage.jsonl`); nothing
+leaves the machine.
 
 **`decision_trace`** (id) → one decision's full supersession chain +
 governed artifacts with existence check (decision drift). A supersession
