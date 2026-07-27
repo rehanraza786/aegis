@@ -15,7 +15,10 @@ reads and gate writes.
 ## Orientation
 
 **`index_status`** () → files/symbols/edges counts, `indexed_sha` vs
-`head_sha`, `fresh`, `payload_version`. Call first when results look stale.
+`head_sha`, `fresh`, `dirty_worktree` (uncommitted paths — the incremental
+indexer absorbs them, so `fresh` is judged against the worktree too, not just
+HEAD), per-root breakdown in multi-root workspaces, `payload_version`. Call
+first when results look stale.
 
 **`module_map`** (prefix?) → per-directory file counts and main languages.
 First call in an unfamiliar repo.
@@ -108,10 +111,13 @@ synthesized understanding, content-hash keyed.
 validity; `as_of` time-travels.
 
 **`decision_trace`** (id) → one decision's full supersession chain +
-governed artifacts with existence check (decision drift).
+governed artifacts with existence check (decision drift). A supersession
+cycle is flagged instead of walked forever.
 
-**`save_decision`** (title, decision, rationale, alternatives?, supersedes?)
-→ writes a numbered ADR file AND indexes it immediately.
+**`save_decision`** (title, decision, rationale, alternatives?, supersedes?,
+root?) → writes a numbered ADR file AND indexes it immediately. In a
+multi-root workspace, `root` names the repo the ADR belongs to (refused with
+the root list otherwise — an ADR outside a root would vanish on reindex).
 
 ## Maintenance
 

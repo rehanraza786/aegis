@@ -23,6 +23,22 @@ JOB_NAME="aegis-index"
 ARTIFACT_PATH=".ariadne/index.db"
 PYBIN="$(command -v python3 || command -v python || true)"
 
+# Refuse to swap the DB while an indexer run holds the lock: mv-under-writer is
+# exactly the race this script must never lose.
+if [ -e .ariadne/.index.lock ]; then
+  echo "An index run is in progress (.ariadne/.index.lock present). Retry when it finishes."
+  exit 1
+fi
+
+# Install a downloaded DB over .ariadne/index.db. The -wal/-shm sidecars MUST
+# go first: a reader mid-transaction can block SQLite's final checkpoint and
+# leave a stale WAL behind — after a bare mv, the next open would REPLAY the
+# OLD index's frames into the pulled file (and quick_check still says ok).
+install_db () {
+  rm -f .ariadne/index.db-wal .ariadne/index.db-shm
+  mv "$1" .ariadne/index.db
+}
+
 # --- derive host + project path from the git remote --------------------------
 ORIGIN="$(git remote get-url origin)"
 if [[ "$ORIGIN" =~ ^ssh://([^@]+@)?([^:/]+)(:[0-9]+)?/(.+)$ ]]; then
@@ -69,7 +85,7 @@ if [[ "$HOST" == *github* ]]; then
       --status success --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
     if [ -n "$RUN_ID" ] && gh run download "$RUN_ID" -R "$PROJECT" -n "$JOB_NAME" --dir "$TMP" >/dev/null 2>&1 \
        && [ -f "$TMP/$ARTIFACT_PATH" ]; then
-      mv "$TMP/$ARTIFACT_PATH" .ariadne/index.db
+      install_db "$TMP/$ARTIFACT_PATH"
       echo "Pulled shared index via gh:"; show_status; exit 0
     fi
     echo "gh fetch failed (no successful '$JOB_NAME' run on $BRANCH yet, or run: gh auth login)."
@@ -84,7 +100,7 @@ if [[ "$HOST" == *github* ]]; then
       "$PYBIN" -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$TMP/a.zip" "$TMP"
       SRC="$TMP/$ARTIFACT_PATH"; [ -f "$SRC" ] || SRC="$TMP/index.db"
       if [ -f "$SRC" ]; then
-        mv "$SRC" .ariadne/index.db
+        install_db "$SRC"
         echo "Pulled shared index via GitHub API:"; show_status; exit 0
       fi
     fi
@@ -100,7 +116,7 @@ if command -v glab >/dev/null 2>&1; then
   echo "Using glab to fetch latest '$JOB_NAME' artifact from $BRANCH..."
   if glab ci artifact "$BRANCH" "$JOB_NAME" --path "$TMP/" -R "$PROJECT" >/dev/null 2>&1 \
      && [ -f "$TMP/$ARTIFACT_PATH" ]; then
-    mv "$TMP/$ARTIFACT_PATH" .ariadne/index.db
+    install_db "$TMP/$ARTIFACT_PATH"
     echo "Pulled shared index via glab:"; show_status; exit 0
   fi
   echo "glab fetch failed (no successful run yet, or run: glab auth login)."
@@ -111,7 +127,7 @@ if [ -n "${GITLAB_TOKEN:-}" ]; then
   ENC_PROJECT="$(urlencode "$PROJECT")"
   URL="https://$HOST/api/v4/projects/$ENC_PROJECT/jobs/artifacts/$BRANCH/raw/$ARTIFACT_PATH?job=$JOB_NAME"
   if curl -fsSL --header "PRIVATE-TOKEN: $GITLAB_TOKEN" "$URL" -o "$TMP/index.db"; then
-    mv "$TMP/index.db" .ariadne/index.db
+    install_db "$TMP/index.db"
     echo "Pulled shared index via API:"; show_status; exit 0
   fi
   echo "API fetch failed (token needs read_api scope; job must have run on $BRANCH)."

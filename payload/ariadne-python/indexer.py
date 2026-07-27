@@ -375,6 +375,16 @@ def connect(for_indexing=False):
     except sqlite3.DatabaseError as e:
         msg = str(e).lower()
         if "malformed" in msg or "not a database" in msg or "corrupt" in msg:
+            # Destructive recovery is an INDEXING decision. A read-only open
+            # (--status on a corrupt DB) used to rotate the file aside and hand
+            # the caller a fresh empty index — report instead, keep the evidence.
+            if not for_indexing:
+                try:
+                    con.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise RuntimeError(
+                    f"Index at {DB_PATH} is corrupt ({e}). Run --rebuild (or --incremental) to recover.") from e
             aside = str(DB_PATH) + f".corrupt-{int(time.time())}"
             try:
                 con.close()
@@ -482,13 +492,74 @@ def release_lock():
 def repo_files():
     for root in ROOTS:
         prefix = root.name if MULTI else ""
-        r = subprocess.run(["git", "ls-files"], capture_output=True, text=True, cwd=root)
-        for line in r.stdout.splitlines():
-            p = Path(line)
-            if any(part in SKIP_DIRS for part in p.parts):
-                continue
-            if p.suffix.lower() in LANG_BY_EXT:
-                yield f"{prefix}/{line}" if prefix else line
+        # -z: NUL separators and no C-quoting — a café.java arrives verbatim
+        # instead of as "caf\303\251.java", whose quoted suffix missed
+        # LANG_BY_EXT and silently dropped the file from the graph.
+        # --others --exclude-standard: untracked-but-not-ignored files. A file
+        # an agent just created enters the graph NOW, not at the next `git add`.
+        for args in (["git", "ls-files", "-z"],
+                     ["git", "ls-files", "-z", "--others", "--exclude-standard"]):
+            r = subprocess.run(args, capture_output=True, text=True, cwd=root)
+            for line in r.stdout.split("\0"):
+                if not line:
+                    continue
+                p = Path(line)
+                if any(part in SKIP_DIRS for part in p.parts):
+                    continue
+                if p.suffix.lower() in LANG_BY_EXT:
+                    yield f"{prefix}/{line}" if prefix else line
+
+
+def porcelain_entries(root):
+    """One entry per dirty path (renames yield the NEW path; the origin token is
+    consumed alongside). Shared by the incremental union and the worktree
+    signature, so the two can never disagree about what "dirty" means."""
+    r = subprocess.run(["git", "status", "--porcelain", "-z"],
+                       capture_output=True, text=True, cwd=root)
+    out = []
+    toks = r.stdout.split("\0")
+    i = 0
+    while i < len(toks):
+        e = toks[i]
+        i += 1
+        if len(e) < 4:
+            continue
+        st = e[:2]
+        if st == "!!":  # ignored
+            continue
+        rel = e[3:]
+        # The index writing itself must never count as dirt (index.db/-wal
+        # mtimes move on every run) — or freshness could not converge in
+        # single-root repos that keep .ariadne unignored.
+        if rel == ".ariadne" or rel.startswith(".ariadne/") or "/.ariadne/" in rel:
+            if "R" in st or "C" in st:
+                i += 1
+            continue
+        origin = None
+        if "R" in st or "C" in st:
+            origin = toks[i] if i < len(toks) else None
+            i += 1
+        out.append((st, rel, origin))
+    return out
+
+
+def worktree_sig(root):
+    """Content-sensitive fingerprint of the uncommitted state: HEAD alone cannot
+    answer "is the index fresh?" once the worktree is indexed too. Format is
+    shared byte-for-byte with the Node edition (sorted "st|rel|size|mtime_ms"
+    lines, sha1) so a runtime switch on a shared DB never fakes staleness.
+    Clean tree = ""."""
+    ents = porcelain_entries(root)
+    if not ents:
+        return ""
+    lines = []
+    for st, rel, _origin in ents:
+        try:
+            stt = (Path(root) / rel).stat()
+            lines.append(f"{st}|{rel}|{stt.st_size}|{int(stt.st_mtime * 1000)}")
+        except OSError:
+            lines.append(f"{st}|{rel}|gone")
+    return hashlib.sha1("\n".join(sorted(lines)).encode()).hexdigest()
 
 
 # ------------------------------------------------------------- file pipeline
@@ -634,6 +705,12 @@ def _compute_task(t):
     return compute_file(rel, prev, force)
 
 
+def _compute_chunk(tasks):
+    """One IPC round-trip per 16 files (the old chunksize), computed in a worker."""
+    return [_compute_task(t) for t in tasks]
+
+
+
 WORKERS_FLAG = None  # set by main() from --workers
 
 
@@ -666,14 +743,26 @@ def compute_and_apply(con, files, force, apply_cb):
             apply_cb(compute_file(rel, prev.get(rel), force))
         return
     log.info("Parallel extract: %d workers over %d files", n, len(files))
+    from collections import deque
     from concurrent.futures import ProcessPoolExecutor
     applied = 0
+    # Chunked like ex.map(chunksize=16) was, but with a BOUNDED submit window:
+    # ex.map submits everything up front, so one slow first file buffered the
+    # whole corpus's compute output in the executor. At most 4·workers chunks
+    # are in flight; results still apply strictly in submission order.
+    chunks = [files[i:i + 16] for i in range(0, len(files), 16)]
     try:
         with ProcessPoolExecutor(max_workers=n) as ex:
-            # ex.map yields results in submission order with the loop in C
-            for rec in ex.map(_compute_task, [(rel, prev.get(rel), force) for rel in files], chunksize=16):
-                apply_cb(rec)
-                applied += 1
+            window = deque()
+            nxt = 0
+            while nxt < len(chunks) or window:
+                while nxt < len(chunks) and len(window) < 4 * n:
+                    ch = chunks[nxt]
+                    window.append(ex.submit(_compute_chunk, [(rel, prev.get(rel), force) for rel in ch]))
+                    nxt += 1
+                for rec in window.popleft().result():
+                    apply_cb(rec)
+                    applied += 1
     except Exception as e:  # noqa: BLE001 - pool infrastructure failure only
         log.warning("parallel extract failed (%s); finishing sequentially", e)
         for rel in files[applied:]:
@@ -766,6 +855,11 @@ def kafka_pass(con, scope_prefixes=None):
     rows = con.execute("SELECT id, path, hash FROM files").fetchall()
     id_by_path = {r[1]: r[0] for r in rows}
     hash_by_path = {r[1]: r[2] for r in rows}
+    # One-time hygiene for DBs written before the files-row guards below existed:
+    # orphan NULL-fid rows never matched a per-file delete (file_id IN (...)
+    # skips NULL), so duplicates accumulated unprunably and poisoned drift math.
+    for t in ("msg_edges", "msg_topics", "db_defs", "db_access", "http_endpoints", "http_calls"):
+        con.execute(f"DELETE FROM {t} WHERE file_id IS NULL")  # noqa: S608 - fixed table list
 
     cfg_paths = sorted(p for p in tracked if re.search(r"(^|/)(application|bootstrap)[^/]*\.(ya?ml|properties)$", p))
     cfg_fp = hashlib.sha1("|".join(f"{p}:{hash_by_path.get(p,'')}" for p in cfg_paths).encode()).hexdigest()
@@ -803,7 +897,11 @@ def kafka_pass(con, scope_prefixes=None):
         if maps_changed:
             widen = True
 
-    javaish = [p for p in tracked if p.endswith((".java", ".kt", ".kts"))]
+    # Only files that HAVE a files row participate: a tracked file over
+    # maxFileBytes (or unreadable) has no row, so extracting it could only
+    # produce orphan NULL-fid rows — and re-reading a skipped 100MB dump every
+    # run is pure waste. (Parity: Node applies the same guard.)
+    javaish = [p for p in tracked if p in id_by_path and p.endswith((".java", ".kt", ".kts"))]
     # Snapshot of what we last EXTRACTED, taken before the map loop updates it. Files whose
     # content hash has moved on are the ones needing re-extraction. Reindexing a file cascades
     # its correlation rows away, so this set must be exact.
@@ -867,11 +965,26 @@ def kafka_pass(con, scope_prefixes=None):
         for k, v in consts.items():
             constants.setdefault(k, v)
         entity_tables.update(ents)
+    # Deleted definitions are semantic deltas too: removing Topics.java (sole
+    # definition of ORDERS_TOPIC) must re-extract every file that MENTIONED the
+    # key, or dependents keep their stale resolved edges forever. Diff the
+    # doomed cache rows into changed_tokens BEFORE pruning them; an unparseable
+    # row widens fully rather than guessing.
+    for row in con.execute("SELECT constants, entities FROM extract_cache "
+                           "WHERE path NOT IN (SELECT path FROM files)").fetchall():
+        try:
+            keys = list(_json.loads(row[0]).keys()) + list(_json.loads(row[1]).keys())
+            if keys:
+                maps_changed = True
+                changed_tokens.update(keys)
+        except (ValueError, TypeError):
+            maps_changed = True
+            widen = True
     con.execute("DELETE FROM extract_cache WHERE path NOT IN (SELECT path FROM files)")
     for k, v in _cfg.get("tableNameOverrides", {}).items():
         entity_tables[k] = str(v).lower()
 
-    candidates = [p for p in tracked
+    candidates = [p for p in tracked if p in id_by_path
                   if re.search(r"\.(java|kts?|xml|ya?ml|sql|ts|tsx|js|jsx|mjs|py|rb|prisma)$", p) or in_ext_files(p)]
     # token-scoped: a semantic change with a small, known key set widens only to
     # files that MENTION a changed key — extraction output for a file that never
@@ -1299,6 +1412,11 @@ def stamp_all(con):
     for root in ROOTS:
         key = f"last_sha:{root.name if MULTI else '.'}"
         con.execute("INSERT OR REPLACE INTO meta VALUES(?, ?)", (key, current_sha(root)))
+        # What the worktree looked like when this index was built. index_status
+        # compares it with the live signature: `fresh` can no longer say true
+        # while an agent's uncommitted edit sits outside the graph.
+        con.execute("INSERT OR REPLACE INTO meta VALUES(?, ?)",
+                    (f"worktree_sig:{root.name if MULTI else '.'}", worktree_sig(root)))
     con.execute("INSERT OR REPLACE INTO meta VALUES('last_sha', ?)", (current_sha(),))
 
 
@@ -1377,25 +1495,54 @@ def incremental_index(con):
             or con.execute("SELECT value FROM meta WHERE key='last_sha'").fetchone()
         if not row or not row[0]:
             return full_index(con)
-        r = subprocess.run(["git", "diff", "--name-status", row[0], "HEAD"],
+        # -z: NUL-separated STATUS, path[, path] records — no C-quoting, so
+        # non-ASCII/tab/newline paths survive (they used to miss LANG_BY_EXT).
+        r = subprocess.run(["git", "diff", "--name-status", "-z", row[0], "HEAD"],
                            capture_output=True, text=True, cwd=root)
         if r.returncode != 0:
             return full_index(con)
         pref = (lambda x: f"{prefix}/{x}" if prefix else x)
-        for line in r.stdout.splitlines():
-            parts = line.split("\t")
-            status = parts[0]
-            if status.startswith("R") and len(parts) == 3:
-                deleted.append(pref(parts[1])); changed.append(pref(parts[2]))
-            elif status == "D":
-                deleted.append(pref(parts[1]))
+        toks = r.stdout.split("\0")
+        i = 0
+        while i < len(toks):
+            status = toks[i]
+            i += 1
+            if not status:
+                continue
+            if status[0] in "RC" and i + 1 < len(toks):
+                deleted.append(pref(toks[i])); changed.append(pref(toks[i + 1])); i += 2
+            elif status.startswith("D") and i < len(toks):
+                deleted.append(pref(toks[i])); i += 1
+            elif i < len(toks):
+                changed.append(pref(toks[i])); i += 1
+        # Working-tree union: the commit diff sees only committed work. An
+        # agent's in-flight edit (tracked, modified or staged) and brand-new
+        # untracked files land here via porcelain; a file deleted on disk but
+        # not yet committed is a real deletion for the graph. False positives
+        # are free — the hash fast-path no-ops files whose bytes didn't change.
+        for st, rel, origin in porcelain_entries(root):
+            if origin:
+                deleted.append(pref(origin))
+            if "D" in st and not (root / rel).exists():
+                deleted.append(pref(rel))
             else:
-                changed.append(pref(parts[-1]))
-    changed = [p for p in changed if Path(p).suffix.lower() in LANG_BY_EXT
+                changed.append(pref(rel))
+    changed = [p for p in dict.fromkeys(changed) if Path(p).suffix.lower() in LANG_BY_EXT
                and not any(s in Path(p).parts for s in SKIP_DIRS)]
     if len(changed) > max(50, 0.4 * (con.execute("SELECT COUNT(*) FROM files").fetchone()[0] or 1)):
         return full_index(con)
-    for p in deleted:
+    # Reconcile against the live universe: an UNTRACKED file that was indexed
+    # and then deleted appears in neither the commit diff nor porcelain (a
+    # vanished untracked path has no status at all) — set-diff the files table
+    # against repo_files() so its rows can't outlive it.
+    present = set(repo_files())
+    deleted.extend(r[0] for r in con.execute("SELECT path FROM files") if r[0] not in present)
+    # Deletion wins whenever the path is gone from disk (worktree delete of a
+    # file the commit-diff also touched); a path that exists and is queued for
+    # reindex just gets reindexed — its row swap needs no prior delete.
+    gone = [p for p in dict.fromkeys(deleted)
+            if p not in changed or not abs_path(p).exists()]
+    for p in gone:
         con.execute("DELETE FROM files WHERE path=?", (p,))
         con.execute("DELETE FROM chunk_text WHERE path=?", (p,))
     touched = []
@@ -1414,7 +1561,7 @@ def incremental_index(con):
     stamp_all(con)
     con.execute("INSERT OR REPLACE INTO meta VALUES('last_run', ?)", (str(time.time()),))
     con.commit()
-    log.info("Incremental index: %d changed, %d deleted.", len(changed), len(deleted))
+    log.info("Incremental index: %d changed, %d deleted.", len(changed), len(gone))
 
 
 def status(con):

@@ -35,6 +35,61 @@ REPO_ROOT = Path(
     or "."
 ).resolve()
 DB_PATH = Path(os.environ.get("ARIADNE_HOME", REPO_ROOT)) / ".ariadne" / "index.db"
+# Workspace base: roots live directly under it in multi-root mode ("." = base).
+WS_BASE = DB_PATH.parent.parent
+
+
+def _root_dir(pref):
+    return WS_BASE if pref == "." else WS_BASE / pref
+
+
+def _porcelain_entries(cwd):
+    """One entry per dirty path (renames yield the NEW path; the origin token is
+    consumed alongside). Mirrors the indexer, so "dirty" always means the same
+    thing on both sides of the stamp."""
+    try:
+        r = subprocess.run(["git", "status", "--porcelain", "-z"],
+                           capture_output=True, text=True, cwd=cwd, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out = []
+    toks = r.stdout.split("\0")
+    i = 0
+    while i < len(toks):
+        e = toks[i]
+        i += 1
+        if len(e) < 4:
+            continue
+        st = e[:2]
+        if st == "!!":
+            continue
+        rel = e[3:]
+        # The index writing itself must never count as dirt (index.db/-wal
+        # mtimes move on every run) — or freshness could not converge in
+        # single-root repos that keep .ariadne unignored.
+        if rel == ".ariadne" or rel.startswith(".ariadne/") or "/.ariadne/" in rel:
+            if "R" in st or "C" in st:
+                i += 1
+            continue
+        if "R" in st or "C" in st:
+            i += 1  # skip the origin token
+        out.append((st, rel))
+    return out
+
+
+def _worktree_sig_from(cwd, ents):
+    """Same fingerprint format the indexer stamps as worktree_sig:<prefix>
+    (sorted "st|rel|size|mtime_ms" lines, sha1; clean = "")."""
+    if not ents:
+        return ""
+    lines = []
+    for st, rel in ents:
+        try:
+            stt = (Path(cwd) / rel).stat()
+            lines.append(f"{st}|{rel}|{stt.st_size}|{int(stt.st_mtime * 1000)}")
+        except OSError:
+            lines.append(f"{st}|{rel}|gone")
+    return hashlib.sha1("\n".join(sorted(lines)).encode()).hexdigest()
 
 mcp = FastMCP("ariadne")
 
@@ -197,17 +252,62 @@ def _status_data():
     f = con.execute("SELECT COUNT(*) c FROM files").fetchone()["c"]
     s = con.execute("SELECT COUNT(*) c FROM symbols").fetchone()["c"]
     e = con.execute("SELECT COUNT(*) c FROM edges").fetchone()["c"]
-    sha = con.execute("SELECT value FROM meta WHERE key='last_sha'").fetchone()
-    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=REPO_ROOT).stdout.strip()
-    indexed = sha["value"] if sha else None
-    return {"files": f, "symbols": s, "edges": e,
-            "indexed_sha": indexed, "head_sha": head,
-            "fresh": indexed == head, "payload_version": _payload_version()}
+
+    def meta(k):
+        row = con.execute("SELECT value FROM meta WHERE key=?", (k,)).fetchone()
+        return row["value"] if row else None
+
+    indexed = meta("last_sha")
+    # Per-root freshness (same rule as graph_export): the indexer stamps one
+    # last_sha:<prefix> per root ("." = single root). Comparing last_sha with
+    # the server's OWN cwd lied in multi-root workspaces — the cwd isn't a
+    # repo there, so fresh sat at false forever and the release-check prompt
+    # sent every reviewer into a reindex loop that could not converge.
+    # Freshness also folds in the WORKTREE signature: an uncommitted edit the
+    # index hasn't absorbed means fresh:false even while SHAs match.
+    sha_rows = con.execute("SELECT key, value FROM meta WHERE key LIKE 'last_sha:%'").fetchall()
+    roots, dirty_total, checked, matched = [], 0, 0, 0
+    for r in sha_rows:
+        pref = r["key"][len("last_sha:"):]
+        d = _root_dir(pref)
+        try:
+            head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                                  text=True, cwd=d, timeout=15).stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            head = None
+        ents = _porcelain_entries(d) if head is not None else []
+        dirty = len(ents)
+        sig_stored = meta(f"worktree_sig:{pref}")
+        sig_now = _worktree_sig_from(d, ents) if head is not None else None
+        # A pre-worktree-stamp index (sig_stored None) is judged on SHAs alone.
+        fresh = None if head is None else (
+            head == r["value"] and (sig_stored is None or sig_stored == sig_now))
+        if head is not None:
+            checked += 1
+            if fresh:
+                matched += 1
+        dirty_total += dirty
+        roots.append({"root": pref, "indexed_sha": r["value"], "head_sha": head,
+                      "dirty_worktree": dirty, "fresh": fresh})
+    if sha_rows:
+        fresh = (matched == checked) if checked == len(sha_rows) else None
+        head_sha = roots[0]["head_sha"] if len(sha_rows) == 1 else None
+    else:  # legacy index without per-root stamps
+        head_sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                                  text=True, cwd=REPO_ROOT).stdout.strip() or None
+        fresh = indexed == head_sha
+    out = {"files": f, "symbols": s, "edges": e,
+           "indexed_sha": indexed, "head_sha": head_sha, "fresh": fresh,
+           "dirty_worktree": dirty_total}
+    if len(roots) > 1:
+        out["roots"] = roots
+    out["payload_version"] = _payload_version()
+    return out
 
 
 @mcp.tool(annotations=RO)
 def index_status() -> str:
-    """Check index freshness: file/symbol/edge counts and the git SHA the index was built at. Call this first if results seem stale."""
+    """Check index freshness: file/symbol/edge counts, whether the indexed git SHA matches HEAD, and dirty_worktree (uncommitted paths — the incremental indexer absorbs them; fresh:false until it has). Call this first if results seem stale."""
     return _status_data()
 
 
@@ -560,11 +660,22 @@ def decision_trace(id: str) -> str:
     if not rec:
         return f"No decision '{id}'."
     chain, cur = [], rec
+    # A supersession CYCLE between two ADRs (A→B→A) used to spin this loop
+    # forever. Track visited ids; a repeat ends the walk and is flagged.
+    seen, cycle = set(), False
     while cur:
+        if cur["id"] in seen:
+            cycle = True
+            break
+        seen.add(cur["id"])
         chain.append(cur)
         cur = con.execute("SELECT * FROM decisions WHERE id=?", (cur["superseded_by"],)).fetchone() if cur["superseded_by"] else None
     back = con.execute("SELECT * FROM decisions WHERE superseded_by=?", (rec["id"],)).fetchone()
     while back:
+        if back["id"] in seen:
+            cycle = True
+            break
+        seen.add(back["id"])
         chain.insert(0, back)
         back = con.execute("SELECT * FROM decisions WHERE superseded_by=?", (back["id"],)).fetchone()
     topics_all = {r[0] for r in con.execute("SELECT DISTINCT topic FROM msg_edges")}
@@ -576,17 +687,40 @@ def decision_trace(id: str) -> str:
     return {
         "chain": [f"{c['id']} [{c['status']}] {c['decided_at'] or '?'}" +
                   (f" → until {c['valid_until']}" if c["valid_until"] else " → current") + f": {c['title']}" for c in chain],
-        "governs": governs, "summary": rec["summary"], "source": rec["source_path"]}
+        "governs": governs, "summary": rec["summary"], "source": rec["source_path"],
+        **({"warning": "supersession cycle detected in this chain — fix the ADR frontmatter"} if cycle else {})}
 
 
 @mcp.tool(annotations=WR)
-def save_decision(title: str, decision: str, rationale: str, alternatives: str = "", supersedes: str = "") -> str:
-    """Capture a decision made in this conversation: writes a git-versioned ADR file (docs/adr/) AND indexes it immediately. Use when an architectural/design choice is settled."""
+def save_decision(title: str, decision: str, rationale: str, alternatives: str = "", supersedes: str = "", root: str = "") -> str:
+    """Capture a decision made in this conversation: writes a git-versioned ADR file (docs/adr/) AND indexes it immediately. Use when an architectural/design choice is settled. root: in a multi-root workspace, which repo the ADR belongs to."""
     import datetime
-    root = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip() or Path.cwd())
-    adr_dir = root / "docs" / "adr"
+    # Anchor the ADR inside a git-versioned ROOT the indexer parses. Writing
+    # under the multi-root workspace PARENT (the old cwd fallback) "succeeded",
+    # then the next reindex started from DELETE FROM decisions and never
+    # re-parsed the file — the decision silently vanished.
+    con0 = db()
+    prefixes = [r["key"][len("last_sha:"):]
+                for r in con0.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]
+    base = REPO_ROOT
+    source_base = REPO_ROOT
+    if any(p != "." for p in prefixes):  # multi-root workspace
+        pick = root or (prefixes[0] if len(prefixes) == 1 else None)
+        if not pick or pick not in prefixes:
+            return ("Multi-root workspace: pass root=<repo> so the ADR lands in a "
+                    f"git-versioned repo the indexer parses. Roots: {', '.join(prefixes)}.")
+        base = _root_dir(pick)
+        source_base = WS_BASE
+    adr_dir = base / "docs" / "adr"
     adr_dir.mkdir(parents=True, exist_ok=True)
-    mx = 0
+    # Ids are workspace-global: seed from the decisions table (ADRs may live in
+    # OTHER roots' docs/adr) and top up with this directory's own files.
+    try:
+        row = con0.execute("SELECT COALESCE(MAX(CAST(SUBSTR(id, 5) AS INTEGER)), 0) m "
+                           "FROM decisions WHERE id LIKE 'ADR-%'").fetchone()
+        mx = row["m"] or 0
+    except sqlite3.Error:
+        mx = 0
     for f in adr_dir.iterdir():
         m = re.match(r"ADR-(\d+)", f.name, re.I)
         if m:
@@ -607,14 +741,14 @@ def save_decision(title: str, decision: str, rationale: str, alternatives: str =
                         decided_at TEXT, valid_until TEXT, superseded_by TEXT, source_path TEXT, summary TEXT)""")
         wcon.execute("CREATE TABLE IF NOT EXISTS decision_links(decision_id TEXT, kind TEXT, target TEXT)")
         wcon.execute("INSERT OR REPLACE INTO decisions(id, title, status, decided_at, valid_until, superseded_by, source_path, summary) VALUES(?,?,?,?,NULL,NULL,?,?)",
-                     (did, title, "accepted", today, str(file.relative_to(root)), decision[:400]))
+                     (did, title, "accepted", today, str(file.relative_to(source_base)), decision[:400]))
         if supersedes:
             wcon.execute("UPDATE decisions SET valid_until=?, superseded_by=?, status='superseded' WHERE id=?",
                          (today, did, supersedes.upper()))
         wcon.commit()
     finally:
         wcon.close()
-    return f"{did} saved to {file.relative_to(root)} (git-versioned) and indexed; commit the file to share it."
+    return f"{did} saved to {file.relative_to(source_base)} (git-versioned) and indexed; commit the file to share it."
 
 
 @mcp.tool(annotations=WR)
@@ -1530,7 +1664,7 @@ def aegis_release_check() -> str:
     n = len(drift) + len(orphan_p) + len(orphan_c) + len(uncalled) + len(unresolved) + len(declared) + len(stale)
     lines = [
         f"Pre-release review, from the live graph (index fresh: {str(st['fresh']).lower()}"
-        + ("" if st["fresh"] else " — reindex before trusting this") + "):",
+        + (" — reindex before trusting this" if st["fresh"] is False else "") + "):",
         "",
         f"1. Schema drift — code touching tables no changeset defines ({len(drift)}): "
         + (", ".join(_cap_list(drift, 10)) or "none") + ". -> db_map table:<name>",

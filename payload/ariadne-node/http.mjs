@@ -158,7 +158,19 @@ export function extractTsHttp(text) {
     calls.push({ method: method.toUpperCase(), path: raw + (concat ? "…" : ""), norm, line: lineAt(text, idx), client });
   };
   for (const m of text.matchAll(FETCH_RE)) {
-    const opts = text.slice(m.index, m.index + 300).match(/method\s*:\s*[`"'](\w+)/);
+    // Look for `method:` only inside THIS call's argument list. The old flat
+    // 300-char window read past the closing paren and stole the NEXT call's
+    // method (a GET labeled POST breaks correlation). Depth-counted walk to
+    // the call's own `)`, still capped at 300 chars as a runaway guard.
+    const start = m.index + m[0].length;
+    let end = Math.min(text.length, start + 300);
+    let depth = 1; // already inside the call's parens
+    for (let i = start; i < Math.min(text.length, start + 300); i++) {
+      const ch = text[i];
+      if (ch === "(" || ch === "{" || ch === "[") depth++;
+      else if (ch === ")" || ch === "}" || ch === "]") { depth--; if (depth === 0) { end = i; break; } }
+    }
+    const opts = text.slice(start, end).match(/method\s*:\s*[`"'](\w+)/);
     push(opts?.[1] ?? "GET", m[2], m.index, "fetch", m.index + m[0].length);
   }
   for (const m of text.matchAll(AXIOS_METHOD_RE)) push(m[1], m[3], m.index, "axios", m.index + m[0].length);
@@ -170,7 +182,7 @@ export function extractTsHttp(text) {
 /** Does a call's normalized path match an endpoint's? Exact, or prefix when the call ends dynamic. */
 export function pathsMatch(callNorm, epNorm) {
   if (segsMatch(callNorm, epNorm)) return true;
-  // fetch(`${API_BASE}/api/orders`) normalizes to /{}/api/orders: that leading
+  // A fetch call on `${API_BASE}/api/orders` normalizes to /{}/api/orders: that leading
   // placeholder is a base-URL/origin variable, not a path segment, and env-based
   // base URLs are the dominant frontend pattern. Retry with it stripped, call
   // side only, so those calls still correlate with /api/orders endpoints.
