@@ -274,9 +274,11 @@ function openGraphPanel(context) {
   const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
   const cytoUri = panel.webview.asWebviewUri(vscode.Uri.file(path.join(context.extensionPath, "media", "cytoscape.min.js")));
   const ehUri = panel.webview.asWebviewUri(vscode.Uri.file(path.join(context.extensionPath, "media", "edgehandles.min.js")));
+  const fcoseUri = panel.webview.asWebviewUri(vscode.Uri.file(path.join(context.extensionPath, "media", "fcose.min.js")));
   panel.webview.html = fs.readFileSync(path.join(context.extensionPath, "graph-view.html"), "utf8")
     .replaceAll("__NONCE__", nonce).replaceAll("__CYTOSCAPE__", String(cytoUri))
-    .replaceAll("__EDGEHANDLES__", String(ehUri));
+    .replaceAll("__EDGEHANDLES__", String(ehUri))
+    .replaceAll("__FCOSE__", String(fcoseUri));
 
   // node positions + viewport survive closing the panel: the webview persists
   // them here (workspaceState), and every data message hands them back
