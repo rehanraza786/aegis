@@ -153,6 +153,15 @@ for t in targets:
 con.commit()
 print(f"Enrichment: {fresh} generated, {cached} cached (hash-unchanged), {failed} failed.")
 
+# docs/generated/ is gitignored, so insights.md is a report, not a record.
+# docs/insights.json is the committed source of truth the indexer re-loads.
+durable = [dict(r) for r in q("SELECT target, kind, hash, summary, model, generated_at FROM insights ORDER BY target")]
+if durable:
+    jf = ROOT / "docs" / "insights.json"
+    jf.parent.mkdir(parents=True, exist_ok=True)
+    jf.write_text(json.dumps(durable, indent=2) + "\n", encoding="utf-8")
+    print(f"  + docs/insights.json ({len(durable)} entries, commit to share)")
+
 rows = q("SELECT target, kind, summary FROM insights ORDER BY kind, target")
 if rows:
     out = ROOT / "docs" / "generated"

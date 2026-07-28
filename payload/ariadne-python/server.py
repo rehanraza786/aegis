@@ -765,15 +765,21 @@ def explain(target: str) -> str:
     if not con.execute("SELECT name FROM sqlite_master WHERE name='insights'").fetchone():
         return ("No insights yet. Run enrichment: python3 .ariadne/enrich.py "
                 "(opt-in, supports fully-local models via OPENAI_BASE_URL, see PRIVACY.md).")
-    row = con.execute("SELECT * FROM insights WHERE target=? OR target LIKE ? LIMIT 1",
-                      (target, f"%{target}%")).fetchone()
+    # Exact match first. The old single `target=? OR target LIKE ?` had no
+    # ORDER BY, so a substring match could outrank the exact row.
+    row = con.execute("SELECT * FROM insights WHERE target=?", (target,)).fetchone()
+    if not row:
+        row = con.execute("SELECT * FROM insights WHERE target LIKE ? ORDER BY LENGTH(target), target LIMIT 1",
+                          (f"%{target}%",)).fetchone()
     if not row:
         return f"No cached insight for '{target}'. Ask Hermes to derive one from the graph, or run enrich."
+    # Staleness applies to modules too. It used to be file-only, so a module
+    # insight was served forever with no warning while the tool description
+    # promised it auto-staled.
+    cur = _insight_subject_hash(con, row)
     stale = ""
-    if row["kind"] == "file":
-        f = con.execute("SELECT hash FROM files WHERE path=?", (row["target"],)).fetchone()
-        if f and f["hash"] != row["hash"]:
-            stale = " [STALE: file changed since this was generated, re-run enrich]"
+    if row["hash"] and cur and cur != row["hash"]:
+        stale = f" [STALE: {row['kind']} changed since this was generated, re-run enrich]"
     return f"{row['kind']} {row['target']} (model: {row['model']}){stale}\n\n{row['summary']}"
 
 
@@ -847,6 +853,49 @@ def decision_trace(id: str) -> str:
         **({"warning": "supersession cycle detected in this chain — fix the ADR frontmatter"} if cycle else {})}
 
 
+def _resolve_write_root(root: str, what: str):
+    """Pick a git-versioned root to write durable memory into.
+
+    Writing under the multi-root workspace PARENT "succeeds" and then never gets
+    re-parsed, so the record silently vanishes on the next index -- the bug this
+    guards against for ADRs, and now for insights too.
+    Returns (base, source_base, error).
+    """
+    con0 = db()
+    prefixes = [r["key"][len("last_sha:"):]
+                for r in con0.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]
+    if not any(p != "." for p in prefixes):
+        return REPO_ROOT, REPO_ROOT, None
+    pick = root or (prefixes[0] if len(prefixes) == 1 else None)
+    if not pick or pick not in prefixes:
+        return None, None, (f"Multi-root workspace: pass root=<repo> so {what} lands in a "
+                            f"git-versioned repo the indexer parses. Roots: {', '.join(prefixes)}.")
+    return _root_dir(pick), WS_BASE, None
+
+
+def _module_hash(con, target: str) -> str:
+    """Content hash of a module (a first path segment), for insight staleness.
+
+    INVARIANT: must match enrich.py module targets and the Node edition -- sha1
+    over the module's file hashes, SORTED BY HASH, joined with "|". Sorting by
+    path instead silently makes every assistant-written insight look changed, so
+    enrich regenerates and overwrites it on every run. tests/run_tests.py asserts
+    the two agree; change one, change all three.
+    """
+    hs = sorted((x[0] or "") for x in con.execute("SELECT hash FROM files WHERE path LIKE ?", (target + "/%",)))
+    return hashlib.sha1("|".join(hs).encode()).hexdigest()
+
+
+def _insight_subject_hash(con, row):
+    """Current hash of whatever an insight is about, or None if it is gone."""
+    if row["kind"] == "file":
+        r = con.execute("SELECT hash FROM files WHERE path=?", (row["target"],)).fetchone()
+        return (r["hash"] if r else None) or None
+    if row["kind"] == "module":
+        return _module_hash(con, row["target"])
+    return None  # topic/table notes (annotate.py) have no single backing file
+
+
 @mcp.tool(annotations=WR)
 def save_decision(title: str, decision: str, rationale: str, alternatives: str = "", supersedes: str = "", root: str = "") -> str:
     """Capture a decision made in this conversation: writes a git-versioned ADR file (docs/adr/) AND indexes it immediately. Use when an architectural/design choice is settled. root: in a multi-root workspace, which repo the ADR belongs to."""
@@ -856,17 +905,9 @@ def save_decision(title: str, decision: str, rationale: str, alternatives: str =
     # then the next reindex started from DELETE FROM decisions and never
     # re-parsed the file — the decision silently vanished.
     con0 = db()
-    prefixes = [r["key"][len("last_sha:"):]
-                for r in con0.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]
-    base = REPO_ROOT
-    source_base = REPO_ROOT
-    if any(p != "." for p in prefixes):  # multi-root workspace
-        pick = root or (prefixes[0] if len(prefixes) == 1 else None)
-        if not pick or pick not in prefixes:
-            return ("Multi-root workspace: pass root=<repo> so the ADR lands in a "
-                    f"git-versioned repo the indexer parses. Roots: {', '.join(prefixes)}.")
-        base = _root_dir(pick)
-        source_base = WS_BASE
+    base, source_base, err = _resolve_write_root(root, "the ADR")
+    if err:
+        return err
     adr_dir = base / "docs" / "adr"
     adr_dir.mkdir(parents=True, exist_ok=True)
     # Ids are workspace-global: seed from the decisions table (ADRs may live in
@@ -908,10 +949,13 @@ def save_decision(title: str, decision: str, rationale: str, alternatives: str =
 
 
 @mcp.tool(annotations=WR)
-def save_insight(target: str, kind: str, summary: str) -> str:
-    """Persist a derived insight for a module or file into the graph (served by explain, hash-keyed so it auto-stales when content changes). kind: 'module' or 'file'. Use after synthesizing understanding from the graph tools."""
+def save_insight(target: str, kind: str, summary: str, root: str = "") -> str:
+    """Persist a derived insight for a module or file into the graph (served by explain, hash-keyed so it auto-stales when content changes). kind: 'module' or 'file'. Writes a git-versioned docs/insights.json AND indexes it. root: in a multi-root workspace, which repo it belongs to."""
     if kind not in ("module", "file") or len(summary) < 40:
         return "kind must be module|file and summary at least 40 chars."
+    base, source_base, err = _resolve_write_root(root, "the insight")
+    if err:
+        return err
     wcon = wdb()
     try:
         wcon.execute("""CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT,
@@ -920,14 +964,32 @@ def save_insight(target: str, kind: str, summary: str) -> str:
             r = wcon.execute("SELECT hash FROM files WHERE path=?", (target,)).fetchone()
             h = (r[0] if r else "") or ""
         else:
-            hs = [x[0] or "" for x in wcon.execute("SELECT hash FROM files WHERE path LIKE ? ORDER BY path", (target + "/%",))]
-            h = hashlib.sha1("|".join(hs).encode()).hexdigest()
+            h = _module_hash(wcon, target)
+        rec = {"target": target, "kind": kind, "hash": h, "summary": summary[:4000],
+               "model": "assistant", "generated_at": time.time()}
+        # File first: the DB is derived and gitignored, so a row without a file
+        # entry is memory that dies at the next pull-index or rebuild.
+        f = base / "docs" / "insights.json"
+        try:
+            items = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            items = []  # first insight in this repo
+        if not isinstance(items, list):
+            items = []
+        items = [i for i in items if not (isinstance(i, dict) and i.get("target") == target)]
+        items.append(rec)
+        items.sort(key=lambda i: str(i.get("target", "")))  # stable order = reviewable diffs
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(items, indent=2) + "\n", encoding="utf-8")
         wcon.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)",
-                     (target, kind, h, summary[:4000], "assistant", time.time()))
+                     (target, kind, h, rec["summary"], rec["model"], rec["generated_at"]))
         wcon.commit()
     finally:
         wcon.close()
-    return f"Insight saved for {kind} '{target}'."
+    rel = f.relative_to(source_base) if str(f).startswith(str(source_base)) else f
+    return (f"Insight saved for {kind} '{target}' to {rel} (git-versioned) and indexed. "
+            "It is re-loaded on every reindex and marked stale automatically when content "
+            "changes; commit the file to share it.")
 
 
 def _gaps_data(con, n):

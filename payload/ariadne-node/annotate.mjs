@@ -33,6 +33,7 @@ if (a.action === "insight") {
     die("insight needs target, kind (module|file|topic|table), and a summary of at least 40 chars.");
   }
   const db = new Database(DB_PATH);
+  let rel, shared = true;
   try {
     db.exec(`CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT,
              hash TEXT, summary TEXT, model TEXT, generated_at REAL)`);
@@ -41,13 +42,50 @@ if (a.action === "insight") {
       h = db.prepare("SELECT hash FROM files WHERE path=?").get(a.target)?.hash ?? "";
       if (!h) die(`File '${a.target}' is not in the index (paths are repo-prefixed in a multi-repo workspace).`);
     } else if (a.kind === "module") {
-      const hs = db.prepare("SELECT hash FROM files WHERE path LIKE ? ORDER BY path").all(a.target + "/%").map((r) => r.hash ?? "");
-      h = crypto.createHash("sha1").update(hs.join("|")).digest("hex");
+      // sha1 over the module's file hashes SORTED BY HASH: must match
+      // enrich, server.mjs moduleHash, and the Python edition, or enrich
+      // treats this insight as changed and overwrites it on the next run
+      const hs = db.prepare("SELECT hash FROM files WHERE path LIKE ?").all(a.target + "/%").map((r) => r.hash ?? "");
+      h = crypto.createHash("sha1").update(hs.sort().join("|")).digest("hex");
     } // topic/table notes have no single backing file; they don't auto-stale
+    // Durable first: index.db is gitignored and disposable, so a row without a
+    // docs/insights.json entry dies at the next pull-index or --rebuild.
+    const prefixes = db.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all()
+      .map((r) => r.key.slice("last_sha:".length)).filter((x) => x !== ".");
+    // Prefer a git-versioned root so the file is shareable. Fall back to the
+    // workspace parent rather than failing: that is where the graph view has
+    // always written docs/graph-assertions.json, the indexer reads both, and a
+    // topic/table note has no path to infer a repo from. Never make an existing
+    // caller pass a new argument.
+    let baseDir = ROOT;
+    if (prefixes.length) { // multi-root workspace: cwd is the parent, not a repo
+      // module/file targets are repo-prefixed, so the repo is the first segment
+      const guess = a.kind === "module" ? a.target : a.kind === "file" ? String(a.target).split("/")[0] : null;
+      const pick = (a.root && prefixes.includes(a.root) ? a.root : null)
+        ?? (prefixes.includes(guess) ? guess : null)
+        ?? (prefixes.length === 1 ? prefixes[0] : null);
+      if (pick) baseDir = path.join(ROOT, pick);
+    }
+    const f = path.join(baseDir, "docs", "insights.json");
+    rel = path.relative(ROOT, f);
+    shared = baseDir !== ROOT || !prefixes.length;
+    let list = [];
+    if (fs.existsSync(f)) {
+      // Never clobber: a malformed file must not erase the team's insights.
+      try { list = JSON.parse(fs.readFileSync(f, "utf8")); }
+      catch (e) { die(`${rel} exists but is not valid JSON (${e.message}). Fix or remove it first.`); }
+      if (!Array.isArray(list)) die(`${rel} is not a JSON array. Fix it first.`);
+    }
+    list = list.filter((x) => x?.target !== a.target);
+    list.push({ target: a.target, kind: a.kind, hash: h, summary: a.summary.slice(0, 4000),
+                model: `${author}:graph-view`, generated_at: Date.now() / 1000 });
+    list.sort((x, y) => String(x.target).localeCompare(String(y.target))); // reviewable diffs
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, JSON.stringify(list, null, 2) + "\n");
     db.prepare("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)")
       .run(a.target, a.kind, h, a.summary.slice(0, 4000), `${author}:graph-view`, Date.now() / 1000);
   } finally { db.close(); }
-  console.log(`Insight saved for ${a.kind} '${a.target}' (provenance: ${author}). Served by explain/context_pack immediately.`);
+  console.log(`Insight saved for ${a.kind} '${a.target}' (provenance: ${author}) and recorded in ${rel}. Served by explain/context_pack immediately; commit the file to share it${shared ? "" : " (tip: pass \"root\":\"<repo>\" to place it inside a git-versioned repo)"}.`);
 
 } else if (a.action === "assert") {
   if (!["kafka", "db", "http_endpoint", "http_call"].includes(a.kind)) die("kind must be kafka|db|http_endpoint|http_call.");

@@ -310,6 +310,12 @@ CREATE TABLE IF NOT EXISTS decisions(
   valid_until TEXT, superseded_by TEXT, source_path TEXT, summary TEXT);
 CREATE TABLE IF NOT EXISTS decision_links(decision_id TEXT, kind TEXT, target TEXT);
 CREATE INDEX IF NOT EXISTS idx_dlinks ON decision_links(target);
+-- Prose memory. Rows are derived from docs/insights.json, exactly like
+-- assertions and ADRs; owning the DDL here is what makes that true (it used
+-- to be CREATE-IF-NOT-EXISTS'd lazily in enrich and the server instead).
+CREATE TABLE IF NOT EXISTS insights(
+  target TEXT PRIMARY KEY, kind TEXT, hash TEXT, summary TEXT,
+  model TEXT, generated_at REAL);
 CREATE TABLE IF NOT EXISTS extract_cache(
   path TEXT PRIMARY KEY, hash TEXT, constants TEXT, entities TEXT);
 CREATE TABLE IF NOT EXISTS test_cases(
@@ -1337,6 +1343,48 @@ def kafka_pass(con, scope_prefixes=None):
         log.info("Assertions: %d loaded into the graph%s", loaded,
                  f", {stale} STALE (evidence file changed since)" if stale else "")
 
+    # ---- Insights: prose memory an assistant or enrichment derived ----
+    # Source of truth is docs/insights.json, committed and reviewed in PRs, same
+    # contract as assertions and ADRs. Before this the only copy lived in
+    # index.db, which is gitignored, so pull-index.sh and corruption recovery
+    # both destroyed it silently -- the failure save_decision already guards
+    # against for ADRs.
+    ins_loaded = 0
+    # REPO_ROOT as well as each root: in a multi-root workspace REPO_ROOT is the
+    # parent, which is where assert_edge and the graph view have always put
+    # docs/graph-assertions.json. Reading both means a file placed either way
+    # still loads; the writers prefer a git-versioned root.
+    seen = set()
+    for root in [REPO_ROOT, *ROOTS]:
+        inf = root / "docs" / "insights.json"
+        if inf in seen or not inf.exists():
+            continue
+        seen.add(inf)
+        try:
+            items = json.loads(inf.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.warning("%s is not valid JSON (%s); its insights stay out of the graph until it is fixed", inf, e)
+            continue
+        if not isinstance(items, list):
+            log.warning("%s is not a JSON array; skipped", inf)
+            continue
+        for i in items:
+            if not isinstance(i, dict) or not i.get("target") or not i.get("summary"):
+                continue
+            try:
+                gen = float(i.get("generated_at") or 0) or time.time()
+            except (TypeError, ValueError):
+                gen = time.time()
+            # annotate.py also writes topic/table notes; collapsing them to
+            # "module" would make explain compute a module hash for a topic
+            kind = i.get("kind") if i.get("kind") in ("module", "file", "topic", "table") else "module"
+            con.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)",
+                        (i["target"], kind, i.get("hash", ""),
+                         str(i["summary"])[:4000], i.get("model", "assistant"), gen))
+            ins_loaded += 1
+    if ins_loaded:
+        log.info("Insights: %d loaded from docs/insights.json", ins_loaded)
+
     # ---- Mnemosyne: decision memory from ADR files ----
     con.execute("DELETE FROM decisions")
     con.execute("DELETE FROM decision_links")
@@ -1446,6 +1494,10 @@ def full_index(con, rebuild=False):
         try:
             con.execute("DELETE FROM extract_cache")
             con.execute("DELETE FROM meta WHERE key='config_fp'")
+            # Only --rebuild wipes insights: it makes docs/insights.json exactly
+            # authoritative (deletions in the file propagate). A normal index is
+            # additive so an un-exported local enrich run isn't destroyed.
+            con.execute("DELETE FROM insights")
         except sqlite3.OperationalError:
             pass
     files = list(repo_files())

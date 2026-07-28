@@ -368,6 +368,12 @@ function connect(forIndexing = false) {
     CREATE TABLE IF NOT EXISTS decision_links(
       decision_id TEXT, kind TEXT, target TEXT);
     CREATE INDEX IF NOT EXISTS idx_dlinks ON decision_links(target);
+    -- Prose memory. Rows are derived from docs/insights.json, exactly like
+    -- assertions and ADRs; owning the DDL here is what makes that true (it used
+    -- to be CREATE-IF-NOT-EXISTS'd lazily in enrich and the server instead).
+    CREATE TABLE IF NOT EXISTS insights(
+      target TEXT PRIMARY KEY, kind TEXT, hash TEXT, summary TEXT,
+      model TEXT, generated_at REAL);
     CREATE TABLE IF NOT EXISTS extract_cache(
       path TEXT PRIMARY KEY, hash TEXT, constants TEXT, entities TEXT);
     CREATE TABLE IF NOT EXISTS test_cases(
@@ -1218,6 +1224,44 @@ async function kafkaPass(db, scopePrefixes = null) {
     }
   }
 
+  // ---- Insights: prose memory an assistant or enrichment derived ----
+  // Source of truth is docs/insights.json, committed and reviewed in PRs, same
+  // contract as assertions and ADRs. Before this the only copy lived in
+  // index.db, which is gitignored, so pull-index.sh and corruption recovery
+  // both destroyed it silently — the failure save_decision already guards
+  // against for ADRs.
+  {
+    const INSIGHT_KINDS = new Set(["module", "file", "topic", "table"]);
+    const ins = db.prepare(`INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at)
+                            VALUES(?,?,?,?,?,?)`);
+    let loaded = 0;
+    // REPO_ROOT as well as each root: in a multi-root workspace REPO_ROOT is
+    // the parent, which is where assert_edge and the graph view have always
+    // put docs/graph-assertions.json. Reading both means a file placed either
+    // way still loads; the writers prefer a git-versioned root.
+    const seen = new Set();
+    for (const root of [REPO_ROOT, ...ROOTS]) {
+      const inf = path.join(root, "docs", "insights.json");
+      if (seen.has(inf)) continue;
+      seen.add(inf);
+      if (!fs.existsSync(inf)) continue;
+      let list = [];
+      try { list = JSON.parse(fs.readFileSync(inf, "utf8")); }
+      catch (e) { log("WARN", `${path.relative(REPO_ROOT, inf)} is not valid JSON (${e.message}); its insights stay out of the graph until it is fixed`); continue; }
+      if (!Array.isArray(list)) { log("WARN", `${path.relative(REPO_ROOT, inf)} is not a JSON array; skipped`); continue; }
+      for (const i of list) {
+        if (!i?.target || !i?.summary) continue;
+        // annotate.mjs also writes topic/table notes; collapsing them to
+        // "module" would make explain compute a module hash for a topic
+        ins.run(i.target, INSIGHT_KINDS.has(i.kind) ? i.kind : "module", i.hash ?? "",
+                String(i.summary).slice(0, 4000), i.model ?? "assistant",
+                Number(i.generated_at) || Date.now() / 1000);
+        loaded++;
+      }
+    }
+    if (loaded) log("INFO", `Insights: ${loaded} loaded from docs/insights.json`);
+  }
+
   // ---- Mnemosyne: decision memory from ADR files (temporal, deterministic) ----
   {
     db.exec("DELETE FROM decisions; DELETE FROM decision_links;");
@@ -1330,6 +1374,10 @@ async function fullIndex(db, rebuild = false) {
     // and rebuild into an empty graph.
     db.exec("DELETE FROM files; DELETE FROM chunk_text;");
     try { db.exec("DELETE FROM extract_cache"); db.exec("DELETE FROM meta WHERE key='config_fp'"); } catch { /* fresh db */ }
+    // Only --rebuild wipes insights: it makes docs/insights.json exactly
+    // authoritative (deletions in the file propagate). A normal index is
+    // additive so an un-exported local enrich run isn't destroyed.
+    try { db.exec("DELETE FROM insights"); } catch { /* fresh db */ }
   }
   const tracked = new Set(files);
   const S = stmts(db);

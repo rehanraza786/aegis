@@ -50,17 +50,61 @@ if a.get("action") == "insight":
                 die(f"File '{a['target']}' is not in the index (paths are repo-prefixed in a multi-repo workspace).")
             h = r[0]
         elif a["kind"] == "module":
-            hs = [x[0] or "" for x in con.execute(
-                "SELECT hash FROM files WHERE path LIKE ? ORDER BY path", (a["target"] + "/%",))]
+            # sha1 over the module's file hashes SORTED BY HASH: must match
+            # enrich, server.py _module_hash, and the Node edition, or enrich
+            # treats this insight as changed and overwrites it on the next run
+            hs = sorted((x[0] or "") for x in con.execute(
+                "SELECT hash FROM files WHERE path LIKE ?", (a["target"] + "/%",)))
             h = hashlib.sha1("|".join(hs).encode()).hexdigest()
         else:
             h = ""  # topic/table notes have no single backing file; they don't auto-stale
+        # Durable first: index.db is gitignored and disposable, so a row without
+        # a docs/insights.json entry dies at the next pull-index or --rebuild.
+        prefixes = [r[0][len("last_sha:"):] for r in
+                    con.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]
+        prefixes = [x for x in prefixes if x != "."]
+        # Prefer a git-versioned root so the file is shareable. Fall back to the
+        # workspace parent rather than failing: that is where the graph view has
+        # always written docs/graph-assertions.json, the indexer reads both, and
+        # a topic/table note has no path to infer a repo from. Never make an
+        # existing caller pass a new argument.
+        base = ROOT
+        if prefixes:  # multi-root workspace: cwd is the parent, not a repo
+            # module/file targets are repo-prefixed, so the repo is the first segment
+            guess = a["target"] if a["kind"] == "module" else a["target"].split("/")[0] if a["kind"] == "file" else None
+            root_arg = a.get("root")
+            pick = (root_arg if root_arg in prefixes else None) or \
+                   (guess if guess in prefixes else None) or \
+                   (prefixes[0] if len(prefixes) == 1 else None)
+            if pick:
+                base = ROOT / pick
+        f = base / "docs" / "insights.json"
+        rel = f.relative_to(ROOT) if str(f).startswith(str(ROOT)) else f
+        shared = base != ROOT or not prefixes
+        items = []
+        if f.exists():
+            # Never clobber: a malformed file must not erase the team's insights.
+            try:
+                items = json.loads(f.read_text(encoding="utf-8"))
+            except Exception as e:  # noqa: BLE001
+                die(f"{rel} exists but is not valid JSON ({e}). Fix or remove it first.")
+            if not isinstance(items, list):
+                die(f"{rel} is not a JSON array. Fix it first.")
+        items = [x for x in items if not (isinstance(x, dict) and x.get("target") == a["target"])]
+        items.append({"target": a["target"], "kind": a["kind"], "hash": h,
+                      "summary": a["summary"][:4000], "model": f"{author}:graph-view",
+                      "generated_at": time.time()})
+        items.sort(key=lambda x: str(x.get("target", "")))  # reviewable diffs
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(items, indent=2) + "\n", encoding="utf-8")
         con.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)",
                     (a["target"], a["kind"], h, a["summary"][:4000], f"{author}:graph-view", time.time()))
         con.commit()
     finally:
         con.close()
-    print(f"Insight saved for {a['kind']} '{a['target']}' (provenance: {author}). Served by explain/context_pack immediately.")
+    tip = "" if shared else ' (tip: pass "root":"<repo>" to place it inside a git-versioned repo)'
+    print(f"Insight saved for {a['kind']} '{a['target']}' (provenance: {author}) and recorded in {rel}. "
+          f"Served by explain/context_pack immediately; commit the file to share it{tip}.")
 
 elif a.get("action") == "assert":
     if a.get("kind") not in ("kafka", "db", "http_endpoint", "http_call"):

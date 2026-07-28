@@ -244,6 +244,8 @@ Enrichment: 0 generated, 4 cached (hash-unchanged), 0 failed.
 
 Four ways to run it: **through Copilot** (`AEGIS: Enrich Insights via Copilot`, using seats you already pay for, no API keys), a **local model** (`OPENAI_BASE_URL` → Ollama/vLLM, zero egress), an **API key**, or **`enrich --plan` / `--apply`** to drive it with anything else. Agents can also write insights directly with `save_insight`. It's **off by default**, and it's the only component with a model in the write path.
 
+Insights follow the same durability contract as ADRs and assertions: the source of truth is **`docs/insights.json`**, committed and reviewed in PRs, and the index is re-derived from it on every reindex. `index.db` is gitignored and disposable, so anything that only lived there — a teammate's `save_insight`, an enrichment run — was destroyed by *Pull Team Index* or a corruption rebuild. Commit the file to share it.
+
 ---
 
 ## Team setup

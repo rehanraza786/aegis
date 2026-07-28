@@ -10,6 +10,7 @@ Usage:  python3 tests/run_tests.py --runtime node|python
 Exit code 0 = all green. Designed for the GitHub Actions matrix (linux+windows).
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -1225,6 +1226,46 @@ await c.close();
     check("retracted assertion leaves the graph on reindex",
           db.execute("SELECT 1 FROM msg_edges WHERE topic='orders.created.manual'").fetchone() is None)
     db.close()
+
+    # ---- insight durability: prose memory survives a wiped index ----
+    # Regression: insights lived only in the gitignored index.db, so pull-index.sh
+    # and corruption recovery destroyed them silently.
+    ins_file = ws / "docs" / "insights.json"
+    ins_file.parent.mkdir(parents=True, exist_ok=True)
+    ins_file.write_text(json.dumps([{
+        "target": "order-service", "kind": "module", "hash": "",
+        "summary": "Owns order intake and publishes orders.created; the only writer of the payments table.",
+        "model": "assistant", "generated_at": 0}]), encoding="utf-8")
+    run(exe + [idx, "--rebuild"], ws)  # the most destructive path there is
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    irow = db.execute("SELECT kind, summary FROM insights WHERE target='order-service'").fetchone()
+    # module hash parity: enrich groups by first path segment and sha1s the
+    # SORTED file hashes; the server must agree or enrich overwrites every
+    # assistant-written insight on each run
+    enrich_h = hashlib.sha1("|".join(sorted(
+        (r[0] or "") for r in db.execute("SELECT hash FROM files WHERE path LIKE 'order-service/%'"))).encode()).hexdigest()
+    server_h = hashlib.sha1("|".join(sorted(
+        (r[0] or "") for r in db.execute("SELECT hash FROM files WHERE path LIKE ?", ("order-service" + "/%",)))).encode()).hexdigest()
+    db.close()
+    check("insight survives --rebuild via docs/insights.json", irow is not None and irow[0] == "module", str(irow))
+    check("module hash agrees between enrich and the server", enrich_h == server_h)
+    # annotate (the VS Code graph view's write path) must be durable too, and
+    # its topic/table notes must not be collapsed into "module" on ingest
+    code, oan = run(exe + [an, json.dumps({
+        "action": "insight", "kind": "topic", "target": "orders.created", "root": "order-service",
+        "summary": "Fan-out event; billing and shipping both consume it, so the payload is a public contract."})], ws)
+    check("annotate: insight recorded in a git-versioned docs/insights.json",
+          code == 0 and (ws / "order-service" / "docs" / "insights.json").exists(), oan[-200:])
+    # commit it: the point of the file is that it is shared, and leaving the
+    # worktree dirty would break the freshness assertions further down
+    git(["add", "-A"], ws / "order-service")
+    git(["commit", "-qm", "record insight"], ws / "order-service")
+    run(exe + [idx, "--rebuild"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    trow = db.execute("SELECT kind, model FROM insights WHERE target='orders.created'").fetchone()
+    db.close()
+    check("annotate insight survives --rebuild with its kind intact",
+          trow is not None and trow[0] == "topic" and str(trow[1]).startswith("human"), str(trow))
 
     # ---- non-JVM seams: endpoints, migrations, brokers, config-declared topics ----
     db = sqlite3.connect(ws / ".ariadne" / "index.db")

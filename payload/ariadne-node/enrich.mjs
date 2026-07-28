@@ -147,6 +147,7 @@ if (APPLY) {
                            VALUES(?,?,?,?,?,?)`);
   for (const it of items) putA.run(it.target, it.kind, it.hash, String(it.summary).slice(0, 4000), it.model ?? "external", Date.now() / 1000);
   console.log(`Applied ${items.length} insights.`);
+  writeInsightsJson();
   writeInsightsMd();
   process.exit(0);
 }
@@ -169,6 +170,19 @@ for (const t of targets) {
   } catch (e) { failed++; console.error(`  ! ${t.target}: ${e.message}`); }
 }
 console.log(`Enrichment: ${fresh} generated, ${cached} cached (hash-unchanged), ${failed} failed.`);
+
+/* ---------------- durable export ---------------- */
+// docs/generated/ is gitignored, so insights.md is a report, not a record.
+// docs/insights.json is the committed source of truth the indexer re-loads.
+function writeInsightsJson() {
+  const rows = q("SELECT target, kind, hash, summary, model, generated_at FROM insights ORDER BY target");
+  if (!rows.length) return;
+  const f = path.join(ROOT, "docs", "insights.json");
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify(rows, null, 2) + "\n");
+  console.log(`  + docs/insights.json (${rows.length} entries, commit to share)`);
+}
+writeInsightsJson();
 
 /* ---------------- insights.md ---------------- */
 writeInsightsMd();
