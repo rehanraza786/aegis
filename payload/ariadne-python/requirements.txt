@@ -1,4 +1,9 @@
-mcp[cli]>=1.2.0
+# <2 is load-bearing: mcp 2.0 removed mcp.server.fastmcp, which server.py
+# imports at module scope. Without the cap a fresh `pip install -r` resolves to
+# 2.x and the Python edition fails to start at all (ModuleNotFoundError before
+# any tool is registered), which reads as "the whole server is broken" rather
+# than "one dependency moved". Revisit when server.py targets the 2.x API.
+mcp[cli]>=1.2.0,<2
 protobuf>=7.35
 tree-sitter>=0.23
 # <1 is load-bearing: the language pack's 1.x line stopped vendoring grammars in
