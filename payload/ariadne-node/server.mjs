@@ -642,7 +642,16 @@ tool(server, "find_callers",
        JOIN symbols s ON s.id=c.src_symbol JOIN files f ON f.id=s.file_id
        WHERE c.callee = ? ORDER BY f.path, c.line LIMIT ?`
 ).all(name, clamp(limit ?? 40, 1, 100));
-    return rows.length ? rows : "No callers recorded (AST index may not cover this file's language, or name mismatch, try find_references for SCIP-grade lookup).";
+    if (!rows.length) return "No callers recorded (AST index may not cover this file's language, or name mismatch, try find_references for SCIP-grade lookup).";
+    // Saying "heuristic" in the tool description does not help an agent holding
+    // a plausible-looking result. Say it here, and only when a precise answer
+    // actually exists for this symbol, so the hint costs nothing when it cannot
+    // be acted on.
+    let scip = 0;
+    try { scip = d.prepare("SELECT COUNT(*) c FROM scip_defs WHERE symbol LIKE ?").get(`%${name}%`).c; } catch { /* no SCIP ingested */ }
+    return scip
+      ? { callers: rows, note: `heuristic (name match). SCIP has compiler-resolved data for '${name}' — use find_references before concluding anything is or is not used.` }
+      : rows;
   }));
 
 tool(server, "find_callees",

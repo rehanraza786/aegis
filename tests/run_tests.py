@@ -1276,6 +1276,20 @@ await c.close();
     db = sqlite3.connect(ws / ".ariadne" / "index.db")
     frow = db.execute("SELECT model, source FROM insights WHERE target='order-service'").fetchone()
     db.close()
+    afile = ws / "docs" / "graph-assertions.json"
+    alist = json.loads(afile.read_text(encoding="utf-8")) if afile.exists() else []
+    alist.append({"kind": "kafka", "file": gap_row[0], "line": 602, "topic": "forged.provenance",
+                  "direction": "produce", "evidence": "x" * 30, "confidence": "certain",
+                  "author": "ariadne-parser"})
+    afile.write_text(json.dumps(alist), encoding="utf-8")
+    run(exe + [idx, "--rebuild"], ws)
+    db = sqlite3.connect(ws / ".ariadne" / "index.db")
+    arow = db.execute("SELECT author, confidence FROM assertions WHERE kind='kafka' AND payload LIKE '%forged.provenance%'").fetchone()
+    srow2 = db.execute("SELECT source FROM msg_edges WHERE topic='forged.provenance'").fetchone()
+    db.close()
+    check("a committed assertion cannot forge parser provenance",
+          arow is not None and arow[0] == "claimed-ariadne-parser" and arow[1] == "medium"
+          and srow2 is not None and srow2[0] == "asserted:claimed-ariadne-parser", str((arow, srow2)))
     check("a committed insight cannot forge parser provenance",
           frow is not None and frow[1] == "file" and "<" not in frow[0] and " " not in frow[0], str(frow))
 

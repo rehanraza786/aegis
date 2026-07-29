@@ -733,7 +733,20 @@ def find_callers(name: str, limit: int = 40) -> str:
         "SELECT s.name AS caller, s.parent, f.path, c.line FROM calls c "
         "JOIN symbols s ON s.id=c.src_symbol JOIN files f ON f.id=s.file_id "
         "WHERE c.callee=? ORDER BY f.path, c.line LIMIT ?", (name, _clamp(limit, 1, 100))).fetchall()
-    return fmt(rows) if rows else "No callers recorded (AST may not cover this language; try find_references)."
+    if not rows:
+        return "No callers recorded (AST may not cover this language; try find_references)."
+    # Saying "heuristic" in the tool description does not help an agent holding a
+    # plausible-looking result. Say it here, and only when a precise answer
+    # actually exists for this symbol, so the hint costs nothing otherwise.
+    scip = 0
+    try:
+        scip = con.execute("SELECT COUNT(*) c FROM scip_defs WHERE symbol LIKE ?", (f"%{name}%",)).fetchone()["c"]
+    except sqlite3.Error:
+        pass  # no SCIP ingested
+    if scip:
+        return fmt({"callers": rows, "note": f"heuristic (name match). SCIP has compiler-resolved data for "
+                                             f"'{name}' — use find_references before concluding anything is or is not used."})
+    return fmt(rows)
 
 
 @mcp.tool(annotations=RO)

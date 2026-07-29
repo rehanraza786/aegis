@@ -1203,11 +1203,22 @@ async function kafkaPass(db, scopePrefixes = null) {
                                VALUES(?,?,?,?,?,?,?,?,?)`);
       const fid = db.prepare("SELECT id, hash FROM files WHERE path=?");
       let loaded = 0, stale = 0;
+      // Same rule as insights: docs/graph-assertions.json is committed, so its
+      // contents are attacker-controlled in any repo that takes PRs. An entry
+      // must not be able to write author:"parser" and be displayed as a parsed
+      // fact — provenance is stamped here, from a clamped token, and every
+      // asserted row is already tagged 'asserted:' in the source column.
+      const safeAuthor = (x) => String(x ?? "assistant").replace(/[^\w.:@-]/g, "").slice(0, 40) || "assistant";
+      const RESERVED = new Set(["parser", "ariadne", "ariadne-parser", "scip", "tree-sitter", "indexer"]);
       for (const a of list) {
         const f = fid.get(a.file);
-        const src = `asserted:${a.author ?? "assistant"}`;
-        insA.run(a.kind, JSON.stringify(a), a.file ?? null, a.line ?? null, a.evidence ?? null,
-                 a.confidence ?? "medium", a.author ?? "assistant", a.source_hash ?? null, Date.now() / 1000);
+        let author = safeAuthor(a.author);
+        if (RESERVED.has(author.toLowerCase())) author = `claimed-${author}`;
+        const conf = ["high", "medium", "low"].includes(a.confidence) ? a.confidence : "medium";
+        const src = `asserted:${author}`;
+        insA.run(a.kind, JSON.stringify(a), a.file ?? null, a.line ?? null,
+                 a.evidence == null ? null : String(a.evidence).slice(0, 2000),
+                 conf, author, a.source_hash ?? null, Date.now() / 1000);
         if (a.source_hash && f && f.hash !== a.source_hash) stale++;
         if (!f) continue;
         if (a.kind === "kafka" && a.topic && a.direction) {

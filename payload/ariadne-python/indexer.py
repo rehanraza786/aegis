@@ -1321,13 +1321,28 @@ def kafka_pass(con, scope_prefixes=None):
             log.warning("docs/graph-assertions.json is not valid JSON (%s); assertions stay out of the graph until it is fixed", e)
     if isinstance(alist, list) and alist:
         loaded = stale = 0
+        # Same rule as insights: docs/graph-assertions.json is committed, so its
+        # contents are attacker-controlled in any repo that takes PRs. An entry
+        # must not be able to write author="parser" and be displayed as a parsed
+        # fact -- provenance is stamped here, from a clamped token, and every
+        # asserted row is already tagged 'asserted:' in the source column.
+        _RESERVED = {"parser", "ariadne", "ariadne-parser", "scip", "tree-sitter", "indexer"}
+
+        def _safe_author(x):
+            a = re.sub(r"[^\w.:@-]", "", str(x if x is not None else "assistant"))[:40] or "assistant"
+            return f"claimed-{a}" if a.lower() in _RESERVED else a
+
         for a in alist:
             fr = con.execute("SELECT id, hash FROM files WHERE path=?", (a.get("file"),)).fetchone()
-            src = f"asserted:{a.get('author', 'assistant')}"
+            author = _safe_author(a.get("author"))
+            conf = a.get("confidence") if a.get("confidence") in ("high", "medium", "low") else "medium"
+            src = f"asserted:{author}"
+            ev = a.get("evidence")
             con.execute("INSERT INTO assertions(kind, payload, file_path, line, evidence, confidence, author, source_hash, created_at) "
                         "VALUES(?,?,?,?,?,?,?,?,?)",
-                        (a.get("kind"), json.dumps(a), a.get("file"), a.get("line"), a.get("evidence"),
-                         a.get("confidence", "medium"), a.get("author", "assistant"), a.get("source_hash"), time.time()))
+                        (a.get("kind"), json.dumps(a), a.get("file"), a.get("line"),
+                         None if ev is None else str(ev)[:2000],
+                         conf, author, a.get("source_hash"), time.time()))
             if a.get("source_hash") and fr and fr[1] != a["source_hash"]:
                 stale += 1
             if not fr:
