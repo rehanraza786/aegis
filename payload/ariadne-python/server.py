@@ -136,6 +136,16 @@ except Exception:  # noqa: BLE001
 MAX_ROWS = _cfg.get("maxToolRows", 50)
 MAX_BYTES = _cfg.get("maxToolBytes", 24000)
 SUMMARY_THRESHOLD = _cfg.get("summaryThreshold", 40)
+# One insight is prose an assistant or a committed file wrote, so it is the least
+# predictable thing any pack carries. context_pack advertises ~900 bytes; an
+# untruncated 4000-char summary blows that by 4x on its own.
+MAX_INSIGHT_CHARS = int(_cfg.get("maxInsightChars", 600))
+
+
+def _clamp_insight(t) -> str:
+    t = str(t if t is not None else "")
+    return t if len(t) <= MAX_INSIGHT_CHARS else \
+        t[:MAX_INSIGHT_CHARS] + '… [truncated; call explain("…") for the full insight]'
 
 
 def _wt_label(con, path_or_id):
@@ -539,6 +549,7 @@ def context_pack(target: str) -> str:
     insight = None
     try:
         row = con.execute("SELECT summary FROM insights WHERE target=? OR target=? LIMIT 1", (fpath, mod)).fetchone()
+        row = {"summary": _clamp_insight(row["summary"])} if row else None
         insight = row["summary"] if row else None
     except sqlite3.Error:
         pass
@@ -780,7 +791,12 @@ def explain(target: str) -> str:
     stale = ""
     if row["hash"] and cur and cur != row["hash"]:
         stale = f" [STALE: {row['kind']} changed since this was generated, re-run enrich]"
-    return f"{row['kind']} {row['target']} (model: {row['model']}){stale}\n\n{row['summary']}"
+    # Provenance is the indexer's stamp, not the file's claim: an entry in the
+    # committed docs/insights.json cannot present itself as a parsed fact.
+    src = row["source"] if "source" in row.keys() else None
+    prov = "derived, from committed docs/insights.json" if src == "file" else "derived, written live"
+    return (f"{row['kind']} {row['target']} ({prov}; model: {row['model']}){stale}"
+            f"\n\n{_clamp_insight(row['summary'])}")
 
 
 @mcp.tool(annotations=RO)
@@ -959,7 +975,9 @@ def save_insight(target: str, kind: str, summary: str, root: str = "") -> str:
     wcon = wdb()
     try:
         wcon.execute("""CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT,
-                        hash TEXT, summary TEXT, model TEXT, generated_at REAL)""")
+                        hash TEXT, summary TEXT, model TEXT, generated_at REAL, source TEXT)""")
+        if not [r for r in wcon.execute("PRAGMA table_info(insights)") if r[1] == "source"]:
+            wcon.execute("ALTER TABLE insights ADD COLUMN source TEXT")
         if kind == "file":
             r = wcon.execute("SELECT hash FROM files WHERE path=?", (target,)).fetchone()
             h = (r[0] if r else "") or ""
@@ -981,7 +999,8 @@ def save_insight(target: str, kind: str, summary: str, root: str = "") -> str:
         items.sort(key=lambda i: str(i.get("target", "")))  # stable order = reviewable diffs
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(json.dumps(items, indent=2) + "\n", encoding="utf-8")
-        wcon.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)",
+        wcon.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at, source) "
+                     "VALUES(?,?,?,?,?,?,'live')",
                      (target, kind, h, rec["summary"], rec["model"], rec["generated_at"]))
         wcon.commit()
     finally:

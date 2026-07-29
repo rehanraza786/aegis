@@ -34,7 +34,9 @@ con = sqlite3.connect(DB)
 con.row_factory = sqlite3.Row
 con.execute("""CREATE TABLE IF NOT EXISTS insights(
   target TEXT PRIMARY KEY, kind TEXT, hash TEXT, summary TEXT,
-  model TEXT, generated_at REAL)""")
+  model TEXT, generated_at REAL, source TEXT)""")
+if not [r for r in con.execute("PRAGMA table_info(insights)") if r[1] == "source"]:
+    con.execute("ALTER TABLE insights ADD COLUMN source TEXT")
 q = lambda sql, *a: con.execute(sql, a).fetchall()
 svc = lambda p: p.split("/")[0]
 # insights describe production intent: seam facts from test files stay out of

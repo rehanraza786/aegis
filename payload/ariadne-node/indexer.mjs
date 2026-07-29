@@ -91,6 +91,7 @@ const DEFAULTS = {
   extraExtensions: {},
   testPathPatterns: [],
   prodPathPatterns: [],
+  maxInsights: 2000, // ceiling on entries loaded from docs/insights.json
   workers: null, // parallel extract: null = auto (cores-1, capped 8); 1 = sequential
 };
 let config = DEFAULTS;
@@ -373,7 +374,7 @@ function connect(forIndexing = false) {
     -- to be CREATE-IF-NOT-EXISTS'd lazily in enrich and the server instead).
     CREATE TABLE IF NOT EXISTS insights(
       target TEXT PRIMARY KEY, kind TEXT, hash TEXT, summary TEXT,
-      model TEXT, generated_at REAL);
+      model TEXT, generated_at REAL, source TEXT);
     CREATE TABLE IF NOT EXISTS extract_cache(
       path TEXT PRIMARY KEY, hash TEXT, constants TEXT, entities TEXT);
     CREATE TABLE IF NOT EXISTS test_cases(
@@ -1231,10 +1232,24 @@ async function kafkaPass(db, scopePrefixes = null) {
   // both destroyed it silently — the failure save_decision already guards
   // against for ADRs.
   {
+    // Older indexes predate the source column; add it before the first write.
+    if (!db.prepare("SELECT COUNT(*) c FROM pragma_table_info('insights') WHERE name='source'").get().c) {
+      db.exec("ALTER TABLE insights ADD COLUMN source TEXT");
+    }
     const INSIGHT_KINDS = new Set(["module", "file", "topic", "table"]);
-    const ins = db.prepare(`INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at)
-                            VALUES(?,?,?,?,?,?)`);
-    let loaded = 0;
+    // docs/insights.json is committed, so its contents are attacker-controlled
+    // in any repo that takes PRs. Two rules follow. (1) Provenance is ours, not
+    // the file's: an entry cannot claim to be a parsed fact by writing
+    // model:"ariadne-parser", because every row loaded here is stamped
+    // source='file' and its model string is clamped to a display-safe token.
+    // (2) Volume is bounded, so a single commit cannot bloat the index or the
+    // model's context.
+    const MAX_INSIGHTS = Number(config.maxInsights) > 0 ? Number(config.maxInsights) : 2000;
+    const MAX_SUMMARY = 4000;
+    const safeModel = (m) => String(m ?? "assistant").replace(/[^\w.:@-]/g, "").slice(0, 40) || "unknown";
+    const ins = db.prepare(`INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at, source)
+                            VALUES(?,?,?,?,?,?,'file')`);
+    let loaded = 0, dropped = 0;
     // REPO_ROOT as well as each root: in a multi-root workspace REPO_ROOT is
     // the parent, which is where assert_edge and the graph view have always
     // put docs/graph-assertions.json. Reading both means a file placed either
@@ -1251,15 +1266,17 @@ async function kafkaPass(db, scopePrefixes = null) {
       if (!Array.isArray(list)) { log("WARN", `${path.relative(REPO_ROOT, inf)} is not a JSON array; skipped`); continue; }
       for (const i of list) {
         if (!i?.target || !i?.summary) continue;
+        if (loaded >= MAX_INSIGHTS) { dropped += 1; continue; }
         // annotate.mjs also writes topic/table notes; collapsing them to
         // "module" would make explain compute a module hash for a topic
-        ins.run(i.target, INSIGHT_KINDS.has(i.kind) ? i.kind : "module", i.hash ?? "",
-                String(i.summary).slice(0, 4000), i.model ?? "assistant",
-                Number(i.generated_at) || Date.now() / 1000);
+        ins.run(String(i.target).slice(0, 300), INSIGHT_KINDS.has(i.kind) ? i.kind : "module",
+                String(i.hash ?? "").slice(0, 64), String(i.summary).slice(0, MAX_SUMMARY),
+                safeModel(i.model), Number(i.generated_at) || Date.now() / 1000);
         loaded++;
       }
     }
-    if (loaded) log("INFO", `Insights: ${loaded} loaded from docs/insights.json`);
+    if (loaded) log("INFO", `Insights: ${loaded} loaded from docs/insights.json (provenance: file)`);
+    if (dropped) log("WARN", `Insights: ${dropped} entries past the ${MAX_INSIGHTS} cap were ignored; split or prune docs/insights.json`);
   }
 
   // ---- Mnemosyne: decision memory from ADR files (temporal, deterministic) ----

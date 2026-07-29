@@ -145,6 +145,15 @@ try { cfg = JSON.parse(fs.readFileSync(path.join(GR_DIR, "config.json"), "utf8")
 const MAX_ROWS = cfg.maxToolRows ?? 50;
 const MAX_BYTES = cfg.maxToolBytes ?? 24000;
 const SUMMARY_THRESHOLD = cfg.summaryThreshold ?? 40;
+// One insight is prose an assistant or a committed file wrote, so it is the
+// least predictable thing any pack carries. context_pack advertises ~900 bytes;
+// an untruncated 4000-char summary blows that by 4x on its own.
+const MAX_INSIGHT_CHARS = cfg.maxInsightChars ?? 600;
+const clampInsight = (t) => {
+  const s = String(t ?? "");
+  return s.length <= MAX_INSIGHT_CHARS ? s
+    : s.slice(0, MAX_INSIGHT_CHARS) + `… [truncated; call explain("…") for the full insight]`;
+};
 
 const hasWarning = (r) => r && typeof r === "object" &&
   (r.warning || r.warnings || r.unresolved_expressions || r.unmatched_calls);
@@ -472,7 +481,7 @@ tool(server, "context_pack",
     let insight = null;
     try {
       const row = d.prepare("SELECT summary FROM insights WHERE target=? OR target=? LIMIT 1").get(file.path, mod);
-      if (row) insight = row.summary;
+      if (row) insight = clampInsight(row.summary);
     } catch { /* no insights yet */ }
 
     // which tests import this target, and the behaviors they assert
@@ -705,7 +714,10 @@ tool(server, "explain",
     const cur = insightSubjectHash(d, row);
     const stale = row.hash && cur && cur !== row.hash
       ? ` [STALE: ${row.kind} changed since this was generated, re-run enrich]` : "";
-    return `${row.kind} ${row.target} (model: ${row.model})${stale}\n\n${row.summary}`;
+    // Provenance is the indexer's stamp, not the file's claim: an entry in the
+    // committed docs/insights.json cannot present itself as a parsed fact.
+    const prov = row.source === "file" ? "derived, from committed docs/insights.json" : "derived, written live";
+    return `${row.kind} ${row.target} (${prov}; model: ${row.model})${stale}\n\n${clampInsight(row.summary)}`;
   }));
 
 tool(server, "decisions",
@@ -868,10 +880,13 @@ tool(server, "save_insight",
       list.sort((a, b) => String(a.target).localeCompare(String(b.target))); // stable order = reviewable diffs
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, JSON.stringify(list, null, 2) + "\n");
-      d.exec(`CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT, hash TEXT,
-                 summary TEXT, model TEXT, generated_at REAL)`);
-      d.prepare(`INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at)
-                 VALUES(?,?,?,?,?,?)`).run(target, kind, hash, summary, rec.model, rec.generated_at);
+        d.exec(`CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT, hash TEXT,
+                 summary TEXT, model TEXT, generated_at REAL, source TEXT)`);
+      if (!d.prepare("SELECT COUNT(*) c FROM pragma_table_info('insights') WHERE name='source'").get().c) {
+        d.exec("ALTER TABLE insights ADD COLUMN source TEXT");
+      }
+      d.prepare(`INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at, source)
+                 VALUES(?,?,?,?,?,?,'live')`).run(target, kind, hash, summary, rec.model, rec.generated_at);
     } finally { d.close(); }
     return `Insight saved for ${kind} '${target}' to ${rel} (git-versioned) and indexed. It is re-loaded on every reindex and marked stale automatically when content changes; commit the file to share it.`;
   });

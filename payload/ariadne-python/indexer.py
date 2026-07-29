@@ -99,6 +99,8 @@ SKIP_DIRS = {".git", ".ariadne", "node_modules", "vendor", "dist", "build", "tar
              "__pycache__", ".venv", "venv", ".next", "coverage", ".idea", ".vscode"}
 SKIP_DIRS |= set(_cfg.get("skipDirs", []))
 MAX_FILE_BYTES = int(_cfg.get("maxFileBytes", 1_500_000))
+# ceiling on entries loaded from docs/insights.json. parity: Node DEFAULTS.maxInsights
+MAX_INSIGHTS_CFG = int(_cfg.get("maxInsights", 2000)) or 2000
 CHUNK_LINES = int(_cfg.get("chunkLines", 40))
 
 # classifies WHERE a file lives (test vs production), decided once at index time;
@@ -315,7 +317,7 @@ CREATE INDEX IF NOT EXISTS idx_dlinks ON decision_links(target);
 -- to be CREATE-IF-NOT-EXISTS'd lazily in enrich and the server instead).
 CREATE TABLE IF NOT EXISTS insights(
   target TEXT PRIMARY KEY, kind TEXT, hash TEXT, summary TEXT,
-  model TEXT, generated_at REAL);
+  model TEXT, generated_at REAL, source TEXT);
 CREATE TABLE IF NOT EXISTS extract_cache(
   path TEXT PRIMARY KEY, hash TEXT, constants TEXT, entities TEXT);
 CREATE TABLE IF NOT EXISTS test_cases(
@@ -1349,7 +1351,22 @@ def kafka_pass(con, scope_prefixes=None):
     # index.db, which is gitignored, so pull-index.sh and corruption recovery
     # both destroyed it silently -- the failure save_decision already guards
     # against for ADRs.
-    ins_loaded = 0
+    # Older indexes predate the source column; add it before the first write.
+    if not [r for r in con.execute("PRAGMA table_info(insights)") if r[1] == "source"]:
+        con.execute("ALTER TABLE insights ADD COLUMN source TEXT")
+    # docs/insights.json is committed, so its contents are attacker-controlled in
+    # any repo that takes PRs. Two rules follow. (1) Provenance is ours, not the
+    # file's: an entry cannot claim to be a parsed fact by writing
+    # model="ariadne-parser", because every row loaded here is stamped
+    # source='file' and its model string is clamped to a display-safe token.
+    # (2) Volume is bounded, so a single commit cannot bloat the index or the
+    # model's context.
+    MAX_INSIGHTS, MAX_SUMMARY = MAX_INSIGHTS_CFG, 4000
+
+    def _safe_model(m):
+        return re.sub(r"[^\w.:@-]", "", str(m if m is not None else "assistant"))[:40] or "unknown"
+
+    ins_loaded = ins_dropped = 0
     # REPO_ROOT as well as each root: in a multi-root workspace REPO_ROOT is the
     # parent, which is where assert_edge and the graph view have always put
     # docs/graph-assertions.json. Reading both means a file placed either way
@@ -1377,13 +1394,20 @@ def kafka_pass(con, scope_prefixes=None):
                 gen = time.time()
             # annotate.py also writes topic/table notes; collapsing them to
             # "module" would make explain compute a module hash for a topic
+            if ins_loaded >= MAX_INSIGHTS:
+                ins_dropped += 1
+                continue
             kind = i.get("kind") if i.get("kind") in ("module", "file", "topic", "table") else "module"
-            con.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)",
-                        (i["target"], kind, i.get("hash", ""),
-                         str(i["summary"])[:4000], i.get("model", "assistant"), gen))
+            con.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at, source) "
+                        "VALUES(?,?,?,?,?,?,'file')",
+                        (str(i["target"])[:300], kind, str(i.get("hash", ""))[:64],
+                         str(i["summary"])[:MAX_SUMMARY], _safe_model(i.get("model")), gen))
             ins_loaded += 1
     if ins_loaded:
-        log.info("Insights: %d loaded from docs/insights.json", ins_loaded)
+        log.info("Insights: %d loaded from docs/insights.json (provenance: file)", ins_loaded)
+    if ins_dropped:
+        log.warning("Insights: %d entries past the %d cap were ignored; split or prune docs/insights.json",
+                    ins_dropped, MAX_INSIGHTS)
 
     # ---- Mnemosyne: decision memory from ADR files ----
     con.execute("DELETE FROM decisions")

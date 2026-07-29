@@ -47,7 +47,10 @@ const db = new Database(DB_PATH);
 db.pragma("busy_timeout = 10000");
 db.exec(`CREATE TABLE IF NOT EXISTS insights(
   target TEXT PRIMARY KEY, kind TEXT, hash TEXT, summary TEXT,
-  model TEXT, generated_at REAL)`);
+  model TEXT, generated_at REAL, source TEXT)`);
+if (!db.prepare("SELECT COUNT(*) c FROM pragma_table_info('insights') WHERE name='source'").get().c) {
+  db.exec("ALTER TABLE insights ADD COLUMN source TEXT");
+}
 const q = (sql, ...a) => db.prepare(sql).all(...a);
 const svc = (p) => p.split("/")[0];
 // insights describe production intent: seam facts from test files stay out of

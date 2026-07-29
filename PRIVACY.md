@@ -11,7 +11,7 @@ I would rather hear about it than have you assume the rest is true.
 |---|---|---|
 | The graph (`index.db`, plus its WAL, log, and lock) | `.ariadne/` | No. Gitignored, per clone, rebuildable. |
 | SCIP compiler indexes (`*.scip`) | build workspace, or the CI job | No, and they never leave your CI. |
-| Cached insight summaries | inside `index.db` | No. Local, and only exist if you turn enrichment on. |
+| Cached insight summaries | `docs/insights.json`, mirrored into `index.db` | **Yes, deliberately**, like graph assertions. Reviewed in PRs, versioned in git, published in the CI index artifact, and readable by anyone with repo access. Prose written by `save_insight`, the graph view, or enrichment lands here permanently — do not put anything in a summary you would not commit. Delete the file (and gitignore it) if you would rather insights stayed per machine; the index still works, `explain` just has nothing cached to serve. |
 | Graph assertions | `docs/graph-assertions.json` | Yes, deliberately. Reviewed in PRs like any other change. |
 | Decisions (ADRs) | `docs/adr/` | Yes. That is the whole point of them. |
 | Knowledge base (Delphi) | `.github/knowledge/` | Yes by default. Gitignore it if you would rather it stayed per machine. |
@@ -19,6 +19,14 @@ I would rather hear about it than have you assume the rest is true.
 | Generated docs | `docs/generated/` | Your choice. Gitignored by default, since they regenerate on every commit. |
 | Usage ledger | `.ariadne/usage.jsonl` | No. Gitignored with the rest of `.ariadne/`. Per-call byte counts (tool name, bytes served, bytes the spanned files measure on disk) so `usage_report` can tell you what the graph saved — no code, no paths, no content. |
 | Extension state | VS Code globalState | Local. It stores one flag: whether you have seen the setup prompt. |
+
+Insights changed in this respect. They used to live only inside the gitignored
+`index.db`, which meant they were also destroyed by *Pull Team Index* and by
+corruption recovery — durable enough to be trusted, not durable enough to
+survive. Making them shareable is what fixed that, and sharing is a real
+tradeoff: an insight is model-written prose about your architecture, and it now
+persists in git history. Provenance is stamped by the indexer, never by the
+file, so an entry in `docs/insights.json` cannot claim to be a parsed fact.
 
 The graph is a local SQLite file. The MCP server talks to your editor over stdio
 and does not bind a port, so there is nothing listening and nothing to reach.

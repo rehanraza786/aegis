@@ -43,7 +43,9 @@ if a.get("action") == "insight":
     try:
         con.execute("PRAGMA busy_timeout=10000")
         con.execute("""CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT,
-                       hash TEXT, summary TEXT, model TEXT, generated_at REAL)""")
+                       hash TEXT, summary TEXT, model TEXT, generated_at REAL, source TEXT)""")
+        if not [r for r in con.execute("PRAGMA table_info(insights)") if r[1] == "source"]:
+            con.execute("ALTER TABLE insights ADD COLUMN source TEXT")
         if a["kind"] == "file":
             r = con.execute("SELECT hash FROM files WHERE path=?", (a["target"],)).fetchone()
             if not r or not r[0]:
@@ -97,7 +99,8 @@ if a.get("action") == "insight":
         items.sort(key=lambda x: str(x.get("target", "")))  # reviewable diffs
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(json.dumps(items, indent=2) + "\n", encoding="utf-8")
-        con.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)",
+        con.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at, source) "
+                    "VALUES(?,?,?,?,?,?,'live')",
                     (a["target"], a["kind"], h, a["summary"][:4000], f"{author}:graph-view", time.time()))
         con.commit()
     finally:

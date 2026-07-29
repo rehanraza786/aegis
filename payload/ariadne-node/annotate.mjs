@@ -36,7 +36,10 @@ if (a.action === "insight") {
   let rel, shared = true;
   try {
     db.exec(`CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT,
-             hash TEXT, summary TEXT, model TEXT, generated_at REAL)`);
+             hash TEXT, summary TEXT, model TEXT, generated_at REAL, source TEXT)`);
+    if (!db.prepare("SELECT COUNT(*) c FROM pragma_table_info('insights') WHERE name='source'").get().c) {
+      db.exec("ALTER TABLE insights ADD COLUMN source TEXT");
+    }
     let h = "";
     if (a.kind === "file") {
       h = db.prepare("SELECT hash FROM files WHERE path=?").get(a.target)?.hash ?? "";
@@ -82,7 +85,7 @@ if (a.action === "insight") {
     list.sort((x, y) => String(x.target).localeCompare(String(y.target))); // reviewable diffs
     fs.mkdirSync(path.dirname(f), { recursive: true });
     fs.writeFileSync(f, JSON.stringify(list, null, 2) + "\n");
-    db.prepare("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)")
+    db.prepare("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at, source) VALUES(?,?,?,?,?,?,'live')")
       .run(a.target, a.kind, h, a.summary.slice(0, 4000), `${author}:graph-view`, Date.now() / 1000);
   } finally { db.close(); }
   console.log(`Insight saved for ${a.kind} '${a.target}' (provenance: ${author}) and recorded in ${rel}. Served by explain/context_pack immediately; commit the file to share it${shared ? "" : " (tip: pass \"root\":\"<repo>\" to place it inside a git-versioned repo)"}.`);
