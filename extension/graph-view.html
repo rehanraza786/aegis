@@ -579,9 +579,26 @@ function renderAssertions() {
 
 /* dismissed gaps mute with their audit trail; live ones offer a one-line
    dismissal (reason mandatory) through the same reviewed write path */
-function dismissRow(d, gap, key) {
+/* A dismissal names a gap, not a file, so annotate cannot infer which repo it
+   belongs to in a multi-root workspace — it refuses rather than write somewhere
+   git cannot see. The view CAN infer it: every gap is displayed next to a site,
+   and paths are repo-prefixed. Send that as `root`. A wrong guess is harmless:
+   annotate validates it against the real repo list and falls back to tracing
+   the gap itself. */
+function repoOf(p) {
+  const seg = String(p || "").split("/")[0];
+  return seg && seg !== p ? seg : null;
+}
+function anchorOf(...candidates) {
+  for (const c of candidates.flat()) {
+    const r = repoOf(typeof c === "string" ? c : c && c.path);
+    if (r) return r;
+  }
+  return null;
+}
+function dismissRow(d, gap, key, anchor) {
   if (d) return `<div class="muted">dismissed by ${esc(d.by || "?")}: ${esc(d.reason || "")}</div>`;
-  return `<form class="annotate" data-dismiss='${esc(JSON.stringify({ gap, key }))}'>
+  return `<form class="annotate" data-dismiss='${esc(JSON.stringify(anchor ? { gap, key, root: anchor } : { gap, key }))}'>
     <input name="reason" placeholder="Dismiss with reason (≥10 chars — stays auditable)">
     <button type="submit" class="secondary">Dismiss</button></form>`;
 }
@@ -618,9 +635,9 @@ function renderGaps() {
         <textarea name="evidence" placeholder="Evidence (≥20 chars): how did you resolve it? Quote the constant/config/profile."></textarea>
         <select name="confidence"><option>high</option><option selected>medium</option><option>low</option></select>
         <button type="submit">Assert resolved topic</button></form></div>`)}
-    ${gapSection("declared", "Declared in config, unused", "warn", declUnused, (it) => `<div class="gap-item${it.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(it.topic)}</b> — ${esc(it.config_key)} declares it, but no producer or consumer references it.<div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div>${dismissRow(it.dismissed, "declared_unused", it.topic)}</div>`)}
+    ${gapSection("declared", "Declared in config, unused", "warn", declUnused, (it) => `<div class="gap-item${it.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(it.topic)}</b> — ${esc(it.config_key)} declares it, but no producer or consumer references it.<div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div>${dismissRow(it.dismissed, "declared_unused", it.topic, anchorOf(it.path))}</div>`)}
     ${gapSection("drift", "Drift tables", "err", drift, (t) => `<div class="gap-item"><span class="err">⚠</span> <b>${esc(t.table)}</b> — no changeset. Click its node to assert.</div>`)}
-    ${gapSection("orphans", "Orphan topics", "warn", orphans, (t) => `<div class="gap-item${t.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(t.topic)}</b> — ${t.warnings.orphan_produce ? "no consumer" : "no producer"} found. Often a real bug: investigate before silencing.${dismissRow(t.dismissed, "orphan_topic", t.topic)}</div>`)}
+    ${gapSection("orphans", "Orphan topics", "warn", orphans, (t) => `<div class="gap-item${t.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(t.topic)}</b> — ${t.warnings.orphan_produce ? "no consumer" : "no producer"} found. Often a real bug: investigate before silencing.${dismissRow(t.dismissed, "orphan_topic", t.topic, anchorOf(t.producers || [], t.consumers || []))}</div>`)}
     ${gapSection("uncalled", "Endpoints with no caller", "warn", uncalled, (e) => `<div class="gap-item"><span class="warn">⚠</span> ${esc(e.method)} <b>${esc(e.path)}</b><div class="site"><a data-open="${esc(e.file)}:${e.line}">${esc(e.file)}:${e.line}</a></div></div>`,
       `<div class="muted">the full list answers to http_map</div>`)}`;
   g.querySelectorAll("details.gap-sec").forEach((d) => d.addEventListener("toggle", () => {
