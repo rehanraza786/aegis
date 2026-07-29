@@ -43,6 +43,32 @@ function assertionsBase(file) {
   return prefixes.includes(seg) ? path.join(ROOT, seg) : ROOT;
 }
 
+/** Repos a gap key touches. A dismissal has no evidence FILE, but it does have
+ *  evidence: the thing being dismissed. An orphan topic has producers, a drift
+ *  table has access sites, an unresolved expression has a path — and every path
+ *  is repo-prefixed, so the graph can say which repo owns the argument. Same
+ *  rule as everywhere else: anchor to the evidence. */
+function dismissalRepos(gap, key) {
+  const prefixes = rootPrefixes();
+  if (!prefixes.length) return [];
+  const paths = new Set();
+  // "unresolved" keys are already a path:line
+  const asPath = String(key ?? "").split(":")[0];
+  if (asPath.includes("/")) paths.add(asPath);
+  const db = new Database(DB_PATH, { readonly: true });
+  try {
+    const add = (sql, ...args) => {
+      try { for (const r of db.prepare(sql).all(...args)) if (r.path) paths.add(r.path); } catch { /* table may not exist */ }
+    };
+    add("SELECT f.path FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE m.topic=?", key);
+    add("SELECT f.path FROM db_access a JOIN files f ON f.id=a.file_id WHERE a.tbl=?", key);
+    add("SELECT f.path FROM db_defs d JOIN files f ON f.id=d.file_id WHERE d.tbl=?", key);
+    add("SELECT f.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE e.norm=? OR e.path=?", key, key);
+    add("SELECT f.path FROM http_calls c JOIN files f ON f.id=c.file_id WHERE c.norm=? OR c.path=?", key, key);
+  } finally { db.close(); }
+  return [...new Set([...paths].map((p) => p.split("/")[0]))].filter((x) => prefixes.includes(x)).sort();
+}
+
 /** Every place an assertions file may live: parent, then each repo. */
 function assertionFiles() {
   const out = [path.join(ROOT, "docs", "graph-assertions.json")];
@@ -167,21 +193,31 @@ if (a.action === "insight") {
   // the same reviewed file, kind "dismissal"; the export mutes matching gaps.
   if (!a.gap || !a.key) die("dismiss needs gap (e.g. orphan_topic) and key (topic/table/path).");
   if (!(a.reason?.length >= 10)) die("reason must say why this gap is acceptable (10+ chars).");
-  // A dismissal is about a gap key, not a file, so there is no repo to infer.
-  // It goes where the caller says, else the workspace root.
+  // Anchor to the evidence, like every other write. Ambiguity is refused rather
+  // than written to the multi-root parent: that parent is not a git repo, so
+  // "succeeded" there means unversioned, unreviewed, and unshared.
   const prefixes = rootPrefixes();
-  const dismissBase = a.root && prefixes.includes(a.root) ? path.join(ROOT, a.root) : ROOT;
-  const af = path.join(dismissBase, "docs", "graph-assertions.json");
-  if (prefixes.length && dismissBase === ROOT) {
-    console.error(`Note: the workspace root is not a git repo, so this dismissal will not be versioned. Pass "root":"<repo>" to commit it. Repos: ${prefixes.join(", ")}.`);
+  let dismissBase = ROOT;
+  if (prefixes.length) {
+    let pick = a.root && prefixes.includes(a.root) ? a.root : null;
+    if (!pick) {
+      const repos = dismissalRepos(a.gap, a.key);
+      if (repos.length === 1) pick = repos[0];
+      else {
+        const opts = (repos.length ? repos : prefixes).join(", ");
+        die(`'${a.key}' ${repos.length ? `spans ${repos.length} repos` : "could not be traced to a repo"}; pass "root":"<repo>" so the dismissal lands somewhere git-versioned. Candidates: ${opts}.`);
+      }
+    }
+    dismissBase = path.join(ROOT, pick);
   }
+  const af = path.join(dismissBase, "docs", "graph-assertions.json");
   let list = readAssertions(af) ?? [];
   list = list.filter((x) => !(x.kind === "dismissal" && x.gap === a.gap && x.key === a.key));
   list.push({ kind: "dismissal", gap: a.gap, key: a.key, reason: a.reason, author,
     dismissed_at: new Date().toISOString().slice(0, 10) });
   fs.mkdirSync(path.dirname(af), { recursive: true });
   fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
-  console.log(`Dismissed ${a.gap} '${a.key}' (by: ${author}). It mutes in the worklist after reindex but stays auditable; commit the file to share.`);
+  console.log(`Dismissed ${a.gap} '${a.key}' (by: ${author}) in ${path.relative(ROOT, af)}. It mutes in the worklist after reindex but stays auditable; commit the file to share.`);
 
 } else if (a.action === "retract" || a.action === "reaffirm") {
   // lifecycle for existing assertions, keyed by the same natural key the

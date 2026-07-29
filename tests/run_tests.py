@@ -66,6 +66,20 @@ def git(args, cwd):
                           cwd=str(cwd), capture_output=True, text=True)
 
 
+def commit_all_repos(ws: Path, message: str):
+    """Commit every dirty fixture repo.
+
+    Writes that anchor into a repo (assertions, dismissals, insights) leave that
+    worktree dirty until committed -- which is what the tools tell you to do, and
+    what the freshness assertions later in this suite measure.
+    """
+    for d in sorted(ws.iterdir()):
+        if d.is_dir() and (d / ".git").exists():
+            git(["add", "-A"], d)
+            if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=d).returncode != 0:
+                git(["commit", "-qm", message], d)
+
+
 def w(path: Path, content: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -1222,6 +1236,17 @@ await c.close();
     db = sqlite3.connect(ws / ".ariadne" / "index.db")
     code, odm = run(exe + [an, json.dumps({"action": "dismiss", "gap": "orphan_topic",
                                            "key": "audit.q", "reason": "fire-and-forget audit stream; consumer lives outside this workspace"})], ws)
+    check("annotate: dismissal is anchored to the repo that owns the gap",
+          code == 0 and any((d / "docs" / "graph-assertions.json").exists()
+                            for d in ws.iterdir() if d.is_dir() and (d / ".git").exists()), odm[-200:])
+    # an ambiguous key has no single owner, so it must be refused rather than
+    # written to the non-versioned workspace parent
+    code_amb, oamb = run(exe + [an, json.dumps({"action": "dismiss", "gap": "orphan_topic",
+                                                "key": "no.such.topic.anywhere", "reason": "not traceable to any repo at all"})], ws)
+    check("annotate: an untraceable dismissal is refused with candidates, not written to the parent",
+          code_amb != 0 and "root" in oamb
+          and "no.such.topic.anywhere" not in (ws / "docs" / "graph-assertions.json").read_text(encoding="utf-8"), oamb[-200:])
+    commit_all_repos(ws, "record dismissal")
     run(exe + [idx, "--incremental"], ws)
     code2, og2 = run(exe + [ge], ws)
     gx2 = json.loads(og2.strip().splitlines()[-1])

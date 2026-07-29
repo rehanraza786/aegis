@@ -62,6 +62,41 @@ def _assertions_base(file):
     return ROOT / seg if seg in _root_prefixes() else ROOT
 
 
+def _dismissal_repos(gap, key):
+    """Repos a gap key touches.
+
+    A dismissal has no evidence FILE, but it does have evidence: the thing being
+    dismissed. An orphan topic has producers, a drift table has access sites, an
+    unresolved expression has a path -- and every path is repo-prefixed, so the
+    graph can say which repo owns the argument. Same rule as everywhere else:
+    anchor to the evidence. Parity: dismissalRepos in annotate.mjs.
+    """
+    prefixes = _root_prefixes()
+    if not prefixes:
+        return []
+    paths = set()
+    as_path = str(key or "").split(":")[0]
+    if "/" in as_path:
+        paths.add(as_path)
+    con = sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)
+    try:
+        def add(sql, *args):
+            try:
+                for r in con.execute(sql, args):
+                    if r[0]:
+                        paths.add(r[0])
+            except sqlite3.Error:
+                pass  # table may not exist
+        add("SELECT f.path FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE m.topic=?", key)
+        add("SELECT f.path FROM db_access a JOIN files f ON f.id=a.file_id WHERE a.tbl=?", key)
+        add("SELECT f.path FROM db_defs d JOIN files f ON f.id=d.file_id WHERE d.tbl=?", key)
+        add("SELECT f.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE e.norm=? OR e.path=?", key, key)
+        add("SELECT f.path FROM http_calls c JOIN files f ON f.id=c.file_id WHERE c.norm=? OR c.path=?", key, key)
+    finally:
+        con.close()
+    return sorted({p.split("/")[0] for p in paths} & set(prefixes))
+
+
 def _assertion_files():
     """Every place an assertions file may live: parent, then each repo."""
     out = [ROOT / "docs" / "graph-assertions.json"]
@@ -212,21 +247,30 @@ elif a.get("action") == "dismiss":
         die("dismiss needs gap (e.g. orphan_topic) and key (topic/table/path).")
     if len(a.get("reason", "")) < 10:
         die("reason must say why this gap is acceptable (10+ chars).")
-    # A dismissal is about a gap key, not a file, so there is no repo to infer.
-    # It goes where the caller says, else the workspace root.
+    # Anchor to the evidence, like every other write. Ambiguity is refused rather
+    # than written to the multi-root parent: that parent is not a git repo, so
+    # "succeeded" there means unversioned, unreviewed, and unshared.
     _prefixes = _root_prefixes()
-    _base = ROOT / a["root"] if a.get("root") in _prefixes else ROOT
+    _base = ROOT
+    if _prefixes:
+        pick = a["root"] if a.get("root") in _prefixes else None
+        if not pick:
+            repos = _dismissal_repos(a["gap"], a["key"])
+            if len(repos) == 1:
+                pick = repos[0]
+            else:
+                opts = ", ".join(repos or _prefixes)
+                die(f"'{a['key']}' " + (f"spans {len(repos)} repos" if repos else "could not be traced to a repo")
+                    + f'; pass "root":"<repo>" so the dismissal lands somewhere git-versioned. Candidates: {opts}.')
+        _base = ROOT / pick
     af = _base / "docs" / "graph-assertions.json"
-    if _prefixes and _base == ROOT:
-        print('Note: the workspace root is not a git repo, so this dismissal will not be versioned. '
-              f'Pass "root":"<repo>" to commit it. Repos: {", ".join(_prefixes)}.', file=sys.stderr)
     alist = _read_assertions(af) or []
     alist = [x for x in alist if not (x.get("kind") == "dismissal" and x.get("gap") == a["gap"] and x.get("key") == a["key"])]
     alist.append({"kind": "dismissal", "gap": a["gap"], "key": a["key"], "reason": a["reason"],
                   "author": author, "dismissed_at": datetime.date.today().isoformat()})
     af.parent.mkdir(parents=True, exist_ok=True)
     af.write_text(json.dumps(alist, indent=2) + "\n", encoding="utf-8")
-    print(f"Dismissed {a['gap']} '{a['key']}' (by: {author}). It mutes in the worklist after reindex but stays auditable; commit the file to share.")
+    print(f"Dismissed {a['gap']} '{a['key']}' (by: {author}) in {af.relative_to(ROOT) if str(af).startswith(str(ROOT)) else af}. It mutes in the worklist after reindex but stays auditable; commit the file to share.")
 
 elif a.get("action") in ("retract", "reaffirm"):
     # lifecycle for existing assertions, keyed by the same natural key the
