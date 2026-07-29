@@ -394,7 +394,7 @@ tool(server, "index_status",
   {}, () => statusData(true));
 
 tool(server, "search_code",
-  "Full-text search over code. Returns chunks with path and start line. Use for 'where is X handled' instead of reading files.",
+  "Full-text search over code, returning chunks with path and line. Use for 'where is X handled or configured' instead of opening files.",
   { query: z.string().min(2).max(200), limit: z.number().int().optional() },
   ({ query, limit }) => withDb((d) => {
     const safe = '"' + query.replaceAll('"', '""') + '"';
@@ -450,7 +450,7 @@ function resolveTarget(d, target) {
 }
 
 tool(server, "context_pack",
-  "ONE call for a file, class, or method: outline, callers, blast radius, the topics/tables/endpoints it touches, governing decisions, cached insight, covering tests. Use INSTEAD of six lookups when starting work.",
+  "ONE call to START WORK on a file, class, or method: outline, callers, blast radius, the topics/tables/endpoints it touches, governing decisions, cached insight, covering tests. Use INSTEAD of six lookups.",
   { target: z.string().min(1).max(300) },
   ({ target }) => withDb((d) => {
     // resolve target -> a file (accept a path, or a symbol name)
@@ -533,7 +533,7 @@ tool(server, "context_pack",
   }));
 
 tool(server, "find_symbol",
-  "Look up functions/classes/types by name (substring). Returns kind, signature, file, line.",
+  "Find a function, class, or type BY NAME when you do not know which file holds it. Returns kind, signature, path, line.",
   { name: z.string().min(1).max(120), exact: z.boolean().optional() },
   ({ name, exact }) => withDb((d) => {
     const rows = exact
@@ -545,7 +545,7 @@ tool(server, "find_symbol",
   }));
 
 tool(server, "file_outline",
-  "A file's skeleton: symbols with signatures, imports, importers. Use INSTEAD of reading the file when you only need structure.",
+  "A file's skeleton: its symbols with signatures, plus who imports it. Use INSTEAD of reading the file when you only need structure.",
   { path: z.string().min(1).max(500) },
   ({ path: p }) => withDb((d) => {
     const f = d.prepare("SELECT * FROM files WHERE path=?").get(p);
@@ -597,7 +597,7 @@ tool(server, "blast_radius",
   ({ path: p, depth }) => withDb((d) => { noteFiles([p]); return blastData(d, p, clamp(depth ?? 2, 1, 5)) ?? "File not in index."; }));
 
 tool(server, "dependencies",
-  "What a file imports (direct in-repo dependencies).",
+  "What a file IMPORTS: its direct in-repo dependencies, nothing else.",
   { path: z.string().min(1).max(500) },
   ({ path: p }) => withDb((d) => {
     const rows = d.prepare(
@@ -634,7 +634,7 @@ tool(server, "hotspots",
                GROUP BY f.id ORDER BY dependents DESC LIMIT ?`).all(clamp(limit ?? 10, 1, 30))));
 
 tool(server, "find_callers",
-  "Who calls this function/method, with file and line. HEURISTIC (name match); use find_references before claiming anything is or is not used.",
+  "Who CALLS this function or method, with file and line. HEURISTIC name match: explore with this, then confirm with find_references.",
   { name: z.string().min(1).max(120), limit: z.number().int().optional() },
   ({ name, limit }) => withDb((d) => {
     const rows = d.prepare(
@@ -655,7 +655,7 @@ tool(server, "find_callers",
   }));
 
 tool(server, "find_callees",
-  "What this function/method calls, with lines. HEURISTIC (name match).",
+  "What this function or method CALLS OUT TO, with lines. HEURISTIC name match; the outgoing direction of find_callers.",
   { name: z.string().min(1).max(120) },
   ({ name }) => withDb((d) => {
     const rows = d.prepare(
@@ -666,7 +666,7 @@ tool(server, "find_callees",
   }));
 
 tool(server, "find_references",
-  "COMPILER-GRADE (needs SCIP): every real use of a symbol, resolved by the compiler. Definition plus reference sites. Authoritative where find_callers guesses.",
+  "COMPILER-GRADE (needs SCIP): every place a symbol is USED ANYWHERE, resolved through types, including Lombok-generated members. The only tool certain enough to conclude something is unused and safe to delete.",
   { name: z.string().min(1).max(200), limit: z.number().int().optional() },
   ({ name, limit }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='scip_refs'").get()) {
@@ -683,7 +683,7 @@ tool(server, "find_references",
   }));
 
 tool(server, "goto_definition",
-  "COMPILER-GRADE (needs SCIP): exact definition of a symbol with its doc comment. Beats find_symbol for overloaded or common names.",
+  "COMPILER-GRADE (needs SCIP): jump to a symbol's exact DEFINITION with its doc comment. Beats find_symbol on overloaded or duplicated names.",
   { name: z.string().min(1).max(200) },
   ({ name }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='scip_defs'").get()) {
@@ -743,7 +743,7 @@ tool(server, "explain",
   }));
 
 tool(server, "decisions",
-  "Architectural decisions with temporal validity. Filter by text, governed target, status, or as_of for time travel. Parsed from ADR markdown.",
+  "Architectural decisions and whether they are STILL CURRENT: filter by text, governed target, status, or as_of to see what was in force on a date. Parsed from ADR markdown.",
   { query: z.string().max(200).optional(), target: z.string().max(200).optional(),
     status: z.string().max(30).optional(), as_of: z.string().max(10).optional() },
   ({ query, target, status, as_of }) => withDb((d) => {
@@ -767,7 +767,7 @@ tool(server, "decisions",
   }));
 
 tool(server, "decision_trace",
-  "One decision's lineage: supersession chain, plus governed artifacts flagged when they no longer exist in the graph.",
+  "One ADR's lineage: what SUPERSEDED what and when, plus the artifacts it governs, flagged when they no longer exist in the graph.",
   { id: z.string().min(1).max(60) },
   ({ id }) => withDb((d) => {
     const rec = d.prepare("SELECT * FROM decisions WHERE id=?").get(id.toUpperCase());
@@ -1002,12 +1002,12 @@ function gapsData(d, n) {
 }
 
 tool(server, "graph_gaps",
-  "Where static analysis is BLIND: unresolved topic/SQL expressions, orphan topics and endpoints, drift tables, unmatched calls, each with file:line. Record answers with assert_edge.",
+  "Where static analysis is BLIND and CANNOT RESOLVE what it sees: dynamic topic/SQL expressions, orphan topics and endpoints, drift tables, unmatched calls, each with file:line. Answer them with assert_edge.",
   { limit: z.number().int().optional() },
   ({ limit }) => withDb((d) => gapsData(d, clamp(limit ?? 20, 1, 60))));
 
 tool(server, "assert_edge",
-  "Record a fact you DERIVED by reading code that static analysis could not resolve. Enters the graph tagged derived, never as parsed. Requires evidence: quote the code that convinced you. Only assert what you can defend.",
+  "RECORD a fact you DERIVED by reading code the parser could not see: a RUNTIME-ASSEMBLED topic name, a dynamically built table. Enters the graph tagged derived, never parsed. Requires evidence: quote the code that convinced you.",
   {
     kind: z.enum(["kafka", "db", "http_endpoint", "http_call"]),
     file: z.string().min(1).max(400),
@@ -1058,7 +1058,7 @@ tool(server, "assert_edge",
   });
 
 tool(server, "message_flow",
-  "Messaging topology (Kafka; RabbitMQ/JMS/SQS/NATS labeled by system). No args = every topic's producers and consumers with file:line, plus orphans. Pass topic for one flow.",
+  "Messaging topology (Kafka; RabbitMQ/JMS/SQS/NATS labeled by system). No args = every TOPIC's producers and consumers with file:line, plus orphans. Pass topic for one flow.",
   { topic: z.string().max(200).optional() },
   ({ topic }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='msg_edges'").get()) {
@@ -1153,7 +1153,7 @@ tool(server, "message_flow",
   }));
 
 tool(server, "db_map",
-  "Database topology: each table's Liquibase changesets and every code site touching it, with read/write mode. No args = full map plus drift warnings. Pass table for one table.",
+  "Database topology: each table's Liquibase changesets and every code site touching it, read or write. No args = full map plus DRIFT (tables code touches that no changelog defines, and tables defined but never touched). Pass table for one.",
   { table: z.string().max(200).optional() },
   ({ table }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='db_defs'").get()) {
@@ -1258,7 +1258,7 @@ function httpCorrelation(d, prodOnly, hasTest) {
 }
 
 tool(server, "http_map",
-  "HTTP seam: REST endpoints correlated with their callers on method + normalized path. No args = full map plus orphans. Pass path to filter.",
+  "HTTP seam: REST endpoints correlated with their callers on method + normalized path. No args = full map plus orphans (endpoints NOBODY CALLS, calls hitting no known endpoint). Pass path to filter.",
   { path: z.string().max(300).optional() },
   ({ path: pf }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='http_endpoints'").get()) {

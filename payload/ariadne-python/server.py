@@ -478,7 +478,7 @@ def index_status() -> str:
 
 @mcp.tool(annotations=RO)
 def search_code(query: str, limit: int = 8) -> str:
-    """Full-text search over code. Returns chunks with path and start line. Use for 'where is X handled' instead of reading files."""
+    """Full-text search over code, returning chunks with path and line. Use for 'where is X handled or configured' instead of opening files."""
     con = db()
     safe = '"' + query.replace('"', '""') + '"'
     rows = con.execute(
@@ -518,7 +518,7 @@ def _resolve_target(con, target):
 
 @mcp.tool(annotations=RO)
 def context_pack(target: str) -> str:
-    """ONE call for a file, class, or method: outline, callers, blast radius, the topics/tables/endpoints it touches, governing decisions, cached insight, covering tests. Use INSTEAD of six lookups when starting work."""
+    """ONE call to START WORK on a file, class, or method: outline, callers, blast radius, the topics/tables/endpoints it touches, governing decisions, cached insight, covering tests. Use INSTEAD of six lookups."""
     con = db()
     hit = _resolve_target(con, target)
     if not hit:
@@ -609,7 +609,7 @@ def context_pack(target: str) -> str:
 
 @mcp.tool(annotations=RO)
 def find_symbol(name: str, exact: bool = False) -> str:
-    """Look up functions/classes/types by name (substring). Returns kind, signature, file, line."""
+    """Find a function, class, or type BY NAME when you do not know which file holds it. Returns kind, signature, path, line."""
     con = db()
     q = name if exact else f"%{name}%"
     op = "=" if exact else "LIKE"
@@ -622,7 +622,7 @@ def find_symbol(name: str, exact: bool = False) -> str:
 
 @mcp.tool(annotations=RO)
 def file_outline(path: str) -> str:
-    """A file's skeleton: symbols with signatures, imports, importers. Use INSTEAD of reading the file when you only need structure."""
+    """A file's skeleton: its symbols with signatures, plus who imports it. Use INSTEAD of reading the file when you only need structure."""
     con = db()
     f = con.execute("SELECT * FROM files WHERE path=?", (path,)).fetchone()
     if not f:
@@ -689,7 +689,7 @@ def blast_radius(path: str, depth: int = 2) -> str:
 
 @mcp.tool(annotations=RO)
 def dependencies(path: str) -> str:
-    """What a file imports (direct in-repo dependencies)."""
+    """What a file IMPORTS: its direct in-repo dependencies, nothing else."""
     con = db()
     rows = con.execute(
         "SELECT f2.path FROM files f JOIN edges e ON e.src=f.id JOIN files f2 ON f2.id=e.dst "
@@ -727,7 +727,7 @@ def hotspots(limit: int = 10) -> str:
 
 @mcp.tool(annotations=RO)
 def find_callers(name: str, limit: int = 40) -> str:
-    """Who calls this function/method, with file and line. HEURISTIC (name match); use find_references before claiming anything is or is not used."""
+    """Who CALLS this function or method, with file and line. HEURISTIC name match: explore with this, then confirm with find_references."""
     con = db()
     rows = con.execute(
         "SELECT s.name AS caller, s.parent, f.path, c.line FROM calls c "
@@ -751,7 +751,7 @@ def find_callers(name: str, limit: int = 40) -> str:
 
 @mcp.tool(annotations=RO)
 def find_callees(name: str) -> str:
-    """What this function/method calls, with lines. HEURISTIC (name match)."""
+    """What this function or method CALLS OUT TO, with lines. HEURISTIC name match; the outgoing direction of find_callers."""
     con = db()
     rows = con.execute(
         "SELECT DISTINCT c.callee, c.line FROM calls c JOIN symbols s ON s.id=c.src_symbol "
@@ -761,7 +761,7 @@ def find_callees(name: str) -> str:
 
 @mcp.tool(annotations=RO)
 def find_references(name: str, limit: int = 40) -> str:
-    """COMPILER-GRADE (needs SCIP): every real use of a symbol, resolved by the compiler. Definition plus reference sites. Authoritative where find_callers guesses."""
+    """COMPILER-GRADE (needs SCIP): every place a symbol is USED ANYWHERE, resolved through types, including Lombok-generated members. The only tool certain enough to conclude something is unused and safe to delete."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='scip_refs'").fetchone():
         return "SCIP data not ingested. Run scip-typescript/scip-java then .ariadne/scip_ingest.py (see README). Falling back: use search_code instead."
@@ -784,7 +784,7 @@ def find_references(name: str, limit: int = 40) -> str:
 
 @mcp.tool(annotations=RO)
 def goto_definition(name: str) -> str:
-    """COMPILER-GRADE (needs SCIP): exact definition of a symbol with its doc comment. Beats find_symbol for overloaded or common names."""
+    """COMPILER-GRADE (needs SCIP): jump to a symbol's exact DEFINITION with its doc comment. Beats find_symbol on overloaded or duplicated names."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='scip_defs'").fetchone():
         return "SCIP data not ingested; use find_symbol instead."
@@ -826,7 +826,7 @@ def explain(target: str) -> str:
 
 @mcp.tool(annotations=RO)
 def decisions(query: str = "", target: str = "", status: str = "", as_of: str = "") -> str:
-    """Architectural decisions with temporal validity. Filter by text, governed target, status, or as_of for time travel. Parsed from ADR markdown."""
+    """Architectural decisions and whether they are STILL CURRENT: filter by text, governed target, status, or as_of to see what was in force on a date. Parsed from ADR markdown."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='decisions'").fetchone():
         return "No decision data; reindex with the current Ariadne"
@@ -857,7 +857,7 @@ def decisions(query: str = "", target: str = "", status: str = "", as_of: str = 
 
 @mcp.tool(annotations=RO)
 def decision_trace(id: str) -> str:
-    """One decision's lineage: supersession chain, plus governed artifacts flagged when they no longer exist in the graph."""
+    """One ADR's lineage: what SUPERSEDED what and when, plus the artifacts it governs, flagged when they no longer exist in the graph."""
     con = db()
     rec = con.execute("SELECT * FROM decisions WHERE id=?", (id.upper(),)).fetchone()
     if not rec:
@@ -1157,7 +1157,7 @@ def _gaps_data(con, n):
 
 @mcp.tool(annotations=RO)
 def graph_gaps(limit: int = 20) -> str:
-    """Where static analysis is BLIND: unresolved topic/SQL expressions, orphan topics and endpoints, drift tables, unmatched calls, each with file:line. Record answers with assert_edge."""
+    """Where static analysis is BLIND and CANNOT RESOLVE what it sees: dynamic topic/SQL expressions, orphan topics and endpoints, drift tables, unmatched calls, each with file:line. Answer them with assert_edge."""
     return _gaps_data(db(), _clamp(limit, 1, 60))
 
 
@@ -1165,7 +1165,7 @@ def graph_gaps(limit: int = 20) -> str:
 def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str = "medium",
                 topic: str = "", direction: str = "", table: str = "", mode: str = "",
                 method: str = "", path: str = "") -> str:
-    """Record a fact you DERIVED by reading code that static analysis could not resolve. Enters the graph tagged derived, never as parsed. Requires evidence: quote the code that convinced you. Only assert what you can defend."""
+    """RECORD a fact you DERIVED by reading code the parser could not see: a RUNTIME-ASSEMBLED topic name, a dynamically built table. Enters the graph tagged derived, never parsed. Requires evidence: quote the code that convinced you."""
     if kind not in ("kafka", "db", "http_endpoint", "http_call"):
         return "kind must be kafka|db|http_endpoint|http_call."
     if len(evidence) < 20:
@@ -1216,7 +1216,7 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
 
 @mcp.tool(annotations=RO)
 def message_flow(topic: str = "") -> str:
-    """Messaging topology (Kafka; RabbitMQ/JMS/SQS/NATS labeled by system). No args = every topic's producers and consumers with file:line, plus orphans. Pass topic for one flow."""
+    """Messaging topology (Kafka; RabbitMQ/JMS/SQS/NATS labeled by system). No args = every TOPIC's producers and consumers with file:line, plus orphans. Pass topic for one flow."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='msg_edges'").fetchone():
         return "No message-edge data; reindex with the current Ariadne"
@@ -1326,7 +1326,7 @@ def message_flow(topic: str = "") -> str:
 
 @mcp.tool(annotations=RO)
 def db_map(table: str = "") -> str:
-    """Database topology: each table's Liquibase changesets and every code site touching it, with read/write mode. No args = full map plus drift warnings. Pass table for one table."""
+    """Database topology: each table's Liquibase changesets and every code site touching it, read or write. No args = full map plus DRIFT (tables code touches that no changelog defines, and tables defined but never touched). Pass table for one."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='db_defs'").fetchone():
         return "No DB-layer data; reindex with the current Ariadne"
@@ -1440,7 +1440,7 @@ def _http_correlation(con, prod_only, has_test):
 
 @mcp.tool(annotations=RO)
 def http_map(path: str = "") -> str:
-    """HTTP seam: REST endpoints correlated with their callers on method + normalized path. No args = full map plus orphans. Pass path to filter."""
+    """HTTP seam: REST endpoints correlated with their callers on method + normalized path. No args = full map plus orphans (endpoints NOBODY CALLS, calls hitting no known endpoint). Pass path to filter."""
     from http_extract import paths_match
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='http_endpoints'").fetchone():

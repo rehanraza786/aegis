@@ -2012,8 +2012,12 @@ asyncio.run(main())
     # The tool list is re-sent to the model on EVERY request, so description
     # length is a fixed per-turn cost paid whether or not a tool is called.
     # These are ratchets, not targets: they stop the surface growing back
-    # unnoticed. Raise them deliberately, in a commit that says why.
-    NODE_DESC_BUDGET, PY_DESC_BUDGET, PER_TOOL_CEILING = 3900, 3900, 230
+    # unnoticed. Raise them deliberately, in a commit that says why. The
+    # tool-selection eval below is the opposing force — it sets the FLOOR, by
+    # failing when a description is too thin to be told apart from its
+    # neighbours. Between them the descriptions can only get shorter until they
+    # stop working, and no shorter.
+    NODE_DESC_BUDGET, PY_DESC_BUDGET, PER_TOOL_CEILING = 4250, 4250, 240
     node_desc = _re2.findall(r'tool\(server,\s*"[a-z][a-z0-9_]*",\s*\n?\s*"((?:[^"\\]|\\.)*)"', node_src)
     py_desc = _re2.findall(
         r'@mcp\.tool\(annotations=(?:RO|WR)\)\s*\n(?:async )?def [a-z][a-z0-9_]*\([^)]*\)[^:]*:\s*\n\s*"""(.*?)"""',
@@ -2043,6 +2047,79 @@ asyncio.run(main())
         "budget",             # results are capped
     ]
     _lost = [f for f in _must_survive if f not in _reference]
+    # ---- tool-selection eval: the descriptions must still discriminate ----
+    # Trimming descriptions trades tokens for selection accuracy, and until now
+    # nothing measured the second half. This is a PROXY, not a model eval: it
+    # asserts the discriminating vocabulary is still present and still lands on
+    # the intended tool under a naive term-overlap score. A model may do better;
+    # it cannot do better with words that are gone.
+    # Function words only. An earlier version also stopped use/used/call/find,
+    # which are the most discriminating verbs in this domain — the filter was
+    # deleting exactly the signal it was meant to measure.
+    _STOP = set("a an and the to of for in on it its is are was with by from that this "
+                "there here then than so but or if as at into out over about "
+                "i my me you your we our they their not no can could should would "
+                "when how any some all more most one".split())
+
+    def _stem(w):  # crude, deterministic, enough to make "used"/"uses" agree
+        for suf in ("ing", "ers", "ed", "es", "s"):
+            if len(w) > len(suf) + 3 and w.endswith(suf):
+                return w[: -len(suf)]
+        return w
+
+    def _terms(t):
+        return {_stem(w) for w in _re2.findall(r"[a-z_]{3,}", t.lower()) if w not in _STOP}
+
+    _desc_by_tool = {n: d for n, d in _re2.findall(
+        r'tool\(server,\s*"([a-z][a-z0-9_]*)",\s*\n?\s*"((?:[^"\\]|\\.)*)"', node_src)}
+    TOOL_ROUTES = [
+        ("is this method used anywhere, I need to be certain before deleting it", "find_references"),
+        ("who calls this function, just exploring", "find_callers"),
+        ("what does this method call", "find_callees"),
+        ("jump to the exact definition of this overloaded symbol", "goto_definition"),
+        ("find the class by name, I don't know which file", "find_symbol"),
+        ("I'm about to start work on OrderService, load everything about it", "context_pack"),
+        ("I have a task but no idea which files, find me a starting set", "plan_context"),
+        ("before I propose this diff, what does editing these files put at risk", "change_check"),
+        ("everything that transitively depends on this shared file", "blast_radius"),
+        ("what does this file import", "dependencies"),
+        ("the skeleton of this file without reading it", "file_outline"),
+        ("which topics have producers but no consumers", "message_flow"),
+        ("which tables does code touch that no changelog defines", "db_map"),
+        ("which endpoints does nobody call", "http_map"),
+        ("why would editing this file affect that consumer", "explain_path"),
+        ("what is this module for, its intent and gotchas", "explain"),
+        ("what did we decide about kafka and is it still current", "decisions"),
+        ("what superseded ADR-007", "decision_trace"),
+        ("what could static analysis not resolve", "graph_gaps"),
+        ("record that I worked out this runtime-assembled topic name", "assert_edge"),
+        ("is the index stale", "index_status"),
+        ("full-text search for where retries are configured", "search_code"),
+    ]
+    _mis = []
+    for utter, want in TOOL_ROUTES:
+        ut = _terms(utter)
+        scored = sorted(((len(ut & _terms(d)), n) for n, d in _desc_by_tool.items()), reverse=True)
+        top = [n for sc, n in scored if sc == scored[0][0]]
+        # a tie is a failure: two tools the words cannot separate is exactly the
+        # ambiguity this eval exists to catch
+        if want not in top or len(top) > 1:
+            _mis.append(f"{want} lost to {'/'.join(t for t in top if t != want)[:34]} ({utter[:26]})")
+    check(f"tool-selection eval: {len(TOOL_ROUTES)} requests land on the intended tool",
+          not _mis, "; ".join(_mis[:5]))
+
+    # Confusable tools must each own a term no sibling has, or the shorter text
+    # has stopped distinguishing them at all.
+    for _cluster in (["find_callers", "find_references", "goto_definition", "find_symbol"],
+                     ["context_pack", "plan_context", "change_check"],
+                     ["message_flow", "db_map", "http_map"],
+                     ["explain", "explain_path"]):
+        _dull = [t for t in _cluster
+                 if not (_terms(_desc_by_tool.get(t, "")) - set().union(
+                     *(_terms(_desc_by_tool.get(o, "")) for o in _cluster if o != t)))]
+        check(f"confusable tools stay distinguishable: {'/'.join(_cluster)}",
+              not _dull, "no unique term: " + ", ".join(_dull))
+
     check("nothing trimmed from a tool description was lost from the reference tier",
           not _lost, "missing from TOOLS.md and aegis-help: " + ", ".join(_lost))
     # descriptions must not silently diverge between editions: the same agent
