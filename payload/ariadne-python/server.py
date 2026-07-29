@@ -472,13 +472,13 @@ def _status_data(live=False):
 
 @mcp.tool(annotations=RO)
 def index_status() -> str:
-    """Check index freshness: file/symbol/edge counts, whether the indexed git SHA matches HEAD, and dirty_worktree (uncommitted paths — the incremental indexer absorbs them; fresh:false until it has). Call this first if results seem stale."""
+    """Index freshness: counts, indexed SHA vs HEAD, dirty_worktree. Call first if results seem stale."""
     return _status_data(live=True)
 
 
 @mcp.tool(annotations=RO)
 def search_code(query: str, limit: int = 8) -> str:
-    """Full-text search over all code. Returns matching chunks with path and start line. Use for 'where is X handled/configured/used' questions instead of reading files."""
+    """Full-text search over code. Returns chunks with path and start line. Use for 'where is X handled' instead of reading files."""
     con = db()
     safe = '"' + query.replace('"', '""') + '"'
     rows = con.execute(
@@ -518,7 +518,7 @@ def _resolve_target(con, target):
 
 @mcp.tool(annotations=RO)
 def context_pack(target: str) -> str:
-    """ONE call that assembles everything relevant to working on a target (file path, class, or method): outline, callers, blast radius, the Kafka topics / DB tables / HTTP endpoints it touches, the decisions governing those, and any cached insight. Use INSTEAD of six separate lookups when starting work."""
+    """ONE call for a file, class, or method: outline, callers, blast radius, the topics/tables/endpoints it touches, governing decisions, cached insight, covering tests. Use INSTEAD of six lookups when starting work."""
     con = db()
     hit = _resolve_target(con, target)
     if not hit:
@@ -609,7 +609,7 @@ def context_pack(target: str) -> str:
 
 @mcp.tool(annotations=RO)
 def find_symbol(name: str, exact: bool = False) -> str:
-    """Look up functions/classes/types by name (substring by default). Returns kind, signature, file, and line, enough to reference or jump to it without reading the file."""
+    """Look up functions/classes/types by name (substring). Returns kind, signature, file, line."""
     con = db()
     q = name if exact else f"%{name}%"
     op = "=" if exact else "LIKE"
@@ -622,7 +622,7 @@ def find_symbol(name: str, exact: bool = False) -> str:
 
 @mcp.tool(annotations=RO)
 def file_outline(path: str) -> str:
-    """Get a file's skeleton: language, line count, all symbols with signatures, plus its imports and importers. Use INSTEAD of reading the file when you only need its structure."""
+    """A file's skeleton: symbols with signatures, imports, importers. Use INSTEAD of reading the file when you only need structure."""
     con = db()
     f = con.execute("SELECT * FROM files WHERE path=?", (path,)).fetchone()
     if not f:
@@ -681,7 +681,7 @@ def _blast_data(con, path, depth):
 
 @mcp.tool(annotations=RO)
 def blast_radius(path: str, depth: int = 2) -> str:
-    """Find everything that transitively depends on a file (reverse dependency BFS up to `depth`). Call BEFORE modifying shared code to know what to re-test."""
+    """Everything that transitively depends on a file. Call BEFORE modifying shared code to know what to re-test."""
     con = db()
     note_files([path])
     return _blast_data(con, path, max(1, min(depth, 5))) or "File not in index."
@@ -689,7 +689,7 @@ def blast_radius(path: str, depth: int = 2) -> str:
 
 @mcp.tool(annotations=RO)
 def dependencies(path: str) -> str:
-    """List what a file imports (its direct dependencies in this repo)."""
+    """What a file imports (direct in-repo dependencies)."""
     con = db()
     rows = con.execute(
         "SELECT f2.path FROM files f JOIN edges e ON e.src=f.id JOIN files f2 ON f2.id=e.dst "
@@ -699,7 +699,7 @@ def dependencies(path: str) -> str:
 
 @mcp.tool(annotations=RO)
 def module_map(prefix: str = "") -> str:
-    """Directory-level overview: for each top-level directory (or under `prefix`), file count, main languages, and symbol count. Use as the first call to orient in an unfamiliar repo."""
+    """Directory overview: file count and main languages per top-level dir (optionally under prefix). First call in an unfamiliar repo."""
     con = db()
     rows = con.execute("SELECT path, lang FROM files WHERE path >= ? AND path < ?", _prefix_range(prefix)).fetchall()
     agg = {}
@@ -717,7 +717,7 @@ def module_map(prefix: str = "") -> str:
 
 @mcp.tool(annotations=RO)
 def hotspots(limit: int = 10) -> str:
-    """The most-depended-on files in the repo (highest in-degree). These are the highest-risk files to change and the best places to start understanding the architecture."""
+    """Most-depended-on files (highest in-degree). Highest risk to change."""
     con = db()
     rows = con.execute(
         "SELECT f.path, COUNT(e.src) dependents FROM files f JOIN edges e ON e.dst=f.id "
@@ -727,7 +727,7 @@ def hotspots(limit: int = 10) -> str:
 
 @mcp.tool(annotations=RO)
 def find_callers(name: str, limit: int = 40) -> str:
-    """AST-based: who calls this function/method? Heuristic (matched by name); for compiler-resolved precision use find_references (SCIP)."""
+    """Who calls this function/method, with file and line. HEURISTIC (name match); use find_references before claiming anything is or is not used."""
     con = db()
     rows = con.execute(
         "SELECT s.name AS caller, s.parent, f.path, c.line FROM calls c "
@@ -751,7 +751,7 @@ def find_callers(name: str, limit: int = 40) -> str:
 
 @mcp.tool(annotations=RO)
 def find_callees(name: str) -> str:
-    """AST-based: what does this function/method call? Heuristic (by name)."""
+    """What this function/method calls, with lines. HEURISTIC (name match)."""
     con = db()
     rows = con.execute(
         "SELECT DISTINCT c.callee, c.line FROM calls c JOIN symbols s ON s.id=c.src_symbol "
@@ -761,7 +761,7 @@ def find_callees(name: str) -> str:
 
 @mcp.tool(annotations=RO)
 def find_references(name: str, limit: int = 40) -> str:
-    """COMPILER-GRADE (requires SCIP ingest): find every place a symbol is actually used, resolved by the compiler, not text matching. Give a function/class/method name. Returns definition site + all reference sites."""
+    """COMPILER-GRADE (needs SCIP): every real use of a symbol, resolved by the compiler. Definition plus reference sites. Authoritative where find_callers guesses."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='scip_refs'").fetchone():
         return "SCIP data not ingested. Run scip-typescript/scip-java then .ariadne/scip_ingest.py (see README). Falling back: use search_code instead."
@@ -784,7 +784,7 @@ def find_references(name: str, limit: int = 40) -> str:
 
 @mcp.tool(annotations=RO)
 def goto_definition(name: str) -> str:
-    """COMPILER-GRADE (requires SCIP ingest): jump to the exact definition of a symbol, with its doc comment. More precise than find_symbol for overloaded/common names."""
+    """COMPILER-GRADE (needs SCIP): exact definition of a symbol with its doc comment. Beats find_symbol for overloaded or common names."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='scip_defs'").fetchone():
         return "SCIP data not ingested; use find_symbol instead."
@@ -796,7 +796,7 @@ def goto_definition(name: str) -> str:
 
 @mcp.tool(annotations=RO)
 def explain(target: str) -> str:
-    """Cached LLM insight for a module or file: intent, responsibilities, system connections, gotchas. Hash-cached, regenerated only when content changes."""
+    """Cached insight for a module or file: intent, responsibilities, connections, gotchas. Says so when none exists or it is stale."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='insights'").fetchone():
         return ("No insights yet. Run enrichment: python3 .ariadne/enrich.py "
@@ -826,7 +826,7 @@ def explain(target: str) -> str:
 
 @mcp.tool(annotations=RO)
 def decisions(query: str = "", target: str = "", status: str = "", as_of: str = "") -> str:
-    """Decision memory (Mnemosyne): query architectural decisions with temporal validity. Filter by text, governed target (topic/table/module), status, or as_of (YYYY-MM-DD) for time-travel."""
+    """Architectural decisions with temporal validity. Filter by text, governed target, status, or as_of for time travel. Parsed from ADR markdown."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='decisions'").fetchone():
         return "No decision data; reindex with the current Ariadne"
@@ -857,7 +857,7 @@ def decisions(query: str = "", target: str = "", status: str = "", as_of: str = 
 
 @mcp.tool(annotations=RO)
 def decision_trace(id: str) -> str:
-    """Full lineage of one decision: supersession chain plus governed artifacts with existence check (flags decision drift)."""
+    """One decision's lineage: supersession chain, plus governed artifacts flagged when they no longer exist in the graph."""
     con = db()
     rec = con.execute("SELECT * FROM decisions WHERE id=?", (id.upper(),)).fetchone()
     if not rec:
@@ -983,7 +983,7 @@ def _insight_subject_hash(con, row):
 
 @mcp.tool(annotations=WR)
 def save_decision(title: str, decision: str, rationale: str, alternatives: str = "", supersedes: str = "", root: str = "") -> str:
-    """Capture a decision made in this conversation: writes a git-versioned ADR file (docs/adr/) AND indexes it immediately. Use when an architectural/design choice is settled. root: in a multi-root workspace, which repo the ADR belongs to."""
+    """Write a git-versioned ADR and index it now. Use when an architectural or design choice is settled."""
     import datetime
     # Anchor the ADR inside a git-versioned ROOT the indexer parses. Writing
     # under the multi-root workspace PARENT (the old cwd fallback) "succeeded",
@@ -1035,7 +1035,7 @@ def save_decision(title: str, decision: str, rationale: str, alternatives: str =
 
 @mcp.tool(annotations=WR)
 def save_insight(target: str, kind: str, summary: str, root: str = "") -> str:
-    """Persist a derived insight for a module or file into the graph (served by explain, hash-keyed so it auto-stales when content changes). kind: 'module' or 'file'. Writes a git-versioned docs/insights.json AND indexes it. root: in a multi-root workspace, which repo it belongs to."""
+    """Persist a derived insight for a module or file, hash-keyed so it auto-stales. Use after synthesizing understanding from the graph."""
     if kind not in ("module", "file") or len(summary) < 40:
         return "kind must be module|file and summary at least 40 chars."
     base, source_base, err = _resolve_write_root(root, "the insight")
@@ -1157,7 +1157,7 @@ def _gaps_data(con, n):
 
 @mcp.tool(annotations=RO)
 def graph_gaps(limit: int = 20) -> str:
-    """Where static analysis is BLIND, the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, and drift tables, each with file:line. Investigate, then record what you work out with assert_edge. This is how the graph gets better instead of staying wrong."""
+    """Where static analysis is BLIND: unresolved topic/SQL expressions, orphan topics and endpoints, drift tables, unmatched calls, each with file:line. Record answers with assert_edge."""
     return _gaps_data(db(), _clamp(limit, 1, 60))
 
 
@@ -1165,7 +1165,7 @@ def graph_gaps(limit: int = 20) -> str:
 def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str = "medium",
                 topic: str = "", direction: str = "", table: str = "", mode: str = "",
                 method: str = "", path: str = "") -> str:
-    """Record a fact you DERIVED by reading code that static analysis could not resolve, a runtime-assembled Kafka topic, dynamic SQL, a gateway-rewritten route. kind: kafka|db|http_endpoint|http_call. Writes docs/graph-assertions.json (git-committed and reviewable, like an ADR) and enters the graph tagged with your name, never mistaken for a parsed fact. Requires evidence: quote the code that convinced you."""
+    """Record a fact you DERIVED by reading code that static analysis could not resolve. Enters the graph tagged derived, never as parsed. Requires evidence: quote the code that convinced you. Only assert what you can defend."""
     if kind not in ("kafka", "db", "http_endpoint", "http_call"):
         return "kind must be kafka|db|http_endpoint|http_call."
     if len(evidence) < 20:
@@ -1216,7 +1216,7 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
 
 @mcp.tool(annotations=RO)
 def message_flow(topic: str = "") -> str:
-    """Messaging topology (Kafka, plus RabbitMQ/JMS/SQS/NATS labeled by system): correlate inbound/outbound message handling across modules. No args = full topic map (producers/consumers per topic with file:line, plus orphan warnings). Topics resolved from literals, constants, and application.yaml placeholders."""
+    """Messaging topology (Kafka; RabbitMQ/JMS/SQS/NATS labeled by system). No args = every topic's producers and consumers with file:line, plus orphans. Pass topic for one flow."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='msg_edges'").fetchone():
         return "No message-edge data; reindex with the current Ariadne"
@@ -1326,7 +1326,7 @@ def message_flow(topic: str = "") -> str:
 
 @mcp.tool(annotations=RO)
 def db_map(table: str = "") -> str:
-    """Database topology (Spring Boot + Liquibase): correlate each table with the changesets that shaped it AND every code site touching it (entities, repositories, @Query, JdbcTemplate) with read/write mode. Includes drift warnings. Pass table for one table."""
+    """Database topology: each table's Liquibase changesets and every code site touching it, with read/write mode. No args = full map plus drift warnings. Pass table for one table."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='db_defs'").fetchone():
         return "No DB-layer data; reindex with the current Ariadne"
@@ -1440,7 +1440,7 @@ def _http_correlation(con, prod_only, has_test):
 
 @mcp.tool(annotations=RO)
 def http_map(path: str = "") -> str:
-    """Full-stack HTTP seam: correlate REST endpoints (Spring controllers) with every caller (TS/React fetch/axios, Java RestTemplate/WebClient/Feign) matched on method + normalized path. Includes orphan endpoints and unmatched calls."""
+    """HTTP seam: REST endpoints correlated with their callers on method + normalized path. No args = full map plus orphans. Pass path to filter."""
     from http_extract import paths_match
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='http_endpoints'").fetchone():
@@ -1541,7 +1541,7 @@ def _cap_list(a, n=10):
 
 @mcp.tool(annotations=RO)
 def plan_context(task: str) -> str:
-    """When you have a TASK but no target yet: ONE call that finds the starting set server-side — full-text and symbol matches for the task's terms, the files they concentrate in, the Kafka topics / DB tables / HTTP endpoints those files touch, the decisions governing them, and the tests that cover them. Use INSTEAD of the 3-5 exploratory search calls at session start; then context_pack the target you choose."""
+    """ONE call when you have a TASK but no target: matching files, the seams they touch, governing decisions, covering tests. Use INSTEAD of exploratory search at session start, then context_pack the target you pick."""
     con = db()
     terms = _task_terms(task)
     if not terms:
@@ -1624,7 +1624,7 @@ def plan_context(task: str) -> str:
 
 @mcp.tool(annotations=RO)
 def change_check(files: list[str]) -> str:
-    """PRE-EDIT decision support: given the files you intend to touch, ONE call returning their combined blast radius, the tests to re-run, the seam warnings your edit could introduce (sole producers/consumers, drift tables, uncalled endpoints, unresolved expressions), the decisions governing them, and the assertions your edit will mark STALE. Call BEFORE proposing a diff."""
+    """ONE call before editing: combined blast radius of the files you will touch, tests to re-run, seam warnings your edit introduces, governing decisions, assertions it marks STALE. Call BEFORE proposing a diff."""
     from http_extract import paths_match
     con = db()
     files = [f for f in files if f][:20]
@@ -1726,7 +1726,7 @@ def change_check(files: list[str]) -> str:
 
 @mcp.tool(annotations=RO)
 def explain_path(source: str, target: str) -> str:
-    """WHY does editing A affect B? The shortest provenance-weighted path between two graph nodes — files, symbols, modules, topics (kafka:orders.created or just the topic name), tables (db:payments), endpoints (GET /api/x) — with per-hop evidence (kind + file:line + parsed/asserted provenance). blast_radius asserts the answer; this explains it, in ~300 tokens."""
+    """WHY editing A affects B: shortest path between two nodes (file, symbol, module, topic, table, endpoint) with per-hop evidence and provenance. blast_radius asserts the answer; this explains it."""
     src = source
     to = target
     if not src or not to:
@@ -1845,7 +1845,7 @@ def explain_path(source: str, target: str) -> str:
 
 @mcp.tool(annotations=RO)
 def usage_report(days: int = 7) -> str:
-    """The context-ROI ledger: how many bytes Ariadne served vs what the answered questions would have cost in raw file reads (the files each answer spans, measured from the index). Local-only (.ariadne/usage.jsonl); nothing leaves the machine. days: look-back window (default 7)."""
+    """Context-ROI ledger: bytes served vs what raw file reads would have cost. Local only. days: look-back window (default 7)."""
     win = _clamp(days, 1, 90)
     if not USAGE_PATH.exists():
         return "No usage recorded yet — the ledger starts with the first tool call after this update."
@@ -1883,7 +1883,7 @@ def usage_report(days: int = 7) -> str:
 
 @mcp.tool(annotations=WR)
 async def reindex(mode: str = "incremental") -> str:
-    """Rebuild the index. mode='incremental' (changed files since last indexed commit) or 'full'. Use when index_status reports fresh=false."""
+    """Rebuild the index. mode='incremental' or 'full'. Use when index_status reports fresh=false."""
     flag = "--full" if mode == "full" else "--incremental"
 
     def _run():

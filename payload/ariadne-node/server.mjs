@@ -390,11 +390,11 @@ function statusData(live = false) {
 }
 
 tool(server, "index_status",
-  "Check index freshness: file/symbol/edge counts, whether the indexed git SHA matches HEAD, and dirty_worktree (uncommitted paths — the incremental indexer absorbs them; fresh:false until it has). Call first if results seem stale.",
+  "Index freshness: counts, indexed SHA vs HEAD, dirty_worktree. Call first if results seem stale.",
   {}, () => statusData(true));
 
 tool(server, "search_code",
-  "Full-text search over all code. Returns matching chunks with path and start line. Use for 'where is X handled/configured/used' questions instead of reading files.",
+  "Full-text search over code. Returns chunks with path and start line. Use for 'where is X handled' instead of reading files.",
   { query: z.string().min(2).max(200), limit: z.number().int().optional() },
   ({ query, limit }) => withDb((d) => {
     const safe = '"' + query.replaceAll('"', '""') + '"';
@@ -450,7 +450,7 @@ function resolveTarget(d, target) {
 }
 
 tool(server, "context_pack",
-  "ONE call that assembles everything relevant to working on a target (a file path, class, or method): its outline, callers, blast radius, the Kafka topics / DB tables / HTTP endpoints it touches, the architectural decisions governing those, and any cached insight. Use this INSTEAD of six separate lookups when starting work on something, it is the cheapest way to load focused context, and it is budgeted so it cannot flood the window.",
+  "ONE call for a file, class, or method: outline, callers, blast radius, the topics/tables/endpoints it touches, governing decisions, cached insight, covering tests. Use INSTEAD of six lookups when starting work.",
   { target: z.string().min(1).max(300) },
   ({ target }) => withDb((d) => {
     // resolve target -> a file (accept a path, or a symbol name)
@@ -533,7 +533,7 @@ tool(server, "context_pack",
   }));
 
 tool(server, "find_symbol",
-  "Look up functions/classes/types by name (substring by default). Returns kind, signature, file, line, enough to reference without reading the file.",
+  "Look up functions/classes/types by name (substring). Returns kind, signature, file, line.",
   { name: z.string().min(1).max(120), exact: z.boolean().optional() },
   ({ name, exact }) => withDb((d) => {
     const rows = exact
@@ -545,7 +545,7 @@ tool(server, "find_symbol",
   }));
 
 tool(server, "file_outline",
-  "A file's skeleton: language, line count, all symbols with signatures, plus its imports and importers. Use INSTEAD of reading the file when you only need structure.",
+  "A file's skeleton: symbols with signatures, imports, importers. Use INSTEAD of reading the file when you only need structure.",
   { path: z.string().min(1).max(500) },
   ({ path: p }) => withDb((d) => {
     const f = d.prepare("SELECT * FROM files WHERE path=?").get(p);
@@ -592,12 +592,12 @@ function blastData(d, p, depth) {
 }
 
 tool(server, "blast_radius",
-  "Everything that transitively depends on a file (reverse dependency BFS). Call BEFORE modifying shared code to know what to re-test.",
+  "Everything that transitively depends on a file. Call BEFORE modifying shared code to know what to re-test.",
   { path: z.string().min(1).max(500), depth: z.number().int().optional() },
   ({ path: p, depth }) => withDb((d) => { noteFiles([p]); return blastData(d, p, clamp(depth ?? 2, 1, 5)) ?? "File not in index."; }));
 
 tool(server, "dependencies",
-  "What a file imports (its direct in-repo dependencies).",
+  "What a file imports (direct in-repo dependencies).",
   { path: z.string().min(1).max(500) },
   ({ path: p }) => withDb((d) => {
     const rows = d.prepare(
@@ -607,7 +607,7 @@ tool(server, "dependencies",
   }));
 
 tool(server, "module_map",
-  "Directory-level overview: file count and main languages per top-level directory (optionally under `prefix`). First call to orient in an unfamiliar repo.",
+  "Directory overview: file count and main languages per top-level dir (optionally under prefix). First call in an unfamiliar repo.",
   { prefix: z.string().max(300).optional() },
   ({ prefix = "" }) => withDb((d) => {
     const rows = d.prepare("SELECT path, lang FROM files WHERE path >= ? AND path < ?").all(...prefixRange(prefix));
@@ -627,14 +627,14 @@ tool(server, "module_map",
   }));
 
 tool(server, "hotspots",
-  "Most-depended-on files (highest in-degree), highest-risk to change, best places to start understanding the architecture.",
+  "Most-depended-on files (highest in-degree). Highest risk to change.",
   { limit: z.number().int().optional() },
   ({ limit }) => withDb((d) =>
     d.prepare(`SELECT f.path, COUNT(e.src) dependents FROM files f JOIN edges e ON e.dst=f.id
                GROUP BY f.id ORDER BY dependents DESC LIMIT ?`).all(clamp(limit ?? 10, 1, 30))));
 
 tool(server, "find_callers",
-  "AST-based: who calls this function/method? Returns each calling function with its file and line. Heuristic (matched by name); for compiler-resolved precision use find_references (SCIP).",
+  "Who calls this function/method, with file and line. HEURISTIC (name match); use find_references before claiming anything is or is not used.",
   { name: z.string().min(1).max(120), limit: z.number().int().optional() },
   ({ name, limit }) => withDb((d) => {
     const rows = d.prepare(
@@ -655,7 +655,7 @@ tool(server, "find_callers",
   }));
 
 tool(server, "find_callees",
-  "AST-based: what does this function/method call? Returns callee names with lines. Heuristic (by name).",
+  "What this function/method calls, with lines. HEURISTIC (name match).",
   { name: z.string().min(1).max(120) },
   ({ name }) => withDb((d) => {
     const rows = d.prepare(
@@ -666,7 +666,7 @@ tool(server, "find_callees",
   }));
 
 tool(server, "find_references",
-  "COMPILER-GRADE (requires SCIP ingest): every place a symbol is actually used, resolved by the compiler, not text matching. Returns definition site + reference sites.",
+  "COMPILER-GRADE (needs SCIP): every real use of a symbol, resolved by the compiler. Definition plus reference sites. Authoritative where find_callers guesses.",
   { name: z.string().min(1).max(200), limit: z.number().int().optional() },
   ({ name, limit }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='scip_refs'").get()) {
@@ -683,7 +683,7 @@ tool(server, "find_references",
   }));
 
 tool(server, "goto_definition",
-  "COMPILER-GRADE (requires SCIP ingest): exact definition of a symbol with its doc comment. More precise than find_symbol for overloaded/common names.",
+  "COMPILER-GRADE (needs SCIP): exact definition of a symbol with its doc comment. Beats find_symbol for overloaded or common names.",
   { name: z.string().min(1).max(200) },
   ({ name }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='scip_defs'").get()) {
@@ -719,7 +719,7 @@ function insightSubjectHash(d, row) {
 }
 
 tool(server, "explain",
-  "Cached LLM insight for a module or file: intent, responsibilities, system connections, gotchas. Generated by the enrichment layer (hash-cached, regenerated only when content changes). Falls back with guidance if no insight exists or it's stale.",
+  "Cached insight for a module or file: intent, responsibilities, connections, gotchas. Says so when none exists or it is stale.",
   { target: z.string().min(1).max(300) },
   ({ target }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='insights'").get()) {
@@ -743,7 +743,7 @@ tool(server, "explain",
   }));
 
 tool(server, "decisions",
-  "Decision memory (Mnemosyne): query architectural decisions with temporal validity. Filter by free text, a governed target (topic/table/module), status, or as_of (YYYY-MM-DD) for time-travel ('what was valid last March'). Decisions are parsed from ADR markdown in the repos, the source of truth stays in git.",
+  "Architectural decisions with temporal validity. Filter by text, governed target, status, or as_of for time travel. Parsed from ADR markdown.",
   { query: z.string().max(200).optional(), target: z.string().max(200).optional(),
     status: z.string().max(30).optional(), as_of: z.string().max(10).optional() },
   ({ query, target, status, as_of }) => withDb((d) => {
@@ -767,7 +767,7 @@ tool(server, "decisions",
   }));
 
 tool(server, "decision_trace",
-  "Full lineage of one decision: supersession chain (what replaced what, when), governed artifacts with existence check (flags decisions referencing topics/tables that no longer exist in the graph, decision drift).",
+  "One decision's lineage: supersession chain, plus governed artifacts flagged when they no longer exist in the graph.",
   { id: z.string().min(1).max(60) },
   ({ id }) => withDb((d) => {
     const rec = d.prepare("SELECT * FROM decisions WHERE id=?").get(id.toUpperCase());
@@ -849,7 +849,7 @@ function resolveWriteRoot(root, what) {
 }
 
 tool(server, "save_decision",
-  "Capture a decision made in this conversation into durable decision memory: writes a git-versioned ADR markdown file (docs/adr/) AND indexes it immediately. Use when the human and you settle an architectural/design choice. supersedes: optional ADR id this replaces. root: in a multi-root workspace, which repo the ADR belongs to.",
+  "Write a git-versioned ADR and index it now. Use when an architectural or design choice is settled.",
   { title: z.string().min(5).max(150), decision: z.string().min(20).max(2000),
     rationale: z.string().min(10).max(2000), alternatives: z.string().max(1000).optional(),
     supersedes: z.string().max(30).optional(), root: z.string().max(200).optional() },
@@ -901,7 +901,7 @@ tool(server, "save_decision",
   });
 
 tool(server, "save_insight",
-  "Persist a derived insight for a module or file into the graph (served by `explain`, hash-keyed so it auto-stales when content changes). Use after synthesizing understanding from the graph tools, this is how assistants (Copilot, Claude, etc.) enrich the shared knowledge layer.",
+  "Persist a derived insight for a module or file, hash-keyed so it auto-stales. Use after synthesizing understanding from the graph.",
   { target: z.string().min(1).max(300), kind: z.enum(["module", "file"]), summary: z.string().min(40).max(4000),
     root: z.string().max(200).optional() },
   ({ target, kind, summary, root }) => {
@@ -1002,12 +1002,12 @@ function gapsData(d, n) {
 }
 
 tool(server, "graph_gaps",
-  "Where static analysis is BLIND, the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, drift tables, and unmatched calls, each with file:line. Use this to find what needs a human or an assistant to work out, then record the answer with assert_edge. This is how the graph gets better instead of staying wrong.",
+  "Where static analysis is BLIND: unresolved topic/SQL expressions, orphan topics and endpoints, drift tables, unmatched calls, each with file:line. Record answers with assert_edge.",
   { limit: z.number().int().optional() },
   ({ limit }) => withDb((d) => gapsData(d, clamp(limit ?? 20, 1, 60))));
 
 tool(server, "assert_edge",
-  "Record a fact you DERIVED by reading code that static analysis could not resolve, a runtime-assembled Kafka topic, a dynamically built SQL table, a gateway-rewritten route. Writes to docs/graph-assertions.json (git-committed and reviewable, exactly like an ADR) and into the graph, tagged with your name so it is never mistaken for a parsed fact. Requires evidence: quote the code that convinced you. Only assert what you can defend.",
+  "Record a fact you DERIVED by reading code that static analysis could not resolve. Enters the graph tagged derived, never as parsed. Requires evidence: quote the code that convinced you. Only assert what you can defend.",
   {
     kind: z.enum(["kafka", "db", "http_endpoint", "http_call"]),
     file: z.string().min(1).max(400),
@@ -1058,7 +1058,7 @@ tool(server, "assert_edge",
   });
 
 tool(server, "message_flow",
-  "Messaging topology (Kafka, plus RabbitMQ/JMS/SQS/NATS labeled by system): correlate inbound/outbound message handling across modules. No args = full topic map (each topic's producers and consumers with file:line, plus orphans, topics produced but never consumed or vice versa). Pass topic for one topic's flow. Topics resolved from literals, constants, and application.yaml placeholders.",
+  "Messaging topology (Kafka; RabbitMQ/JMS/SQS/NATS labeled by system). No args = every topic's producers and consumers with file:line, plus orphans. Pass topic for one flow.",
   { topic: z.string().max(200).optional() },
   ({ topic }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='msg_edges'").get()) {
@@ -1153,7 +1153,7 @@ tool(server, "message_flow",
   }));
 
 tool(server, "db_map",
-  "Database topology (Spring Boot + Liquibase): correlate every table with the changesets that shaped it AND every code site touching it (JPA entities, Spring Data repositories, @Query, JdbcTemplate) with read/write mode. No args = full map with drift warnings (code accessing tables no changelog defines; tables defined but never accessed). Pass table for one table.",
+  "Database topology: each table's Liquibase changesets and every code site touching it, with read/write mode. No args = full map plus drift warnings. Pass table for one table.",
   { table: z.string().max(200).optional() },
   ({ table }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='db_defs'").get()) {
@@ -1258,7 +1258,7 @@ function httpCorrelation(d, prodOnly, hasTest) {
 }
 
 tool(server, "http_map",
-  "Full-stack HTTP seam: correlate REST endpoints (Spring controllers) with every caller (TS/React fetch/axios, Java RestTemplate/WebClient/Feign) matched on method + normalized path ({id}, :id, ${expr} all correlate). No args = full map with orphans (endpoints nobody calls; calls hitting no known endpoint). Pass path to filter.",
+  "HTTP seam: REST endpoints correlated with their callers on method + normalized path. No args = full map plus orphans. Pass path to filter.",
   { path: z.string().max(300).optional() },
   ({ path: pf }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='http_endpoints'").get()) {
@@ -1345,7 +1345,7 @@ function governingFor(d, targets) {
 const capList = (a, n = 10) => (a.length > n ? [...a.slice(0, n), `…and ${a.length - n} more`] : a);
 
 tool(server, "plan_context",
-  "When you have a TASK but no target yet: ONE call that finds the starting set server-side — full-text and symbol matches for the task's terms, the files they concentrate in, the Kafka topics / DB tables / HTTP endpoints those files touch, the decisions governing them, and the tests that cover them. Use INSTEAD of the 3-5 exploratory search calls at session start; then context_pack the target you choose.",
+  "ONE call when you have a TASK but no target: matching files, the seams they touch, governing decisions, covering tests. Use INSTEAD of exploratory search at session start, then context_pack the target you pick.",
   { task: z.string().min(3).max(500) },
   ({ task }) => withDb((d) => {
     const terms = taskTerms(task);
@@ -1417,7 +1417,7 @@ tool(server, "plan_context",
   }));
 
 tool(server, "explain_path",
-  "WHY does editing A affect B? The shortest provenance-weighted path between two graph nodes — files, symbols, modules, topics (kafka:orders.created or just the topic name), tables (db:payments), endpoints (GET /api/x) — with per-hop evidence (kind + file:line + parsed/asserted provenance). blast_radius asserts the answer; this explains it, in ~300 tokens.",
+  "WHY editing A affects B: shortest path between two nodes (file, symbol, module, topic, table, endpoint) with per-hop evidence and provenance. blast_radius asserts the answer; this explains it.",
   { source: z.string().min(1).max(300), target: z.string().min(1).max(300) },
   ({ source, target }) => withDb((d) => {
     // --- resolve an endpoint of the path to a node id in the traversal space:
@@ -1527,7 +1527,7 @@ tool(server, "explain_path",
   }));
 
 tool(server, "usage_report",
-  "The context-ROI ledger: how many bytes Ariadne served vs what the answered questions would have cost in raw file reads (the files each answer spans, measured from the index). Local-only (.ariadne/usage.jsonl); nothing leaves the machine. days: look-back window (default 7).",
+  "Context-ROI ledger: bytes served vs what raw file reads would have cost. Local only. days: look-back window (default 7).",
   { days: z.number().int().optional() },
   ({ days }) => {
     const win = clamp(days ?? 7, 1, 90);
@@ -1559,7 +1559,7 @@ tool(server, "usage_report",
   });
 
 tool(server, "change_check",
-  "PRE-EDIT decision support: given the files you intend to touch, ONE call returning their combined blast radius, the tests to re-run, the seam warnings your edit could introduce (sole producers/consumers, drift tables, uncalled endpoints, unresolved expressions), the decisions governing them, and the assertions your edit will mark STALE. Call BEFORE proposing a diff.",
+  "ONE call before editing: combined blast radius of the files you will touch, tests to re-run, seam warnings your edit introduces, governing decisions, assertions it marks STALE. Call BEFORE proposing a diff.",
   { files: z.array(z.string().min(1).max(500)).min(1).max(20) },
   ({ files }) => withDb((d) => {
     noteFiles(files);
@@ -1645,7 +1645,7 @@ tool(server, "change_check",
   }));
 
 tool(server, "reindex",
-  "Rebuild the index. mode='incremental' (changed files since last indexed commit) or 'full'. Use when index_status reports fresh=false.",
+  "Rebuild the index. mode='incremental' or 'full'. Use when index_status reports fresh=false.",
   { mode: z.enum(["incremental", "full"]).optional() },
   ({ mode = "incremental" }) => new Promise((resolve) => {
     execFile(process.execPath, [path.join(GR_DIR, "indexer.mjs"), `--${mode}`],

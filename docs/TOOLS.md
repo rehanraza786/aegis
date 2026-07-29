@@ -64,6 +64,12 @@ rabbit, jms, sqs, nats — non-kafka sites labeled). Unscoped on large systems:
 summary + complete warning lists (orphans, test-only, unresolved,
 declared-in-config-but-unused). Scoped: per-topic sites with `config_keys`
 linkage and a hoist-to-config note when declared names are hardcoded.
+Topic names resolve three ways: string literals, `static final` constants
+collected repo-wide, and `${config.key}` placeholders looked up in a flattened
+parse of every `application*.yaml|properties` in the workspace — which is what
+correlates a producer and consumer when neither names the topic literally.
+Expressions assembled at runtime are reported as gaps, never guessed.
+
 
 **`db_map`** (table?) → tables ↔ changesets ↔ access sites with read/write
 mode. Drift warnings: accessed-but-no-changeset, defined-but-never-accessed.

@@ -2009,6 +2009,51 @@ asyncio.run(main())
     py_ann = {name: ann for ann, name in _re2.findall(
         r"@mcp\.tool\(annotations=(RO|WR)\)\s*\n(?:async )?def ([a-z][a-z0-9_]*)", py_src)}
     py_reg = set(py_ann)
+    # The tool list is re-sent to the model on EVERY request, so description
+    # length is a fixed per-turn cost paid whether or not a tool is called.
+    # These are ratchets, not targets: they stop the surface growing back
+    # unnoticed. Raise them deliberately, in a commit that says why.
+    NODE_DESC_BUDGET, PY_DESC_BUDGET, PER_TOOL_CEILING = 3900, 3900, 230
+    node_desc = _re2.findall(r'tool\(server,\s*"[a-z][a-z0-9_]*",\s*\n?\s*"((?:[^"\\]|\\.)*)"', node_src)
+    py_desc = _re2.findall(
+        r'@mcp\.tool\(annotations=(?:RO|WR)\)\s*\n(?:async )?def [a-z][a-z0-9_]*\([^)]*\)[^:]*:\s*\n\s*"""(.*?)"""',
+        py_src, _re2.S)
+    node_bytes, py_bytes = sum(map(len, node_desc)), sum(map(len, py_desc))
+    check(f"node tool descriptions stay within the per-turn budget ({node_bytes} <= {NODE_DESC_BUDGET})",
+          len(node_desc) >= 25 and node_bytes <= NODE_DESC_BUDGET, f"{node_bytes} bytes over {len(node_desc)} tools")
+    check(f"python tool descriptions stay within the per-turn budget ({py_bytes} <= {PY_DESC_BUDGET})",
+          len(py_desc) >= 25 and py_bytes <= PY_DESC_BUDGET, f"{py_bytes} bytes over {len(py_desc)} tools")
+    _fat = [d[:40] for d in node_desc + py_desc if len(d) > PER_TOOL_CEILING]
+    check(f"no single tool description exceeds {PER_TOOL_CEILING} chars", not _fat, "; ".join(_fat[:3]))
+
+    # Descriptions are agent-facing and short; the long form has to live
+    # somewhere reachable, or trimming them destroys knowledge instead of
+    # relocating it. Each fact below was in a description once.
+    _tools_md = (TOOLKIT / "docs" / "TOOLS.md").read_text(encoding="utf-8").lower()
+    _help_md = (TOOLKIT / "payload" / ".github" / "skills" / "aegis-help" / "SKILL.md").read_text(encoding="utf-8").lower()
+    _reference = _tools_md + _help_md
+    _must_survive = [
+        "application",        # ${config.key} topic resolution from application*.yaml
+        "graph-assertions",   # where assert_edge writes
+        "scip",               # what "compiler-grade" depends on
+        "heuristic",          # find_callers' limitation
+        "drift",              # db_map's warning class
+        "orphan",             # message_flow / http_map warning class
+        "supersede",          # decision_trace's chain
+        "budget",             # results are capped
+    ]
+    _lost = [f for f in _must_survive if f not in _reference]
+    check("nothing trimmed from a tool description was lost from the reference tier",
+          not _lost, "missing from TOOLS.md and aegis-help: " + ", ".join(_lost))
+    # descriptions must not silently diverge between editions: the same agent
+    # should see the same tool whichever runtime is serving it
+    _nd = dict(_re2.findall(r'tool\(server,\s*"([a-z][a-z0-9_]*)",\s*\n?\s*"((?:[^"\\]|\\.)*)"', node_src))
+    _pd = dict((n, d) for n, d in _re2.findall(
+        r'@mcp\.tool\(annotations=(?:RO|WR)\)\s*\n(?:async )?def ([a-z][a-z0-9_]*)\([^)]*\)[^:]*:\s*\n\s*"""(.*?)"""',
+        py_src, _re2.S))
+    _diff = sorted(n for n in set(_nd) & set(_pd) if _nd[n].strip() != _pd[n].strip())
+    check("tool descriptions are identical across editions", not _diff, "differ: " + ", ".join(_diff[:4]))
+
     check("node and python tool registries match (28 tools)",
           node_reg == py_reg and len(node_reg) == 28, str(sorted(node_reg ^ py_reg)))
     # annotations: every tool annotated, identically across editions, and only

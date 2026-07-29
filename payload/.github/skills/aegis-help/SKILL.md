@@ -53,6 +53,38 @@ Two things worth knowing without being asked:
   consumer", "accessed but no changeset defines it" — surface these when you see
   them, even if nobody asked.
 
+## Choosing between the lookup tools
+
+Tool descriptions are deliberately short: they are re-sent to the model on every
+request, so they carry only what is needed to *choose*. The long form lives in
+`docs/TOOLS.md`, and the distinctions that actually cause wrong answers are here,
+where they cost nothing until a request routes to this skill.
+
+**Three overlapping symbol lookups, in order of authority.**
+`find_references` is compiler-grade (SCIP): it resolves through types, sees
+Lombok-generated members, and is the only one that can settle "is this used".
+`goto_definition` is the same machinery for the definition site, and beats
+`find_symbol` on overloaded or common names. `find_callers` matches by *name* —
+use it to explore, never to conclude. If `find_callers` returns a plausible list
+and SCIP has data for that symbol, it says so on the result; take the hint.
+
+**Structure without reading files.** `file_outline` for one file's skeleton,
+`dependencies` for what it imports, `blast_radius` for everything that
+transitively depends on it, `hotspots` for where risk concentrates. Reach for
+`context_pack` instead when you want several of these about one target.
+
+**The three seam maps take no arguments on purpose.** `message_flow`, `db_map`,
+and `http_map` return a summary with the *complete* warning lists — orphan
+topics, drift tables, uncalled endpoints — and a pointer to query one item at a
+time. Pass an argument only once you know which item you care about.
+
+**Topic resolution has limits worth knowing.** `message_flow` resolves topic
+names from literals, repo-wide `static final` constants, and `${config.key}`
+placeholders read from every `application*.yaml|properties` in the workspace —
+which is how a producer and a consumer correlate when neither names the topic
+literally. Anything assembled at runtime is reported by `graph_gaps` as
+unresolved rather than guessed; close those with `assert_edge` and evidence.
+
 ## Working on a large codebase
 
 On a big system the tools protect your context automatically, but you should
