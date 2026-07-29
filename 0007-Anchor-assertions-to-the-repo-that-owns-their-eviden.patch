@@ -1,0 +1,663 @@
+From f2cbff98b0d0f1997137902da560742733f8fae0 Mon Sep 17 00:00:00 2001
+From: rehanraza786 <rehanraza786@users.noreply.github.com>
+Date: Wed, 29 Jul 2026 01:56:14 +0000
+Subject: [PATCH 07/12] Anchor assertions to the repo that owns their evidence
+ file
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+assert_edge's description promises "git-committed and reviewable, exactly
+like an ADR". In a multi-root workspace that was not true: both writers put
+docs/graph-assertions.json at the workspace parent, which is not a git repo,
+so the file was loaded by the indexer but never versioned, never reviewed,
+and never shared — the control silently absent exactly where a team has the
+most repos. save_decision already guards against this for ADRs.
+
+Paths are repo-prefixed, so the first segment of the evidence file names the
+repo. assert_edge and annotate now anchor there (assertionsBase /
+_assertions_base), and both editions report the real path they wrote.
+
+Readers take the parent AND every root: the indexer, and the
+ariadne://assertions resource, which otherwise under-reports what is
+actually in the graph. Existing files at the parent keep working, so this
+needs no migration.
+
+Lifecycle follows. retract and reaffirm search every candidate file and edit
+whichever one holds the record, instead of assuming the parent. A dismissal
+is keyed on a gap, not a file, so there is no repo to infer: it honors an
+explicit root and otherwise stays at the workspace root, saying out loud
+that it will not be versioned there.
+
+One consequence worth knowing: assert_edge now legitimately dirties the
+worktree of the repo it writes into, until you commit — which is what the
+tool has always told you to do. The old placement hid that by writing
+somewhere git could not see, which is the bug.
+
+run_tests.py: the annotate lifecycle now asserts against the anchored file,
+and both protocol probes commit what assert_edge wrote, the way a user
+would.
+---
+ payload/ariadne-node/annotate.mjs  |  85 ++++++++++++++++-------
+ payload/ariadne-node/indexer.mjs   |  19 +++--
+ payload/ariadne-node/server.mjs    |  55 ++++++++++++---
+ payload/ariadne-python/annotate.py | 107 ++++++++++++++++++++---------
+ payload/ariadne-python/indexer.py  |  22 ++++--
+ payload/ariadne-python/server.py   |  67 ++++++++++++++----
+ tests/run_tests.py                 |  28 ++++++--
+ 7 files changed, 295 insertions(+), 88 deletions(-)
+
+diff --git a/payload/ariadne-node/annotate.mjs b/payload/ariadne-node/annotate.mjs
+index cb9954f..90fc114 100644
+--- a/payload/ariadne-node/annotate.mjs
++++ b/payload/ariadne-node/annotate.mjs
+@@ -23,6 +23,47 @@ const ROOT = process.cwd();
+ const DB_PATH = path.join(process.env.ARIADNE_HOME ?? ROOT, ".ariadne", "index.db");
+ const die = (msg) => { console.error(msg); process.exit(1); };
+ 
++/** Repo prefixes in a multi-root workspace (empty for a single repo). */
++function rootPrefixes() {
++  const db = new Database(DB_PATH, { readonly: true });
++  try {
++    return db.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all()
++      .map((r) => r.key.slice("last_sha:".length)).filter((x) => x !== ".");
++  } catch { return []; } finally { db.close(); }
++}
++
++/** Directory whose docs/graph-assertions.json should hold an assertion about
++ *  `file`. Paths are repo-prefixed, so the first segment names the repo.
++ *  Writing to the multi-root parent "works" — the indexer reads it — but the
++ *  parent is not a git repo, so nothing is versioned, reviewed, or shared.
++ *  Parity: assertionsBase in server.mjs. */
++function assertionsBase(file) {
++  const prefixes = rootPrefixes();
++  const seg = String(file ?? "").split("/")[0];
++  return prefixes.includes(seg) ? path.join(ROOT, seg) : ROOT;
++}
++
++/** Every place an assertions file may live: parent, then each repo. */
++function assertionFiles() {
++  const out = [path.join(ROOT, "docs", "graph-assertions.json")];
++  for (const r of rootPrefixes()) {
++    const p = path.join(ROOT, r, "docs", "graph-assertions.json");
++    if (!out.includes(p)) out.push(p);
++  }
++  return out;
++}
++
++/** Read an assertions file, refusing to proceed on malformed JSON: a stray
++ *  comma must never silently erase the team's accumulated assertions. */
++function readAssertions(af) {
++  if (!fs.existsSync(af)) return null;
++  let list;
++  try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
++  catch (e) { die(`${path.relative(ROOT, af)} is not valid JSON (${e.message}). Fix or remove it first.`); }
++  if (!Array.isArray(list)) die(`${path.relative(ROOT, af)} is not a JSON array. Fix it first.`);
++  return list;
++}
++
+ if (!fs.existsSync(DB_PATH)) die("Index not found, run the Ariadne indexer first.");
+ let a;
+ try { a = JSON.parse(process.argv[2] ?? ""); } catch { die("annotate expects one JSON argument; see the header of this file."); }
+@@ -108,14 +149,8 @@ if (a.action === "insight") {
+   try { hash = db.prepare("SELECT hash FROM files WHERE path=?").get(a.file)?.hash ?? null; } finally { db.close(); }
+   if (!hash) die(`File '${a.file}' is not in the index (paths are repo-prefixed in a multi-repo workspace).`);
+ 
+-  const af = path.join(ROOT, "docs", "graph-assertions.json");
+-  let list = [];
+-  if (fs.existsSync(af)) {
+-    // Never clobber: a malformed file must not erase the team's assertions.
+-    try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
+-    catch (e) { die(`docs/graph-assertions.json exists but is not valid JSON (${e.message}). Fix or remove it first.`); }
+-    if (!Array.isArray(list)) die("docs/graph-assertions.json is not a JSON array. Fix it first.");
+-  }
++  const af = path.join(assertionsBase(a.file), "docs", "graph-assertions.json");
++  let list = readAssertions(af) ?? [];
+   const rec = { kind: a.kind, file: a.file, line: a.line ?? 0, evidence: a.evidence,
+     confidence: ["high", "medium", "low"].includes(a.confidence) ? a.confidence : "medium",
+     author, source_hash: hash, asserted_at: new Date().toISOString().slice(0, 10) };
+@@ -125,20 +160,22 @@ if (a.action === "insight") {
+   list.push(rec);
+   fs.mkdirSync(path.dirname(af), { recursive: true });
+   fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
+-  console.log(`Asserted (provenance: ${author}) and recorded in docs/graph-assertions.json (${list.length} total). It enters the graph on the next index, marked STALE automatically if ${a.file} changes. Commit the file to share it.`);
++  console.log(`Asserted (provenance: ${author}) and recorded in ${path.relative(ROOT, af)} (${list.length} total). It enters the graph on the next index, marked STALE automatically if ${a.file} changes. Commit the file to share it.`);
+ 
+ } else if (a.action === "dismiss") {
+   // gap triage: a dismissed gap stops shouting but stays auditable. Stored in
+   // the same reviewed file, kind "dismissal"; the export mutes matching gaps.
+   if (!a.gap || !a.key) die("dismiss needs gap (e.g. orphan_topic) and key (topic/table/path).");
+   if (!(a.reason?.length >= 10)) die("reason must say why this gap is acceptable (10+ chars).");
+-  const af = path.join(ROOT, "docs", "graph-assertions.json");
+-  let list = [];
+-  if (fs.existsSync(af)) {
+-    try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
+-    catch (e) { die(`docs/graph-assertions.json is not valid JSON (${e.message}). Fix it first.`); }
+-    if (!Array.isArray(list)) die("docs/graph-assertions.json is not a JSON array. Fix it first.");
++  // A dismissal is about a gap key, not a file, so there is no repo to infer.
++  // It goes where the caller says, else the workspace root.
++  const prefixes = rootPrefixes();
++  const dismissBase = a.root && prefixes.includes(a.root) ? path.join(ROOT, a.root) : ROOT;
++  const af = path.join(dismissBase, "docs", "graph-assertions.json");
++  if (prefixes.length && dismissBase === ROOT) {
++    console.error(`Note: the workspace root is not a git repo, so this dismissal will not be versioned. Pass "root":"<repo>" to commit it. Repos: ${prefixes.join(", ")}.`);
+   }
++  let list = readAssertions(af) ?? [];
+   list = list.filter((x) => !(x.kind === "dismissal" && x.gap === a.gap && x.key === a.key));
+   list.push({ kind: "dismissal", gap: a.gap, key: a.key, reason: a.reason, author,
+     dismissed_at: new Date().toISOString().slice(0, 10) });
+@@ -150,16 +187,18 @@ if (a.action === "insight") {
+   // lifecycle for existing assertions, keyed by the same natural key the
+   // no-duplicate filter uses. retract removes; reaffirm re-verifies: the
+   // source_hash moves to the evidence file's CURRENT hash, clearing STALE.
+-  const af = path.join(ROOT, "docs", "graph-assertions.json");
+-  if (!fs.existsSync(af)) die("docs/graph-assertions.json does not exist; nothing to modify.");
+-  let list;
+-  try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
+-  catch (e) { die(`docs/graph-assertions.json is not valid JSON (${e.message}). Fix it first.`); }
+-  if (!Array.isArray(list)) die("docs/graph-assertions.json is not a JSON array. Fix it first.");
++  // The record may live in the parent (older placements) or in the repo that
++  // owns its evidence file, so edit whichever one actually holds it.
+   const key = (x) => [x.kind, x.file, x.line ?? 0, x.topic ?? "", x.table ?? "", x.path ?? ""].join("|");
+   const target = key(a);
+-  const hits = list.filter((x) => key(x) === target);
+-  if (!hits.length) die("No matching assertion found in docs/graph-assertions.json (key: kind+file+line+topic/table/path).");
++  let af = null, list = null, hits = [];
++  for (const cand of assertionFiles()) {
++    const part = readAssertions(cand);
++    if (!part) continue;
++    const found = part.filter((x) => key(x) === target);
++    if (found.length) { af = cand; list = part; hits = found; break; }
++  }
++  if (!af) die("No matching assertion found in any docs/graph-assertions.json (key: kind+file+line+topic/table/path).");
+   if (a.action === "retract") {
+     list = list.filter((x) => key(x) !== target);
+     fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
+diff --git a/payload/ariadne-node/indexer.mjs b/payload/ariadne-node/indexer.mjs
+index d9d30df..5945ee8 100644
+--- a/payload/ariadne-node/indexer.mjs
++++ b/payload/ariadne-node/indexer.mjs
+@@ -1192,11 +1192,22 @@ async function kafkaPass(db, scopePrefixes = null) {
+     db.exec("DELETE FROM db_access WHERE source LIKE 'asserted%'");
+     db.exec("DELETE FROM http_endpoints WHERE source LIKE 'asserted%'");
+     db.exec("DELETE FROM http_calls WHERE source LIKE 'asserted%'");
+-    const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
++    // Parent AND every root. In a multi-root workspace the parent is not a git
++    // repo, so an assertion written there is loaded but never actually
++    // versioned or shared — the "committed and reviewable" promise silently
++    // absent exactly where there are the most repos. Writers now anchor to the
++    // repo owning the evidence file; reading both keeps older placements working.
+     let list = [];
+-    if (fs.existsSync(af)) {
+-      try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
+-      catch (e) { log("WARN", `docs/graph-assertions.json is not valid JSON (${e.message}); assertions stay out of the graph until it is fixed`); }
++    const seenA = new Set();
++    for (const root of [REPO_ROOT, ...ROOTS]) {
++      const af = path.join(root, "docs", "graph-assertions.json");
++      if (seenA.has(af) || !fs.existsSync(af)) continue;
++      seenA.add(af);
++      try {
++        const part = JSON.parse(fs.readFileSync(af, "utf8"));
++        if (Array.isArray(part)) list.push(...part);
++        else log("WARN", `${path.relative(REPO_ROOT, af)} is not a JSON array; skipped`);
++      } catch (e) { log("WARN", `${path.relative(REPO_ROOT, af)} is not valid JSON (${e.message}); its assertions stay out of the graph until it is fixed`); }
+     }
+     if (Array.isArray(list) && list.length) {
+       const insA = db.prepare(`INSERT INTO assertions(kind, payload, file_path, line, evidence, confidence, author, source_hash, created_at)
+diff --git a/payload/ariadne-node/server.mjs b/payload/ariadne-node/server.mjs
+index 9ad6af7..0d813b9 100644
+--- a/payload/ariadne-node/server.mjs
++++ b/payload/ariadne-node/server.mjs
+@@ -810,6 +810,33 @@ tool(server, "decision_trace",
+  *  multi-root workspace PARENT "succeeds" and then never gets re-parsed, so the
+  *  record silently vanishes on the next index — the bug this guards against for
+  *  ADRs, and now for insights too. */
++/** Directory whose docs/graph-assertions.json should hold an assertion about
++ *  `file`. Paths are repo-prefixed in a multi-root workspace, so the first
++ *  segment names the repo; anything unrecognised falls back to REPO_ROOT. */
++/** Every place an assertions file may live: the workspace parent, then each
++ *  repo. Readers use all of them; writers pick one via assertionsBase. */
++function assertionFiles() {
++  const out = [path.join(REPO_ROOT, "docs", "graph-assertions.json")];
++  try {
++    for (const r of withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
++      .map((r) => r.key.slice("last_sha:".length)).filter((x) => x !== ".")) {
++      const p = path.join(rootDir(r), "docs", "graph-assertions.json");
++      if (!out.includes(p)) out.push(p);
++    }
++  } catch { /* fresh index */ }
++  return out;
++}
++
++function assertionsBase(file) {
++  try {
++    const prefixes = withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
++      .map((r) => r.key.slice("last_sha:".length)).filter((x) => x !== ".");
++    const seg = String(file ?? "").split("/")[0];
++    if (prefixes.includes(seg)) return rootDir(seg);
++  } catch { /* fresh index */ }
++  return REPO_ROOT;
++}
++
+ function resolveWriteRoot(root, what) {
+   const prefixes = withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
+     .map((r) => r.key.slice("last_sha:".length));
+@@ -1007,7 +1034,11 @@ tool(server, "assert_edge",
+     try { hash = d.prepare("SELECT hash FROM files WHERE path=?").get(a.file)?.hash ?? null; } finally { d.close(); }
+     if (!hash) return `File '${a.file}' is not in the index, check the path (it is repo-prefixed in a multi-repo workspace).`;
+ 
+-    const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
++    // Anchor to the repo that owns the evidence file. Writing to the multi-root
++    // parent "works" — the indexer reads it — but the parent is not a git repo,
++    // so nothing is versioned, reviewed, or shared, which is the entire promise
++    // this tool makes. Falls back to REPO_ROOT for a single-repo workspace.
++    const af = path.join(assertionsBase(a.file), "docs", "graph-assertions.json");
+     let list = [];
+     if (fs.existsSync(af)) {
+       // Never clobber: a malformed file (merge-conflict marker, stray comma) must
+@@ -1023,7 +1054,7 @@ tool(server, "assert_edge",
+     list.push(rec);
+     fs.mkdirSync(path.dirname(af), { recursive: true });
+     fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
+-    return `Asserted and recorded in docs/graph-assertions.json (${list.length} total). It enters the graph on the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically if ${a.file} changes. Commit the file to share it with the team.`;
++    return `Asserted and recorded in ${path.relative(WS_BASE, af)} (${list.length} total). It enters the graph on the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically if ${a.file} changes. Commit the file to share it with the team.`;
+   });
+ 
+ tool(server, "message_flow",
+@@ -1898,12 +1929,20 @@ resource(server, "decision", new ResourceTemplate("ariadne://decisions/{id}", {
+ resource(server, "assertions", "ariadne://assertions",
+   { description: "The human knowledge layer: docs/graph-assertions.json with a computed stale flag per assertion (evidence file changed since it was recorded).", mimeType: "application/json" },
+   () => {
+-    const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
+-    if (!fs.existsSync(af)) return { assertions: [], note: "No graph-assertions.json yet — assert_edge (or the graph view) creates it." };
+-    let list;
+-    try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
+-    catch (e) { return `docs/graph-assertions.json exists but is not valid JSON (${e.message}). Fix it by hand; nothing here will overwrite it.`; }
+-    if (!Array.isArray(list)) return "docs/graph-assertions.json is not a JSON array. Fix it by hand; nothing here will overwrite it.";
++    // Same candidate set the indexer reads: the parent plus each repo, so a
++    // multi-root workspace does not under-report what is actually in the graph.
++    const list = [];
++    let found = false;
++    for (const af of assertionFiles()) {
++      if (!fs.existsSync(af)) continue;
++      found = true;
++      let part;
++      try { part = JSON.parse(fs.readFileSync(af, "utf8")); }
++      catch (e) { return `${path.relative(WS_BASE, af)} exists but is not valid JSON (${e.message}). Fix it by hand; nothing here will overwrite it.`; }
++      if (!Array.isArray(part)) return `${path.relative(WS_BASE, af)} is not a JSON array. Fix it by hand; nothing here will overwrite it.`;
++      list.push(...part);
++    }
++    if (!found) return { assertions: [], note: "No graph-assertions.json yet — assert_edge (or the graph view) creates it." };
+     try {
+       withDb((d) => {
+         const h = d.prepare("SELECT hash FROM files WHERE path=?");
+diff --git a/payload/ariadne-python/annotate.py b/payload/ariadne-python/annotate.py
+index d2d3857..d06555b 100644
+--- a/payload/ariadne-python/annotate.py
++++ b/payload/ariadne-python/annotate.py
+@@ -36,6 +36,55 @@ except Exception:  # noqa: BLE001
+     die("annotate expects one JSON argument; see the header of this file.")
+ author = a.get("author") or "human"
+ 
++def _root_prefixes():
++    """Repo prefixes in a multi-root workspace (empty for a single repo)."""
++    try:
++        con = sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)
++        try:
++            return [r[0][len("last_sha:"):] for r in
++                    con.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()
++                    if r[0][len("last_sha:"):] != "."]
++        finally:
++            con.close()
++    except sqlite3.Error:
++        return []
++
++
++def _assertions_base(file):
++    """Directory whose docs/graph-assertions.json should hold an assertion about `file`.
++
++    Paths are repo-prefixed, so the first segment names the repo. Writing to the
++    multi-root parent "works" -- the indexer reads it -- but the parent is not a
++    git repo, so nothing is versioned, reviewed, or shared.
++    Parity: _assertions_base in server.py.
++    """
++    seg = str(file or "").split("/")[0]
++    return ROOT / seg if seg in _root_prefixes() else ROOT
++
++
++def _assertion_files():
++    """Every place an assertions file may live: parent, then each repo."""
++    out = [ROOT / "docs" / "graph-assertions.json"]
++    for r in _root_prefixes():
++        f = ROOT / r / "docs" / "graph-assertions.json"
++        if f not in out:
++            out.append(f)
++    return out
++
++
++def _read_assertions(af):
++    """Read an assertions file, refusing to proceed on malformed JSON."""
++    if not af.exists():
++        return None
++    try:
++        lst = json.loads(af.read_text(encoding="utf-8"))
++    except Exception as e:  # noqa: BLE001
++        die(f"{af} is not valid JSON ({e}). Fix or remove it first.")
++    if not isinstance(lst, list):
++        die(f"{af} is not a JSON array. Fix it first.")
++    return lst
++
++
+ if a.get("action") == "insight":
+     if a.get("kind") not in ("module", "file", "topic", "table") or len(a.get("summary", "")) < 40 or not a.get("target"):
+         die("insight needs target, kind (module|file|topic|table), and a summary of at least 40 chars.")
+@@ -137,16 +186,8 @@ elif a.get("action") == "assert":
+     if not row or not row[0]:
+         die(f"File '{a.get('file')}' is not in the index (paths are repo-prefixed in a multi-repo workspace).")
+ 
+-    af = ROOT / "docs" / "graph-assertions.json"
+-    lst = []
+-    if af.exists():
+-        # Never clobber: a malformed file must not erase the team's assertions.
+-        try:
+-            lst = json.loads(af.read_text(encoding="utf-8"))
+-        except Exception as e:  # noqa: BLE001
+-            die(f"docs/graph-assertions.json exists but is not valid JSON ({e}). Fix or remove it first.")
+-        if not isinstance(lst, list):
+-            die("docs/graph-assertions.json is not a JSON array. Fix it first.")
++    af = _assertions_base(a.get("file")) / "docs" / "graph-assertions.json"
++    lst = _read_assertions(af) or []
+     rec = {"kind": a["kind"], "file": a["file"], "line": a.get("line", 0), "evidence": a["evidence"],
+            "confidence": a.get("confidence") if a.get("confidence") in ("high", "medium", "low") else "medium",
+            "author": author, "source_hash": row[0],
+@@ -160,7 +201,7 @@ elif a.get("action") == "assert":
+     lst.append(rec)
+     af.parent.mkdir(parents=True, exist_ok=True)
+     af.write_text(json.dumps(lst, indent=2) + "\n", encoding="utf-8")
+-    print(f"Asserted (provenance: {author}) and recorded in docs/graph-assertions.json ({len(lst)} total). "
++    print(f"Asserted (provenance: {author}) and recorded in {af.relative_to(ROOT) if str(af).startswith(str(ROOT)) else af} ({len(lst)} total). "
+           f"It enters the graph on the next index, marked STALE automatically if {a['file']} changes. "
+           "Commit the file to share it.")
+ 
+@@ -171,15 +212,15 @@ elif a.get("action") == "dismiss":
+         die("dismiss needs gap (e.g. orphan_topic) and key (topic/table/path).")
+     if len(a.get("reason", "")) < 10:
+         die("reason must say why this gap is acceptable (10+ chars).")
+-    af = ROOT / "docs" / "graph-assertions.json"
+-    alist = []
+-    if af.exists():
+-        try:
+-            alist = json.loads(af.read_text(encoding="utf-8"))
+-        except Exception as e:  # noqa: BLE001
+-            die(f"docs/graph-assertions.json is not valid JSON ({e}). Fix it first.")
+-        if not isinstance(alist, list):
+-            die("docs/graph-assertions.json is not a JSON array. Fix it first.")
++    # A dismissal is about a gap key, not a file, so there is no repo to infer.
++    # It goes where the caller says, else the workspace root.
++    _prefixes = _root_prefixes()
++    _base = ROOT / a["root"] if a.get("root") in _prefixes else ROOT
++    af = _base / "docs" / "graph-assertions.json"
++    if _prefixes and _base == ROOT:
++        print('Note: the workspace root is not a git repo, so this dismissal will not be versioned. '
++              f'Pass "root":"<repo>" to commit it. Repos: {", ".join(_prefixes)}.', file=sys.stderr)
++    alist = _read_assertions(af) or []
+     alist = [x for x in alist if not (x.get("kind") == "dismissal" and x.get("gap") == a["gap"] and x.get("key") == a["key"])]
+     alist.append({"kind": "dismissal", "gap": a["gap"], "key": a["key"], "reason": a["reason"],
+                   "author": author, "dismissed_at": datetime.date.today().isoformat()})
+@@ -191,23 +232,25 @@ elif a.get("action") in ("retract", "reaffirm"):
+     # lifecycle for existing assertions, keyed by the same natural key the
+     # no-duplicate filter uses. retract removes; reaffirm re-verifies: the
+     # source_hash moves to the evidence file's CURRENT hash, clearing STALE.
+-    af = ROOT / "docs" / "graph-assertions.json"
+-    if not af.exists():
+-        die("docs/graph-assertions.json does not exist; nothing to modify.")
+-    try:
+-        alist = json.loads(af.read_text(encoding="utf-8"))
+-    except Exception as e:  # noqa: BLE001
+-        die(f"docs/graph-assertions.json is not valid JSON ({e}). Fix it first.")
+-    if not isinstance(alist, list):
+-        die("docs/graph-assertions.json is not a JSON array. Fix it first.")
+-
++    # The record may live in the parent (older placements) or in the repo that
++    # owns its evidence file, so edit whichever one actually holds it. af and
++    # alist are chosen below, once the natural key is known.
+     def key(x):
+         return "|".join(str(v) for v in (x.get("kind"), x.get("file"), x.get("line", 0),
+                                          x.get("topic", ""), x.get("table", ""), x.get("path", "")))
+     target = key(a)
+-    hits = [x for x in alist if key(x) == target]
++    af = alist = None
++    hits = []
++    for cand in _assertion_files():
++        part = _read_assertions(cand)
++        if part is None:
++            continue
++        found = [x for x in part if key(x) == target]
++        if found:
++            af, alist, hits = cand, part, found
++            break
+     if not hits:
+-        die("No matching assertion found in docs/graph-assertions.json (key: kind+file+line+topic/table/path).")
++        die("No matching assertion found in any docs/graph-assertions.json (key: kind+file+line+topic/table/path).")
+     if a["action"] == "retract":
+         alist = [x for x in alist if key(x) != target]
+         af.write_text(json.dumps(alist, indent=2) + "\n", encoding="utf-8")
+diff --git a/payload/ariadne-python/indexer.py b/payload/ariadne-python/indexer.py
+index 49b223a..d490f85 100644
+--- a/payload/ariadne-python/indexer.py
++++ b/payload/ariadne-python/indexer.py
+@@ -1312,13 +1312,27 @@ def kafka_pass(con, scope_prefixes=None):
+     con.execute("DELETE FROM assertions")
+     for t in ("msg_edges", "db_access", "http_endpoints", "http_calls"):
+         con.execute(f"DELETE FROM {t} WHERE source LIKE 'asserted%'")
+-    af = REPO_ROOT / "docs" / "graph-assertions.json"
++    # Parent AND every root. In a multi-root workspace the parent is not a git
++    # repo, so an assertion written there is loaded but never actually versioned
++    # or shared -- the "committed and reviewable" promise silently absent exactly
++    # where there are the most repos. Writers now anchor to the repo owning the
++    # evidence file; reading both keeps older placements working.
+     alist = []
+-    if af.exists():
++    _seen_a = set()
++    for _root in [REPO_ROOT, *ROOTS]:
++        af = _root / "docs" / "graph-assertions.json"
++        if af in _seen_a or not af.exists():
++            continue
++        _seen_a.add(af)
+         try:
+-            alist = json.loads(af.read_text(encoding="utf-8"))
++            part = json.loads(af.read_text(encoding="utf-8"))
+         except Exception as e:  # noqa: BLE001
+-            log.warning("docs/graph-assertions.json is not valid JSON (%s); assertions stay out of the graph until it is fixed", e)
++            log.warning("%s is not valid JSON (%s); its assertions stay out of the graph until it is fixed", af, e)
++            continue
++        if isinstance(part, list):
++            alist.extend(part)
++        else:
++            log.warning("%s is not a JSON array; skipped", af)
+     if isinstance(alist, list) and alist:
+         loaded = stale = 0
+         # Same rule as insights: docs/graph-assertions.json is committed, so its
+diff --git a/payload/ariadne-python/server.py b/payload/ariadne-python/server.py
+index 850d9ff..6106558 100644
+--- a/payload/ariadne-python/server.py
++++ b/payload/ariadne-python/server.py
+@@ -894,6 +894,43 @@ def decision_trace(id: str) -> str:
+         **({"warning": "supersession cycle detected in this chain — fix the ADR frontmatter"} if cycle else {})}
+ 
+ 
++def _assertions_base(file: str) -> Path:
++    """Directory whose docs/graph-assertions.json should hold an assertion about `file`.
++
++    Paths are repo-prefixed in a multi-root workspace, so the first segment names
++    the repo. Writing to the parent "works" -- the indexer reads it -- but the
++    parent is not a git repo, so nothing is versioned, reviewed, or shared, which
++    is the entire promise this tool makes. Parity: assertionsBase in server.mjs.
++    """
++    try:
++        con = db()
++        prefixes = [r["key"][len("last_sha:"):] for r in
++                    con.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]
++        seg = str(file or "").split("/")[0]
++        if seg in [p for p in prefixes if p != "."]:
++            return _root_dir(seg)
++    except sqlite3.Error:
++        pass  # fresh index
++    return REPO_ROOT
++
++
++def _assertion_files():
++    """Every place an assertions file may live: parent, then each repo."""
++    out = [REPO_ROOT / "docs" / "graph-assertions.json"]
++    try:
++        con = db()
++        for r in [x["key"][len("last_sha:"):] for x in
++                  con.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]:
++            if r == ".":
++                continue
++            f = _root_dir(r) / "docs" / "graph-assertions.json"
++            if f not in out:
++                out.append(f)
++    except sqlite3.Error:
++        pass  # fresh index
++    return out
++
++
+ def _resolve_write_root(root: str, what: str):
+     """Pick a git-versioned root to write durable memory into.
+ 
+@@ -1145,9 +1182,7 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str
+     if not row:
+         return f"File '{file}' is not in the index, check the path (repo-prefixed in a multi-repo workspace)."
+ 
+-    root = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
+-                               text=True).stdout.strip() or Path.cwd())
+-    af = root / "docs" / "graph-assertions.json"
++    af = _assertions_base(file) / "docs" / "graph-assertions.json"
+     lst = []
+     if af.exists():
+         # Never clobber: a malformed file (merge-conflict marker, stray comma) must
+@@ -1173,7 +1208,8 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str
+     lst.append(rec)
+     af.parent.mkdir(parents=True, exist_ok=True)
+     af.write_text(json.dumps(lst, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+-    return (f"Asserted and recorded in docs/graph-assertions.json ({len(lst)} total). It enters the graph on "
++    _rel = af.relative_to(WS_BASE) if str(af).startswith(str(WS_BASE)) else af
++    return (f"Asserted and recorded in {_rel} ({len(lst)} total). It enters the graph on "
+             f"the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically "
+             f"if {file} changes. Commit the file to share it with the team.")
+ 
+@@ -2283,15 +2319,22 @@ def resource_decision(id: str) -> str:
+ @mcp.resource("ariadne://assertions", name="assertions", mime_type="application/json",
+               description="The human knowledge layer: docs/graph-assertions.json with a computed stale flag per assertion (evidence file changed since it was recorded).")
+ def resource_assertions() -> str:
+-    af = REPO_ROOT / "docs" / "graph-assertions.json"
+-    if not af.exists():
++    # Same candidate set the indexer reads: the parent plus each repo, so a
++    # multi-root workspace does not under-report what is actually in the graph.
++    lst, found = [], False
++    for af in _assertion_files():
++        if not af.exists():
++            continue
++        found = True
++        try:
++            part = json.loads(af.read_text(encoding="utf-8"))
++        except Exception as e:  # noqa: BLE001
++            return f"{af} exists but is not valid JSON ({e}). Fix it by hand; nothing here will overwrite it."
++        if not isinstance(part, list):
++            return f"{af} is not a JSON array. Fix it by hand; nothing here will overwrite it."
++        lst.extend(part)
++    if not found:
+         return json.dumps({"assertions": [], "note": "No graph-assertions.json yet — assert_edge (or the graph view) creates it."}, indent=1, ensure_ascii=False)
+-    try:
+-        lst = json.loads(af.read_text(encoding="utf-8"))
+-    except Exception as e:  # noqa: BLE001
+-        return f"docs/graph-assertions.json exists but is not valid JSON ({e}). Fix it by hand; nothing here will overwrite it."
+-    if not isinstance(lst, list):
+-        return "docs/graph-assertions.json is not a JSON array. Fix it by hand; nothing here will overwrite it."
+     try:
+         con = db()
+         for a in lst:
+diff --git a/tests/run_tests.py b/tests/run_tests.py
+index e43d4b4..bb84dab 100644
+--- a/tests/run_tests.py
++++ b/tests/run_tests.py
+@@ -1179,8 +1179,13 @@ await c.close();
+         "direction": "produce", "topic": "orders.created.manual",
+         "evidence": "PREFIX is a static final 'orders.created'; env resolves to a fixed suffix here.",
+         "confidence": "high"})], ws)
+-    check("annotate: assertion recorded without clobbering existing file",
+-          code == 0 and (ws / "docs" / "graph-assertions.json").exists(), oas[-200:])
++    # assertions now anchor to the repo that owns the evidence file, so they are
++    # actually git-versioned; the workspace parent is not a repo in a multi-root
++    # workspace, which is where they used to land and quietly stay unversioned
++    arepo = gap_row[0].split("/")[0]
++    afile_anchored = ws / arepo / "docs" / "graph-assertions.json"
++    check("annotate: assertion recorded in the repo owning its evidence file",
++          code == 0 and afile_anchored.exists(), oas[-200:])
+     code, _oi = run(exe + [idx, "--full"], ws)  # ingest the assertion
+     db = sqlite3.connect(ws / ".ariadne" / "index.db")
+     srow = db.execute("SELECT source FROM msg_edges WHERE topic='orders.created.manual'").fetchone()
+@@ -1203,14 +1208,14 @@ await c.close();
+     check("assertion goes stale when its evidence file changes", a_hash != cur_hash)
+     code, orf = run(exe + [an, json.dumps({"action": "reaffirm", "kind": "kafka", "file": gap_row[0],
+                                            "line": 601, "topic": "orders.created.manual"})], ws)
+-    alist = json.loads((ws / "docs" / "graph-assertions.json").read_text(encoding="utf-8"))
++    alist = json.loads(afile_anchored.read_text(encoding="utf-8"))
+     hit = [x for x in alist if x.get("topic") == "orders.created.manual"]
+     check("annotate: reaffirm moves source_hash to the file's current hash",
+           code == 0 and hit and hit[0].get("source_hash") == cur_hash
+           and hit[0].get("reaffirmed_by") == "human", orf[-200:])
+     code, ort = run(exe + [an, json.dumps({"action": "retract", "kind": "kafka", "file": gap_row[0],
+                                            "line": 601, "topic": "orders.created.manual"})], ws)
+-    alist = json.loads((ws / "docs" / "graph-assertions.json").read_text(encoding="utf-8"))
++    alist = json.loads(afile_anchored.read_text(encoding="utf-8"))
+     check("annotate: retract removes the assertion from the source of truth",
+           code == 0 and not any(x.get("topic") == "orders.created.manual" for x in alist), ort[-200:])
+     run(exe + [idx, "--incremental"], ws)
+@@ -1378,6 +1383,7 @@ const sdRefuse = await call("save_decision", { title: "Probe anchor refusal", de
+ const sdOk = await call("save_decision", { title: "Probe anchor rooted", decision: "This decision exists to verify multi-root anchoring behavior.", rationale: "Anchoring test needs it.", root: "docs-repo" });
+ import fs from "node:fs";
+ import path from "node:path";
++import { execFileSync } from "node:child_process";
+ import Database from "better-sqlite3";
+ const adrDir = path.join(process.cwd(), "docs-repo", "docs", "adr");
+ const probeAdr = fs.existsSync(adrDir) ? fs.readdirSync(adrDir).filter((f) => f.includes("probe-anchor-rooted")) : [];
+@@ -1401,6 +1407,12 @@ await call("assert_edge", { kind: "kafka", file: "order-service/src/main/java/co
+ const asr2 = JSON.parse(await read("ariadne://assertions"));
+ const recA = (asr2.assertions ?? []).find((x) => x && x.topic === "probe.contract.check") ?? {};
+ const contractOk = recA.confidence === "medium" && !("mode" in recA) && !("method" in recA) && recA.direction === "produce";
++// assert_edge now anchors the file inside the repo that owns the evidence, so it
++// legitimately dirties that worktree until committed — exactly what the tool
++// tells you to do. Commit it, or the freshness probe below sees this file.
++const asrRepo = path.join(process.cwd(), "order-service");
++execFileSync("git", ["add", "-A"], { cwd: asrRepo });
++execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "record assertion"], { cwd: asrRepo });
+ 
+ // ---- batch 18: fresh tells the truth about the worktree ----
+ const scratch = path.join(process.cwd(), "order-service", "src", "main", "java", "com", "acme", "ProbeScratch.java");
+@@ -1485,7 +1497,7 @@ await c.close();
+         sprobe.unlink(missing_ok=True)
+     else:
+         sprobe = ws / ".ariadne" / "_surface.py"
+-        sprobe.write_text('''import asyncio, json, sys
++        sprobe.write_text('''import asyncio, json, os, subprocess, sys
+ from mcp import ClientSession, StdioServerParameters, types
+ from mcp.client.stdio import stdio_client
+ from pydantic import AnyUrl
+@@ -1578,6 +1590,12 @@ async def main():
+             rec_a = next((x for x in asr2.get("assertions", []) if isinstance(x, dict) and x.get("topic") == "probe.contract.check"), {})
+             contract_ok = (rec_a.get("confidence") == "medium" and "mode" not in rec_a
+                            and "method" not in rec_a and rec_a.get("direction") == "produce")
++            # assert_edge now anchors the file inside the repo that owns the
++            # evidence, so it legitimately dirties that worktree until committed.
++            _asr_repo = os.path.join(os.getcwd(), "order-service")
++            subprocess.run(["git", "add", "-A"], cwd=_asr_repo, check=True)
++            subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
++                            "commit", "-qm", "record assertion"], cwd=_asr_repo, check=True)
+ 
+             # ---- batch 18: fresh tells the truth about the worktree ----
+             scratch = os.path.join(os.getcwd(), "order-service", "src", "main", "java", "com", "acme", "ProbeScratch.java")
+-- 
+2.43.0
+

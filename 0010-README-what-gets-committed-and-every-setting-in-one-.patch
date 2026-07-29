@@ -1,0 +1,136 @@
+From b69e4569f2f3d71dd511c150518c5028c2212229 Mon Sep 17 00:00:00 2001
+From: rehanraza786 <rehanraza786@users.noreply.github.com>
+Date: Wed, 29 Jul 2026 03:21:15 +0000
+Subject: [PATCH 10/12] README: what gets committed, and every setting in one
+ table
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Eight of the nine commits in this branch change something a user has to
+know about, and none of it was written down anywhere they would look. Two
+new sections, both above the Reference line where people actually read.
+
+"What gets committed, and why it matters" states the rule the whole memory
+design rests on and that nothing in the README said out loud: .ariadne/ is
+gitignored and disposable, so ADRs, graph assertions and insights live in
+your repos or they do not survive. A table of the three files, who writes
+each, and the answer to "do I commit this" (yes, all three). Then the parts
+that surprise people: the tools leave the worktree dirty on purpose, writes
+anchor to the repo owning the evidence in a multi-repo workspace, an
+ambiguous write is refused rather than dropped somewhere git cannot see, and
+reviewing an insight means reading it as an instruction to a machine.
+
+"Settings" collects every knob in one table with defaults, instead of one
+prose sentence listing names and a separate file holding the meanings.
+Adds the two settings this branch introduced (maxInsights,
+maxInsightChars), the VS Code pair, and the only environment variables that
+do anything — all of them enrichment's, which is the honest way to say that
+nothing else phones home.
+
+Also says plainly that tool descriptions are written for agents rather than
+for humans, and points at TOOLS.md and the aegis-help skill, so a reader who
+finds them terse knows that is deliberate and where the long form went.
+
+The "Using it" table now ends by saying three of those answers write a file
+you should commit, since that is the one habit the toolkit needs and the
+table read as though everything happened invisibly.
+---
+ README.md | 74 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 74 insertions(+)
+
+diff --git a/README.md b/README.md
+index e373b7f..ada10ab 100644
+--- a/README.md
++++ b/README.md
+@@ -110,6 +110,11 @@ Point Claude Code, Cursor, Zed, or anything else that speaks MCP at that command
+ | *"We just decided to use an outbox, record it"* | Writes a numbered, formatted ADR into `docs/adr/` and indexes it on the spot |
+ | *"Why can't the graph resolve this topic?"* | Shows you exactly where static analysis is blind, and lets you teach it the answer with evidence |
+ 
++Three of those answers write a file into your repo — an ADR, a graph
++assertion, an insight. That is deliberate: it is how the knowledge outlives the
++chat, and it is the one habit the tool needs from you. See
++[What gets committed](#what-gets-committed-and-why-it-matters).
++
+ That is the whole interface. There is a one-page [cheat sheet](docs/CHEATSHEET.md) your team can pin. Everything below this line is reference: useful when you want it, unnecessary to get started.
+ 
+ ### Handing off bigger work
+@@ -248,6 +253,75 @@ Insights follow the same durability contract as ADRs and assertions: the source
+ 
+ ---
+ 
++## What gets committed, and why it matters
++
++Three things AEGIS produces live in **your git repos**, not in the index. The
++index (`.ariadne/`) is gitignored and disposable — it is rebuilt from these on
++every reindex, so anything that exists only there is destroyed the next time a
++teammate runs *Pull Team Index* or the index is rebuilt.
++
++| File | Written by | Commit it? |
++|---|---|---|
++| `docs/adr/*.md` | `save_decision`, or you | Yes — decision memory |
++| `docs/graph-assertions.json` | `assert_edge`, the graph view | Yes — derived facts and gap dismissals, reviewed in PRs |
++| `docs/insights.json` | `save_insight`, the graph view, `enrich` | Yes — prose understanding, reviewed in PRs |
++
++**The workflow is: the tool writes the file, you commit it.** Each of those
++tools ends its reply by telling you which path it wrote, and every one of them
++leaves that worktree dirty until you commit — that is the tool doing its job,
++not a bug. If you would rather insights stayed on your machine, gitignore
++`docs/insights.json`; everything still works and `explain` simply has nothing
++cached to serve.
++
++**In a multi-repo workspace**, writes anchor to the repo that owns the evidence:
++an assertion about `order-service/…/OrderPublisher.java` lands in
++`order-service/docs/`. Where there is no evidence to anchor to — a `save_decision`
++with no repo, a dismissal whose gap spans several — the tool refuses and names
++the candidates rather than writing somewhere git cannot see. Pass
++`root: "<repo>"` to resolve it.
++
++**Reviewing these files is a real review.** An insight summary is injected into
++`explain` and `context_pack` ahead of the code, framed as established
++understanding, so read it as an instruction to a machine rather than as
++documentation. Provenance is stamped by the indexer, never taken from the file,
++so an entry cannot claim to be a parsed fact. The `graph-augmentation` skill has
++the full checklist.
++
++## Settings
++
++Everything is optional; the defaults are what the tests run against.
++
++**`.ariadne/config.json`** — indexing and budgets. The full annotated example is
++in [SETUP.md](SETUP.md). The ones people actually change:
++
++| Setting | Default | What it does |
++|---|---|---|
++| `skipDirs` | build dirs | Directories never indexed (added to the built-in list) |
++| `maxFileBytes` | 1500000 | Skip files larger than this |
++| `tableNameOverrides` | `{}` | For a custom Hibernate naming strategy — the indexer can't execute your Java |
++| `testPathPatterns` / `prodPathPatterns` | `[]` | Regexes that force files into or out of test classification |
++| `workers` | auto | Parallel extract processes; `1` forces sequential |
++| `maxToolRows` / `maxToolBytes` | 50 / 24000 | Hard caps on any single tool result |
++| `summaryThreshold` | 40 | Past this many items, unscoped seam maps summarize instead of dumping |
++| `maxInsights` | 2000 | Entries loaded from `docs/insights.json` |
++| `maxInsightChars` | 600 | How much of one insight is inlined before pointing at `explain` |
++
++**VS Code** — `aegis.runtime` (`node` or `python`) and
++`aegis.autoRegisterAriadne`. Use `python` if your environment blocks native
++binaries; see Troubleshooting.
++
++**Environment** — only enrichment reads any: `ANTHROPIC_API_KEY` or
++`OPENAI_API_KEY` (+ `OPENAI_BASE_URL` to point at Ollama/vLLM for zero egress),
++and `AEGIS_MODEL`. Nothing else in the toolkit makes a network call except
++`pull-index.sh` talking to your own CI. See [PRIVACY.md](PRIVACY.md).
++
++**Tool descriptions are written for agents, not for you.** They carry only what
++a model needs to pick the right tool, because the tool list is re-sent on every
++request. The reference for humans is [docs/TOOLS.md](docs/TOOLS.md); the
++distinctions that cause wrong answers — `find_callers` guesses, `find_references`
++concludes — are in the `aegis-help` skill, which an agent reads only when it is
++already uncertain.
++
+ ## Team setup
+ 
+ **Git hooks** (installed by setup) run an incremental index and regenerate docs after every commit, merge, and checkout, in the background, never blocking git.
+-- 
+2.43.0
+

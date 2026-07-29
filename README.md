@@ -110,6 +110,11 @@ Point Claude Code, Cursor, Zed, or anything else that speaks MCP at that command
 | *"We just decided to use an outbox, record it"* | Writes a numbered, formatted ADR into `docs/adr/` and indexes it on the spot |
 | *"Why can't the graph resolve this topic?"* | Shows you exactly where static analysis is blind, and lets you teach it the answer with evidence |
 
+Three of those answers write a file into your repo — an ADR, a graph
+assertion, an insight. That is deliberate: it is how the knowledge outlives the
+chat, and it is the one habit the tool needs from you. See
+[What gets committed](#what-gets-committed-and-why-it-matters).
+
 That is the whole interface. There is a one-page [cheat sheet](docs/CHEATSHEET.md) your team can pin. Everything below this line is reference: useful when you want it, unnecessary to get started.
 
 ### Handing off bigger work
@@ -247,6 +252,75 @@ Four ways to run it: **through Copilot** (`AEGIS: Enrich Insights via Copilot`, 
 Insights follow the same durability contract as ADRs and assertions: the source of truth is **`docs/insights.json`**, committed and reviewed in PRs, and the index is re-derived from it on every reindex. `index.db` is gitignored and disposable, so anything that only lived there — a teammate's `save_insight`, an enrichment run — was destroyed by *Pull Team Index* or a corruption rebuild. Commit the file to share it.
 
 ---
+
+## What gets committed, and why it matters
+
+Three things AEGIS produces live in **your git repos**, not in the index. The
+index (`.ariadne/`) is gitignored and disposable — it is rebuilt from these on
+every reindex, so anything that exists only there is destroyed the next time a
+teammate runs *Pull Team Index* or the index is rebuilt.
+
+| File | Written by | Commit it? |
+|---|---|---|
+| `docs/adr/*.md` | `save_decision`, or you | Yes — decision memory |
+| `docs/graph-assertions.json` | `assert_edge`, the graph view | Yes — derived facts and gap dismissals, reviewed in PRs |
+| `docs/insights.json` | `save_insight`, the graph view, `enrich` | Yes — prose understanding, reviewed in PRs |
+
+**The workflow is: the tool writes the file, you commit it.** Each of those
+tools ends its reply by telling you which path it wrote, and every one of them
+leaves that worktree dirty until you commit — that is the tool doing its job,
+not a bug. If you would rather insights stayed on your machine, gitignore
+`docs/insights.json`; everything still works and `explain` simply has nothing
+cached to serve.
+
+**In a multi-repo workspace**, writes anchor to the repo that owns the evidence:
+an assertion about `order-service/…/OrderPublisher.java` lands in
+`order-service/docs/`. Where there is no evidence to anchor to — a `save_decision`
+with no repo, a dismissal whose gap spans several — the tool refuses and names
+the candidates rather than writing somewhere git cannot see. Pass
+`root: "<repo>"` to resolve it.
+
+**Reviewing these files is a real review.** An insight summary is injected into
+`explain` and `context_pack` ahead of the code, framed as established
+understanding, so read it as an instruction to a machine rather than as
+documentation. Provenance is stamped by the indexer, never taken from the file,
+so an entry cannot claim to be a parsed fact. The `graph-augmentation` skill has
+the full checklist.
+
+## Settings
+
+Everything is optional; the defaults are what the tests run against.
+
+**`.ariadne/config.json`** — indexing and budgets. The full annotated example is
+in [SETUP.md](SETUP.md). The ones people actually change:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `skipDirs` | build dirs | Directories never indexed (added to the built-in list) |
+| `maxFileBytes` | 1500000 | Skip files larger than this |
+| `tableNameOverrides` | `{}` | For a custom Hibernate naming strategy — the indexer can't execute your Java |
+| `testPathPatterns` / `prodPathPatterns` | `[]` | Regexes that force files into or out of test classification |
+| `workers` | auto | Parallel extract processes; `1` forces sequential |
+| `maxToolRows` / `maxToolBytes` | 50 / 24000 | Hard caps on any single tool result |
+| `summaryThreshold` | 40 | Past this many items, unscoped seam maps summarize instead of dumping |
+| `maxInsights` | 2000 | Entries loaded from `docs/insights.json` |
+| `maxInsightChars` | 600 | How much of one insight is inlined before pointing at `explain` |
+
+**VS Code** — `aegis.runtime` (`node` or `python`) and
+`aegis.autoRegisterAriadne`. Use `python` if your environment blocks native
+binaries; see Troubleshooting.
+
+**Environment** — only enrichment reads any: `ANTHROPIC_API_KEY` or
+`OPENAI_API_KEY` (+ `OPENAI_BASE_URL` to point at Ollama/vLLM for zero egress),
+and `AEGIS_MODEL`. Nothing else in the toolkit makes a network call except
+`pull-index.sh` talking to your own CI. See [PRIVACY.md](PRIVACY.md).
+
+**Tool descriptions are written for agents, not for you.** They carry only what
+a model needs to pick the right tool, because the tool list is re-sent on every
+request. The reference for humans is [docs/TOOLS.md](docs/TOOLS.md); the
+distinctions that cause wrong answers — `find_callers` guesses, `find_references`
+concludes — are in the `aegis-help` skill, which an agent reads only when it is
+already uncertain.
 
 ## Team setup
 

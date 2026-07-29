@@ -1,0 +1,176 @@
+From f823b1883e4dd3d36fa9de841345bdc01101632f Mon Sep 17 00:00:00 2001
+From: rehanraza786 <rehanraza786@users.noreply.github.com>
+Date: Wed, 29 Jul 2026 01:26:05 +0000
+Subject: [PATCH 05/12] Assertions cannot forge provenance either; find_callers
+ says when it is guessing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the class rather than the instance. docs/graph-assertions.json is
+committed and therefore attacker-controlled in any repo that takes PRs, and
+the ingest copied its author field verbatim into both assertions.author and
+the msg_edges/db_access source column — so an entry could write
+author:"parser" and read as a parsed fact, the same hole just fixed for
+insights. Author is now clamped to a display-safe token, reserved words
+(parser, ariadne, scip, tree-sitter, indexer) are prefixed 'claimed-',
+confidence is constrained to high|medium|low instead of stored as given,
+and evidence is length-capped.
+
+find_callers already told agents it was heuristic — in its description, and
+in the message it returns when it finds nothing. Neither helps an agent
+holding a plausible-looking list of callers. It now carries the warning on
+populated results, and only when SCIP actually has compiler-resolved data
+for that symbol, so the hint costs nothing when it could not be acted on.
+
+run_tests.py: a committed assertion cannot forge parser provenance.
+---
+ payload/ariadne-node/indexer.mjs  | 17 ++++++++++++++---
+ payload/ariadne-node/server.mjs   | 11 ++++++++++-
+ payload/ariadne-python/indexer.py | 21 ++++++++++++++++++---
+ payload/ariadne-python/server.py  | 15 ++++++++++++++-
+ tests/run_tests.py                | 14 ++++++++++++++
+ 5 files changed, 70 insertions(+), 8 deletions(-)
+
+diff --git a/payload/ariadne-node/indexer.mjs b/payload/ariadne-node/indexer.mjs
+index b6a31b9..d9d30df 100644
+--- a/payload/ariadne-node/indexer.mjs
++++ b/payload/ariadne-node/indexer.mjs
+@@ -1203,11 +1203,22 @@ async function kafkaPass(db, scopePrefixes = null) {
+                                VALUES(?,?,?,?,?,?,?,?,?)`);
+       const fid = db.prepare("SELECT id, hash FROM files WHERE path=?");
+       let loaded = 0, stale = 0;
++      // Same rule as insights: docs/graph-assertions.json is committed, so its
++      // contents are attacker-controlled in any repo that takes PRs. An entry
++      // must not be able to write author:"parser" and be displayed as a parsed
++      // fact — provenance is stamped here, from a clamped token, and every
++      // asserted row is already tagged 'asserted:' in the source column.
++      const safeAuthor = (x) => String(x ?? "assistant").replace(/[^\w.:@-]/g, "").slice(0, 40) || "assistant";
++      const RESERVED = new Set(["parser", "ariadne", "ariadne-parser", "scip", "tree-sitter", "indexer"]);
+       for (const a of list) {
+         const f = fid.get(a.file);
+-        const src = `asserted:${a.author ?? "assistant"}`;
+-        insA.run(a.kind, JSON.stringify(a), a.file ?? null, a.line ?? null, a.evidence ?? null,
+-                 a.confidence ?? "medium", a.author ?? "assistant", a.source_hash ?? null, Date.now() / 1000);
++        let author = safeAuthor(a.author);
++        if (RESERVED.has(author.toLowerCase())) author = `claimed-${author}`;
++        const conf = ["high", "medium", "low"].includes(a.confidence) ? a.confidence : "medium";
++        const src = `asserted:${author}`;
++        insA.run(a.kind, JSON.stringify(a), a.file ?? null, a.line ?? null,
++                 a.evidence == null ? null : String(a.evidence).slice(0, 2000),
++                 conf, author, a.source_hash ?? null, Date.now() / 1000);
+         if (a.source_hash && f && f.hash !== a.source_hash) stale++;
+         if (!f) continue;
+         if (a.kind === "kafka" && a.topic && a.direction) {
+diff --git a/payload/ariadne-node/server.mjs b/payload/ariadne-node/server.mjs
+index 6acbb47..9ad6af7 100644
+--- a/payload/ariadne-node/server.mjs
++++ b/payload/ariadne-node/server.mjs
+@@ -642,7 +642,16 @@ tool(server, "find_callers",
+        JOIN symbols s ON s.id=c.src_symbol JOIN files f ON f.id=s.file_id
+        WHERE c.callee = ? ORDER BY f.path, c.line LIMIT ?`
+ ).all(name, clamp(limit ?? 40, 1, 100));
+-    return rows.length ? rows : "No callers recorded (AST index may not cover this file's language, or name mismatch, try find_references for SCIP-grade lookup).";
++    if (!rows.length) return "No callers recorded (AST index may not cover this file's language, or name mismatch, try find_references for SCIP-grade lookup).";
++    // Saying "heuristic" in the tool description does not help an agent holding
++    // a plausible-looking result. Say it here, and only when a precise answer
++    // actually exists for this symbol, so the hint costs nothing when it cannot
++    // be acted on.
++    let scip = 0;
++    try { scip = d.prepare("SELECT COUNT(*) c FROM scip_defs WHERE symbol LIKE ?").get(`%${name}%`).c; } catch { /* no SCIP ingested */ }
++    return scip
++      ? { callers: rows, note: `heuristic (name match). SCIP has compiler-resolved data for '${name}' — use find_references before concluding anything is or is not used.` }
++      : rows;
+   }));
+ 
+ tool(server, "find_callees",
+diff --git a/payload/ariadne-python/indexer.py b/payload/ariadne-python/indexer.py
+index 924381f..49b223a 100644
+--- a/payload/ariadne-python/indexer.py
++++ b/payload/ariadne-python/indexer.py
+@@ -1321,13 +1321,28 @@ def kafka_pass(con, scope_prefixes=None):
+             log.warning("docs/graph-assertions.json is not valid JSON (%s); assertions stay out of the graph until it is fixed", e)
+     if isinstance(alist, list) and alist:
+         loaded = stale = 0
++        # Same rule as insights: docs/graph-assertions.json is committed, so its
++        # contents are attacker-controlled in any repo that takes PRs. An entry
++        # must not be able to write author="parser" and be displayed as a parsed
++        # fact -- provenance is stamped here, from a clamped token, and every
++        # asserted row is already tagged 'asserted:' in the source column.
++        _RESERVED = {"parser", "ariadne", "ariadne-parser", "scip", "tree-sitter", "indexer"}
++
++        def _safe_author(x):
++            a = re.sub(r"[^\w.:@-]", "", str(x if x is not None else "assistant"))[:40] or "assistant"
++            return f"claimed-{a}" if a.lower() in _RESERVED else a
++
+         for a in alist:
+             fr = con.execute("SELECT id, hash FROM files WHERE path=?", (a.get("file"),)).fetchone()
+-            src = f"asserted:{a.get('author', 'assistant')}"
++            author = _safe_author(a.get("author"))
++            conf = a.get("confidence") if a.get("confidence") in ("high", "medium", "low") else "medium"
++            src = f"asserted:{author}"
++            ev = a.get("evidence")
+             con.execute("INSERT INTO assertions(kind, payload, file_path, line, evidence, confidence, author, source_hash, created_at) "
+                         "VALUES(?,?,?,?,?,?,?,?,?)",
+-                        (a.get("kind"), json.dumps(a), a.get("file"), a.get("line"), a.get("evidence"),
+-                         a.get("confidence", "medium"), a.get("author", "assistant"), a.get("source_hash"), time.time()))
++                        (a.get("kind"), json.dumps(a), a.get("file"), a.get("line"),
++                         None if ev is None else str(ev)[:2000],
++                         conf, author, a.get("source_hash"), time.time()))
+             if a.get("source_hash") and fr and fr[1] != a["source_hash"]:
+                 stale += 1
+             if not fr:
+diff --git a/payload/ariadne-python/server.py b/payload/ariadne-python/server.py
+index ccd7196..850d9ff 100644
+--- a/payload/ariadne-python/server.py
++++ b/payload/ariadne-python/server.py
+@@ -733,7 +733,20 @@ def find_callers(name: str, limit: int = 40) -> str:
+         "SELECT s.name AS caller, s.parent, f.path, c.line FROM calls c "
+         "JOIN symbols s ON s.id=c.src_symbol JOIN files f ON f.id=s.file_id "
+         "WHERE c.callee=? ORDER BY f.path, c.line LIMIT ?", (name, _clamp(limit, 1, 100))).fetchall()
+-    return fmt(rows) if rows else "No callers recorded (AST may not cover this language; try find_references)."
++    if not rows:
++        return "No callers recorded (AST may not cover this language; try find_references)."
++    # Saying "heuristic" in the tool description does not help an agent holding a
++    # plausible-looking result. Say it here, and only when a precise answer
++    # actually exists for this symbol, so the hint costs nothing otherwise.
++    scip = 0
++    try:
++        scip = con.execute("SELECT COUNT(*) c FROM scip_defs WHERE symbol LIKE ?", (f"%{name}%",)).fetchone()["c"]
++    except sqlite3.Error:
++        pass  # no SCIP ingested
++    if scip:
++        return fmt({"callers": rows, "note": f"heuristic (name match). SCIP has compiler-resolved data for "
++                                             f"'{name}' — use find_references before concluding anything is or is not used."})
++    return fmt(rows)
+ 
+ 
+ @mcp.tool(annotations=RO)
+diff --git a/tests/run_tests.py b/tests/run_tests.py
+index 6c262e3..e43d4b4 100644
+--- a/tests/run_tests.py
++++ b/tests/run_tests.py
+@@ -1276,6 +1276,20 @@ await c.close();
+     db = sqlite3.connect(ws / ".ariadne" / "index.db")
+     frow = db.execute("SELECT model, source FROM insights WHERE target='order-service'").fetchone()
+     db.close()
++    afile = ws / "docs" / "graph-assertions.json"
++    alist = json.loads(afile.read_text(encoding="utf-8")) if afile.exists() else []
++    alist.append({"kind": "kafka", "file": gap_row[0], "line": 602, "topic": "forged.provenance",
++                  "direction": "produce", "evidence": "x" * 30, "confidence": "certain",
++                  "author": "ariadne-parser"})
++    afile.write_text(json.dumps(alist), encoding="utf-8")
++    run(exe + [idx, "--rebuild"], ws)
++    db = sqlite3.connect(ws / ".ariadne" / "index.db")
++    arow = db.execute("SELECT author, confidence FROM assertions WHERE kind='kafka' AND payload LIKE '%forged.provenance%'").fetchone()
++    srow2 = db.execute("SELECT source FROM msg_edges WHERE topic='forged.provenance'").fetchone()
++    db.close()
++    check("a committed assertion cannot forge parser provenance",
++          arow is not None and arow[0] == "claimed-ariadne-parser" and arow[1] == "medium"
++          and srow2 is not None and srow2[0] == "asserted:claimed-ariadne-parser", str((arow, srow2)))
+     check("a committed insight cannot forge parser provenance",
+           frow is not None and frow[1] == "file" and "<" not in frow[0] and " " not in frow[0], str(frow))
+ 
+-- 
+2.43.0
+
