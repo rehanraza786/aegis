@@ -315,6 +315,10 @@ CREATE INDEX IF NOT EXISTS idx_dlinks ON decision_links(target);
 -- Prose memory. Rows are derived from docs/insights.json, exactly like
 -- assertions and ADRs; owning the DDL here is what makes that true (it used
 -- to be CREATE-IF-NOT-EXISTS'd lazily in enrich and the server instead).
+-- One module hash per index, not one per explain() call. Single source of truth
+-- for staleness: the server, enrich, and annotate all read it instead of each
+-- recomputing (three implementations is how they drifted before).
+CREATE TABLE IF NOT EXISTS module_hashes(module TEXT PRIMARY KEY, hash TEXT, files INTEGER);
 CREATE TABLE IF NOT EXISTS insights(
   target TEXT PRIMARY KEY, kind TEXT, hash TEXT, summary TEXT,
   model TEXT, generated_at REAL, source TEXT);
@@ -1344,6 +1348,17 @@ def kafka_pass(con, scope_prefixes=None):
             loaded += 1
         log.info("Assertions: %d loaded into the graph%s", loaded,
                  f", {stale} STALE (evidence file changed since)" if stale else "")
+
+    # ---- Module hashes: derived once, read by explain/enrich/annotate ----
+    _mods: dict[str, list[str]] = {}
+    for _p, _h in con.execute("SELECT path, hash FROM files"):
+        seg = str(_p).split("/")[0]
+        if seg:
+            _mods.setdefault(seg, []).append(_h or "")
+    con.execute("DELETE FROM module_hashes")
+    for _name, _hs in _mods.items():
+        con.execute("INSERT OR REPLACE INTO module_hashes(module, hash, files) VALUES(?,?,?)",
+                    (_name, hashlib.sha1("|".join(sorted(_hs)).encode()).hexdigest(), len(_hs)))
 
     # ---- Insights: prose memory an assistant or enrichment derived ----
     # Source of truth is docs/insights.json, committed and reviewed in PRs, same

@@ -55,9 +55,19 @@ if a.get("action") == "insight":
             # sha1 over the module's file hashes SORTED BY HASH: must match
             # enrich, server.py _module_hash, and the Node edition, or enrich
             # treats this insight as changed and overwrites it on the next run
-            hs = sorted((x[0] or "") for x in con.execute(
-                "SELECT hash FROM files WHERE path LIKE ?", (a["target"] + "/%",)))
-            h = hashlib.sha1("|".join(hs).encode()).hexdigest()
+            row = None
+            try:
+                row = con.execute("SELECT hash FROM module_hashes WHERE module=?", (a["target"],)).fetchone()
+            except sqlite3.Error:
+                pass  # older index
+            if row:
+                h = row[0]
+            else:
+                lo = a["target"] + "/"
+                hi = lo[:-1] + chr(ord(lo[-1]) + 1)
+                hs = sorted((x[0] or "") for x in con.execute(
+                    "SELECT hash FROM files WHERE path >= ? AND path < ?", (lo, hi)))
+                h = hashlib.sha1("|".join(hs).encode()).hexdigest()
         else:
             h = ""  # topic/table notes have no single backing file; they don't auto-stale
         # Durable first: index.db is gitignored and disposable, so a row without

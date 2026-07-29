@@ -48,8 +48,14 @@ if (a.action === "insight") {
       // sha1 over the module's file hashes SORTED BY HASH: must match
       // enrich, server.mjs moduleHash, and the Python edition, or enrich
       // treats this insight as changed and overwrites it on the next run
-      const hs = db.prepare("SELECT hash FROM files WHERE path LIKE ?").all(a.target + "/%").map((r) => r.hash ?? "");
-      h = crypto.createHash("sha1").update(hs.sort().join("|")).digest("hex");
+      let row = null;
+      try { row = db.prepare("SELECT hash FROM module_hashes WHERE module=?").get(a.target); } catch { /* older index */ }
+      if (row) h = row.hash;
+      else {
+        const lo = a.target + "/", hi = lo.slice(0, -1) + String.fromCharCode(lo.charCodeAt(lo.length - 1) + 1);
+        const hs = db.prepare("SELECT hash FROM files WHERE path >= ? AND path < ?").all(lo, hi).map((r) => r.hash ?? "");
+        h = crypto.createHash("sha1").update(hs.sort().join("|")).digest("hex");
+      }
     } // topic/table notes have no single backing file; they don't auto-stale
     // Durable first: index.db is gitignored and disposable, so a row without a
     // docs/insights.json entry dies at the next pull-index or --rebuild.

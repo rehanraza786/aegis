@@ -52,6 +52,9 @@ if (!db.prepare("SELECT COUNT(*) c FROM pragma_table_info('insights') WHERE name
   db.exec("ALTER TABLE insights ADD COLUMN source TEXT");
 }
 const q = (sql, ...a) => db.prepare(sql).all(...a);
+// LIKE 'p%' cannot use the index (LIKE is case-insensitive by default); a
+// half-open range can. Parity: server.mjs prefixRange.
+const prefixRange = (p) => p ? [p, p.slice(0, -1) + String.fromCharCode(p.charCodeAt(p.length - 1) + 1)] : ["", "\uffff"];
 const svc = (p) => p.split("/")[0];
 // insights describe production intent: seam facts from test files stay out of
 // the prompts (column exists only once an indexer >= schema v5 has run)
@@ -88,16 +91,20 @@ async function complete(prompt) {
 
 /* ---------------- targets: modules + hotspot files, hash-keyed ---------------- */
 function moduleTargets() {
-  const files = q("SELECT path, hash FROM files");
+  // The indexer computes these once per index; reading them here is what keeps
+  // enrich, the server, and annotate from drifting into three different hashes.
+  try {
+    const rows = q("SELECT module, hash FROM module_hashes ORDER BY module");
+    if (rows.length) return rows.map((r) => ({ kind: "module", target: r.module, hash: r.hash }));
+  } catch { /* index predates module_hashes; fall back */ }
   const mods = new Map();
-  for (const f of files) {
-    const m = mods.get(svc(f.path)) ?? { paths: [], hashes: [] };
-    m.paths.push(f.path); m.hashes.push(f.hash ?? "");
-    mods.set(svc(f.path), m);
+  for (const f of q("SELECT path, hash FROM files")) {
+    if (!mods.has(svc(f.path))) mods.set(svc(f.path), []);
+    mods.get(svc(f.path)).push(f.hash ?? "");
   }
-  return [...mods.entries()].map(([name, m]) => ({
+  return [...mods.entries()].map(([name, hs]) => ({
     kind: "module", target: name,
-    hash: createHash("sha1").update(m.hashes.sort().join("|")).digest("hex"),
+    hash: createHash("sha1").update(hs.sort().join("|")).digest("hex"),
   }));
 }
 function hotspotTargets(n = 12) {
@@ -115,10 +122,10 @@ or gotchas a developer must know before changing it. No preamble, no markdown he
 TARGET: ${t.kind} ${t.target}\n`;
   if (t.kind === "module") {
     const syms = q(`SELECT s.name, s.kind FROM symbols s JOIN files f ON f.id=s.file_id
-                    WHERE f.path LIKE ? AND s.kind IN ('class','type') LIMIT 25`, t.target + "/%");
-    const topics = q(`SELECT DISTINCT m.topic, m.direction FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?${PROD}`, t.target + "/%");
+                    WHERE f.path >= ? AND f.path < ? AND s.kind IN ('class','type') LIMIT 25`, ...prefixRange(t.target + "/"));
+    const topics = q(`SELECT DISTINCT m.topic, m.direction FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path >= ? AND f.path < ?${PROD}`, ...prefixRange(t.target + "/"));
     const tables = q(`SELECT DISTINCT a.tbl, a.mode FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?${PROD}`, t.target + "/%");
-    const eps = q(`SELECT e.method, e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ?${PROD} LIMIT 15`, t.target + "/%");
+    const eps = q(`SELECT e.method, e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path >= ? AND f.path < ?${PROD} LIMIT 15`, ...prefixRange(t.target + "/"));
     return header +
       `Classes/types: ${syms.map((s) => s.name).join(", ") || "n/a"}\n` +
       `Kafka: ${topics.map((x) => `${x.direction} ${x.topic}`).join(", ") || "none"}\n` +

@@ -416,6 +416,14 @@ tool(server, "search_code",
 // Resolve a target (file path, symbol name, or fragment) to a file row —
 // shared by context_pack and the /aegis-impact prompt.
 // dirty-state provenance label for a file row: '' (committed) | 'working-tree' | 'untracked'
+/** Half-open range for a path prefix. SQLite cannot use an index for
+ *  `path LIKE 'p%'` because LIKE is case-insensitive by default; an explicit
+ *  range can, and matching paths case-sensitively is more correct anyway. */
+function prefixRange(p) {
+  if (!p) return ["", "\uffff"];
+  return [p, p.slice(0, -1) + String.fromCharCode(p.charCodeAt(p.length - 1) + 1)];
+}
+
 function wtLabel(d, pathOrId) {
   try {
     const row = typeof pathOrId === "number"
@@ -602,7 +610,7 @@ tool(server, "module_map",
   "Directory-level overview: file count and main languages per top-level directory (optionally under `prefix`). First call to orient in an unfamiliar repo.",
   { prefix: z.string().max(300).optional() },
   ({ prefix = "" }) => withDb((d) => {
-    const rows = d.prepare("SELECT path, lang FROM files WHERE path LIKE ?").all(`${prefix}%`);
+    const rows = d.prepare("SELECT path, lang FROM files WHERE path >= ? AND path < ?").all(...prefixRange(prefix));
     const agg = new Map();
     for (const r of rows) {
       const rest = r.path.slice(prefix.length).replace(/^\//, "");
@@ -685,7 +693,12 @@ tool(server, "goto_definition",
  *  so enrich regenerates and overwrites it on every run. tests/run_tests.py
  *  asserts the two agree; change one, change all three. */
 function moduleHash(d, target) {
-  const hs = d.prepare("SELECT hash FROM files WHERE path LIKE ?").all(target + "/%").map((r) => r.hash ?? "");
+  try {
+    const row = d.prepare("SELECT hash FROM module_hashes WHERE module=?").get(target);
+    if (row) return row.hash;
+  } catch { /* index predates module_hashes; fall through */ }
+  const [lo, hi] = prefixRange(target + "/");
+  const hs = d.prepare("SELECT hash FROM files WHERE path >= ? AND path < ?").all(lo, hi).map((r) => r.hash ?? "");
   return createHash("sha1").update(hs.sort().join("|")).digest("hex");
 }
 
@@ -1675,20 +1688,20 @@ prompt(server, "aegis-orient",
   "First encounter with a module: files, the most-depended-on entry points, the seams it participates in, governing decisions, and cached insight — the reading plan before any code is read.",
   { module: z.string().min(1).max(200) },
   ({ module }) => withDb((d) => {
-    const rows = d.prepare("SELECT id, path, lang FROM files WHERE path LIKE ?").all(module + "/%");
+    const rows = d.prepare("SELECT id, path, lang FROM files WHERE path >= ? AND path < ?").all(...prefixRange(module + "/"));
     if (!rows.length) return `No files under module '${module}'. module_map lists the modules in this workspace.`;
     const langs = {};
     for (const r of rows) langs[r.lang] = (langs[r.lang] ?? 0) + 1;
     const hot = d.prepare(`SELECT f.path, COUNT(e.src) n FROM files f JOIN edges e ON e.dst=f.id
-      WHERE f.path LIKE ? GROUP BY f.id ORDER BY n DESC LIMIT 5`).all(module + "/%");
-    const topics = d.prepare(`SELECT DISTINCT m.direction || ' ' || m.topic s FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?`).all(module + "/%").map((r) => r.s);
-    const tables = d.prepare(`SELECT DISTINCT a.mode || ' ' || a.tbl s FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?`).all(module + "/%").map((r) => r.s);
-    const eps = d.prepare(`SELECT DISTINCT e.method || ' ' || e.path s FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ?`).all(module + "/%").map((r) => r.s);
+      WHERE f.path >= ? AND f.path < ? GROUP BY f.id ORDER BY n DESC LIMIT 5`).all(...prefixRange(module + "/"));
+    const topics = d.prepare(`SELECT DISTINCT m.direction || ' ' || m.topic s FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path >= ? AND f.path < ?`).all(...prefixRange(module + "/")).map((r) => r.s);
+    const tables = d.prepare(`SELECT DISTINCT a.mode || ' ' || a.tbl s FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path >= ? AND f.path < ?`).all(...prefixRange(module + "/")).map((r) => r.s);
+    const eps = d.prepare(`SELECT DISTINCT e.method || ' ' || e.path s FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path >= ? AND f.path < ?`).all(...prefixRange(module + "/")).map((r) => r.s);
     const govern = governingFor(d, [...new Set([...topics.map((s) => s.split(" ").pop()), ...tables.map((s) => s.split(" ").pop()), module])]);
     let insight = null;
     try { insight = d.prepare("SELECT summary FROM insights WHERE target=?").get(module)?.summary ?? null; } catch { /* none yet */ }
     let nTests = 0;
-    try { nTests = d.prepare("SELECT COUNT(*) c FROM files WHERE path LIKE ? AND is_test=1").get(module + "/%").c; } catch { /* pre-is_test build */ }
+    try { nTests = d.prepare("SELECT COUNT(*) c FROM files WHERE path >= ? AND path < ? AND is_test=1").get(...prefixRange(module + "/")).c; } catch { /* pre-is_test build */ }
     const lines = [
       `Orientation for module ${module}: ${rows.length} files (${Object.keys(langs).sort((a, b) => langs[b] - langs[a]).slice(0, 3).join(", ")}), ${nTests} of them tests.`,
       "",

@@ -70,7 +70,22 @@ def complete(prompt):
     return j["choices"][0]["message"]["content"]
 
 
+def _prefix_range(p: str):
+    """Half-open range for a path prefix; LIKE 'p%' cannot use the index."""
+    if not p:
+        return "", "\uffff"
+    return p, p[:-1] + chr(ord(p[-1]) + 1)
+
+
 def module_targets():
+    # The indexer computes these once per index; reading them here is what keeps
+    # enrich, the server, and annotate from drifting into three different hashes.
+    try:
+        rows = q("SELECT module, hash FROM module_hashes ORDER BY module")
+        if rows:
+            return [{"kind": "module", "target": r["module"], "hash": r["hash"]} for r in rows]
+    except sqlite3.Error:
+        pass  # index predates module_hashes; fall back
     mods = {}
     for f in q("SELECT path, hash FROM files"):
         mods.setdefault(svc(f["path"]), []).append(f["hash"] or "")
@@ -91,12 +106,12 @@ def prompt_for(t):
               "of the system, and any invariants or gotchas a developer must know before changing it. "
               f"No preamble, no markdown headers.\n\nTARGET: {t['kind']} {t['target']}\n")
     if t["kind"] == "module":
-        like = t["target"] + "/%"
+        lo, hi = _prefix_range(t["target"] + "/")
         syms = q("SELECT s.name FROM symbols s JOIN files f ON f.id=s.file_id "
-                 "WHERE f.path LIKE ? AND s.kind IN ('class','type') LIMIT 25", like)
-        topics = q(f"SELECT DISTINCT m.topic, m.direction FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?{PROD}", like)
-        tables = q(f"SELECT DISTINCT a.tbl, a.mode FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?{PROD}", like)
-        eps = q(f"SELECT e.method, e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ?{PROD} LIMIT 15", like)
+                 "WHERE f.path >= ? AND f.path < ? AND s.kind IN ('class','type') LIMIT 25", lo, hi)
+        topics = q(f"SELECT DISTINCT m.topic, m.direction FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path >= ? AND f.path < ?{PROD}", lo, hi)
+        tables = q(f"SELECT DISTINCT a.tbl, a.mode FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path >= ? AND f.path < ?{PROD}", lo, hi)
+        eps = q(f"SELECT e.method, e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path >= ? AND f.path < ?{PROD} LIMIT 15", lo, hi)
         return header + (
             f"Classes/types: {', '.join(s['name'] for s in syms) or 'n/a'}\n"
             f"Kafka: {', '.join(x['direction'] + ' ' + x['topic'] for x in topics) or 'none'}\n"

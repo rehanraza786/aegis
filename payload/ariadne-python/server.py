@@ -148,6 +148,18 @@ def _clamp_insight(t) -> str:
         t[:MAX_INSIGHT_CHARS] + '… [truncated; call explain("…") for the full insight]'
 
 
+def _prefix_range(p: str):  # noqa: D401
+    """Half-open range for a path prefix.
+
+    SQLite cannot use an index for `path LIKE 'p%'` because LIKE is
+    case-insensitive by default; an explicit range can, and matching paths
+    case-sensitively is more correct anyway.
+    """
+    if not p:
+        return "", "\uffff"
+    return p, p[:-1] + chr(ord(p[-1]) + 1)
+
+
 def _wt_label(con, path_or_id):
     """Dirty-state provenance label: '' (committed) | 'working-tree' | 'untracked'."""
     try:
@@ -689,7 +701,7 @@ def dependencies(path: str) -> str:
 def module_map(prefix: str = "") -> str:
     """Directory-level overview: for each top-level directory (or under `prefix`), file count, main languages, and symbol count. Use as the first call to orient in an unfamiliar repo."""
     con = db()
-    rows = con.execute("SELECT path, lang FROM files WHERE path LIKE ?", (f"{prefix}%",)).fetchall()
+    rows = con.execute("SELECT path, lang FROM files WHERE path >= ? AND path < ?", _prefix_range(prefix)).fetchall()
     agg = {}
     strip = len(prefix)
     for r in rows:
@@ -898,7 +910,14 @@ def _module_hash(con, target: str) -> str:
     enrich regenerates and overwrites it on every run. tests/run_tests.py asserts
     the two agree; change one, change all three.
     """
-    hs = sorted((x[0] or "") for x in con.execute("SELECT hash FROM files WHERE path LIKE ?", (target + "/%",)))
+    try:
+        row = con.execute("SELECT hash FROM module_hashes WHERE module=?", (target,)).fetchone()
+        if row:
+            return row[0]
+    except sqlite3.Error:
+        pass  # index predates module_hashes; fall through
+    lo, hi = _prefix_range(target + "/")
+    hs = sorted((x[0] or "") for x in con.execute("SELECT hash FROM files WHERE path >= ? AND path < ?", (lo, hi)))
     return hashlib.sha1("|".join(hs).encode()).hexdigest()
 
 
@@ -1951,7 +1970,7 @@ def aegis_impact(target: str) -> str:
 @_prompt_guard
 def aegis_orient(module: str) -> str:
     con = db()
-    rows = con.execute("SELECT id, path, lang FROM files WHERE path LIKE ?", (module + "/%",)).fetchall()
+    rows = con.execute("SELECT id, path, lang FROM files WHERE path >= ? AND path < ?", _prefix_range(module + "/")).fetchall()
     if not rows:
         return f"No files under module '{module}'. module_map lists the modules in this workspace."
     langs = {}
@@ -1959,13 +1978,13 @@ def aegis_orient(module: str) -> str:
         langs[r["lang"]] = langs.get(r["lang"], 0) + 1
     hot = con.execute(
         "SELECT f.path, COUNT(e.src) n FROM files f JOIN edges e ON e.dst=f.id "
-        "WHERE f.path LIKE ? GROUP BY f.id ORDER BY n DESC LIMIT 5", (module + "/%",)).fetchall()
+        "WHERE f.path >= ? AND f.path < ? GROUP BY f.id ORDER BY n DESC LIMIT 5", _prefix_range(module + "/")).fetchall()
     topics = [r[0] for r in con.execute(
-        "SELECT DISTINCT m.direction || ' ' || m.topic FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?", (module + "/%",))]
+        "SELECT DISTINCT m.direction || ' ' || m.topic FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path >= ? AND f.path < ?", _prefix_range(module + "/"))]
     tables = [r[0] for r in con.execute(
-        "SELECT DISTINCT a.mode || ' ' || a.tbl FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?", (module + "/%",))]
+        "SELECT DISTINCT a.mode || ' ' || a.tbl FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path >= ? AND f.path < ?", _prefix_range(module + "/"))]
     eps = [r[0] for r in con.execute(
-        "SELECT DISTINCT e.method || ' ' || e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ?", (module + "/%",))]
+        "SELECT DISTINCT e.method || ' ' || e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path >= ? AND f.path < ?", _prefix_range(module + "/"))]
     govern = _governing(con, list(dict.fromkeys(
         [s.split(" ")[-1] for s in topics] + [s.split(" ")[-1] for s in tables] + [module])))
     insight = None
@@ -1976,8 +1995,8 @@ def aegis_orient(module: str) -> str:
         pass  # none yet
     n_tests = 0
     try:
-        n_tests = con.execute("SELECT COUNT(*) c FROM files WHERE path LIKE ? AND is_test=1",
-                              (module + "/%",)).fetchone()["c"]
+        n_tests = con.execute("SELECT COUNT(*) c FROM files WHERE path >= ? AND path < ? AND is_test=1",
+                              _prefix_range(module + "/")).fetchone()["c"]
     except sqlite3.Error:
         pass  # pre-is_test build
     top_langs = ", ".join(sorted(langs, key=langs.get, reverse=True)[:3])
