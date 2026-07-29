@@ -23,6 +23,47 @@ const ROOT = process.cwd();
 const DB_PATH = path.join(process.env.ARIADNE_HOME ?? ROOT, ".ariadne", "index.db");
 const die = (msg) => { console.error(msg); process.exit(1); };
 
+/** Repo prefixes in a multi-root workspace (empty for a single repo). */
+function rootPrefixes() {
+  const db = new Database(DB_PATH, { readonly: true });
+  try {
+    return db.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all()
+      .map((r) => r.key.slice("last_sha:".length)).filter((x) => x !== ".");
+  } catch { return []; } finally { db.close(); }
+}
+
+/** Directory whose docs/graph-assertions.json should hold an assertion about
+ *  `file`. Paths are repo-prefixed, so the first segment names the repo.
+ *  Writing to the multi-root parent "works" — the indexer reads it — but the
+ *  parent is not a git repo, so nothing is versioned, reviewed, or shared.
+ *  Parity: assertionsBase in server.mjs. */
+function assertionsBase(file) {
+  const prefixes = rootPrefixes();
+  const seg = String(file ?? "").split("/")[0];
+  return prefixes.includes(seg) ? path.join(ROOT, seg) : ROOT;
+}
+
+/** Every place an assertions file may live: parent, then each repo. */
+function assertionFiles() {
+  const out = [path.join(ROOT, "docs", "graph-assertions.json")];
+  for (const r of rootPrefixes()) {
+    const p = path.join(ROOT, r, "docs", "graph-assertions.json");
+    if (!out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
+/** Read an assertions file, refusing to proceed on malformed JSON: a stray
+ *  comma must never silently erase the team's accumulated assertions. */
+function readAssertions(af) {
+  if (!fs.existsSync(af)) return null;
+  let list;
+  try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
+  catch (e) { die(`${path.relative(ROOT, af)} is not valid JSON (${e.message}). Fix or remove it first.`); }
+  if (!Array.isArray(list)) die(`${path.relative(ROOT, af)} is not a JSON array. Fix it first.`);
+  return list;
+}
+
 if (!fs.existsSync(DB_PATH)) die("Index not found, run the Ariadne indexer first.");
 let a;
 try { a = JSON.parse(process.argv[2] ?? ""); } catch { die("annotate expects one JSON argument; see the header of this file."); }
@@ -108,14 +149,8 @@ if (a.action === "insight") {
   try { hash = db.prepare("SELECT hash FROM files WHERE path=?").get(a.file)?.hash ?? null; } finally { db.close(); }
   if (!hash) die(`File '${a.file}' is not in the index (paths are repo-prefixed in a multi-repo workspace).`);
 
-  const af = path.join(ROOT, "docs", "graph-assertions.json");
-  let list = [];
-  if (fs.existsSync(af)) {
-    // Never clobber: a malformed file must not erase the team's assertions.
-    try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
-    catch (e) { die(`docs/graph-assertions.json exists but is not valid JSON (${e.message}). Fix or remove it first.`); }
-    if (!Array.isArray(list)) die("docs/graph-assertions.json is not a JSON array. Fix it first.");
-  }
+  const af = path.join(assertionsBase(a.file), "docs", "graph-assertions.json");
+  let list = readAssertions(af) ?? [];
   const rec = { kind: a.kind, file: a.file, line: a.line ?? 0, evidence: a.evidence,
     confidence: ["high", "medium", "low"].includes(a.confidence) ? a.confidence : "medium",
     author, source_hash: hash, asserted_at: new Date().toISOString().slice(0, 10) };
@@ -125,20 +160,22 @@ if (a.action === "insight") {
   list.push(rec);
   fs.mkdirSync(path.dirname(af), { recursive: true });
   fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
-  console.log(`Asserted (provenance: ${author}) and recorded in docs/graph-assertions.json (${list.length} total). It enters the graph on the next index, marked STALE automatically if ${a.file} changes. Commit the file to share it.`);
+  console.log(`Asserted (provenance: ${author}) and recorded in ${path.relative(ROOT, af)} (${list.length} total). It enters the graph on the next index, marked STALE automatically if ${a.file} changes. Commit the file to share it.`);
 
 } else if (a.action === "dismiss") {
   // gap triage: a dismissed gap stops shouting but stays auditable. Stored in
   // the same reviewed file, kind "dismissal"; the export mutes matching gaps.
   if (!a.gap || !a.key) die("dismiss needs gap (e.g. orphan_topic) and key (topic/table/path).");
   if (!(a.reason?.length >= 10)) die("reason must say why this gap is acceptable (10+ chars).");
-  const af = path.join(ROOT, "docs", "graph-assertions.json");
-  let list = [];
-  if (fs.existsSync(af)) {
-    try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
-    catch (e) { die(`docs/graph-assertions.json is not valid JSON (${e.message}). Fix it first.`); }
-    if (!Array.isArray(list)) die("docs/graph-assertions.json is not a JSON array. Fix it first.");
+  // A dismissal is about a gap key, not a file, so there is no repo to infer.
+  // It goes where the caller says, else the workspace root.
+  const prefixes = rootPrefixes();
+  const dismissBase = a.root && prefixes.includes(a.root) ? path.join(ROOT, a.root) : ROOT;
+  const af = path.join(dismissBase, "docs", "graph-assertions.json");
+  if (prefixes.length && dismissBase === ROOT) {
+    console.error(`Note: the workspace root is not a git repo, so this dismissal will not be versioned. Pass "root":"<repo>" to commit it. Repos: ${prefixes.join(", ")}.`);
   }
+  let list = readAssertions(af) ?? [];
   list = list.filter((x) => !(x.kind === "dismissal" && x.gap === a.gap && x.key === a.key));
   list.push({ kind: "dismissal", gap: a.gap, key: a.key, reason: a.reason, author,
     dismissed_at: new Date().toISOString().slice(0, 10) });
@@ -150,16 +187,18 @@ if (a.action === "insight") {
   // lifecycle for existing assertions, keyed by the same natural key the
   // no-duplicate filter uses. retract removes; reaffirm re-verifies: the
   // source_hash moves to the evidence file's CURRENT hash, clearing STALE.
-  const af = path.join(ROOT, "docs", "graph-assertions.json");
-  if (!fs.existsSync(af)) die("docs/graph-assertions.json does not exist; nothing to modify.");
-  let list;
-  try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
-  catch (e) { die(`docs/graph-assertions.json is not valid JSON (${e.message}). Fix it first.`); }
-  if (!Array.isArray(list)) die("docs/graph-assertions.json is not a JSON array. Fix it first.");
+  // The record may live in the parent (older placements) or in the repo that
+  // owns its evidence file, so edit whichever one actually holds it.
   const key = (x) => [x.kind, x.file, x.line ?? 0, x.topic ?? "", x.table ?? "", x.path ?? ""].join("|");
   const target = key(a);
-  const hits = list.filter((x) => key(x) === target);
-  if (!hits.length) die("No matching assertion found in docs/graph-assertions.json (key: kind+file+line+topic/table/path).");
+  let af = null, list = null, hits = [];
+  for (const cand of assertionFiles()) {
+    const part = readAssertions(cand);
+    if (!part) continue;
+    const found = part.filter((x) => key(x) === target);
+    if (found.length) { af = cand; list = part; hits = found; break; }
+  }
+  if (!af) die("No matching assertion found in any docs/graph-assertions.json (key: kind+file+line+topic/table/path).");
   if (a.action === "retract") {
     list = list.filter((x) => key(x) !== target);
     fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");

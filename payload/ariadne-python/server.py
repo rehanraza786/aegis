@@ -894,6 +894,43 @@ def decision_trace(id: str) -> str:
         **({"warning": "supersession cycle detected in this chain — fix the ADR frontmatter"} if cycle else {})}
 
 
+def _assertions_base(file: str) -> Path:
+    """Directory whose docs/graph-assertions.json should hold an assertion about `file`.
+
+    Paths are repo-prefixed in a multi-root workspace, so the first segment names
+    the repo. Writing to the parent "works" -- the indexer reads it -- but the
+    parent is not a git repo, so nothing is versioned, reviewed, or shared, which
+    is the entire promise this tool makes. Parity: assertionsBase in server.mjs.
+    """
+    try:
+        con = db()
+        prefixes = [r["key"][len("last_sha:"):] for r in
+                    con.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]
+        seg = str(file or "").split("/")[0]
+        if seg in [p for p in prefixes if p != "."]:
+            return _root_dir(seg)
+    except sqlite3.Error:
+        pass  # fresh index
+    return REPO_ROOT
+
+
+def _assertion_files():
+    """Every place an assertions file may live: parent, then each repo."""
+    out = [REPO_ROOT / "docs" / "graph-assertions.json"]
+    try:
+        con = db()
+        for r in [x["key"][len("last_sha:"):] for x in
+                  con.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]:
+            if r == ".":
+                continue
+            f = _root_dir(r) / "docs" / "graph-assertions.json"
+            if f not in out:
+                out.append(f)
+    except sqlite3.Error:
+        pass  # fresh index
+    return out
+
+
 def _resolve_write_root(root: str, what: str):
     """Pick a git-versioned root to write durable memory into.
 
@@ -1145,9 +1182,7 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
     if not row:
         return f"File '{file}' is not in the index, check the path (repo-prefixed in a multi-repo workspace)."
 
-    root = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
-                               text=True).stdout.strip() or Path.cwd())
-    af = root / "docs" / "graph-assertions.json"
+    af = _assertions_base(file) / "docs" / "graph-assertions.json"
     lst = []
     if af.exists():
         # Never clobber: a malformed file (merge-conflict marker, stray comma) must
@@ -1173,7 +1208,8 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
     lst.append(rec)
     af.parent.mkdir(parents=True, exist_ok=True)
     af.write_text(json.dumps(lst, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    return (f"Asserted and recorded in docs/graph-assertions.json ({len(lst)} total). It enters the graph on "
+    _rel = af.relative_to(WS_BASE) if str(af).startswith(str(WS_BASE)) else af
+    return (f"Asserted and recorded in {_rel} ({len(lst)} total). It enters the graph on "
             f"the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically "
             f"if {file} changes. Commit the file to share it with the team.")
 
@@ -2283,15 +2319,22 @@ def resource_decision(id: str) -> str:
 @mcp.resource("ariadne://assertions", name="assertions", mime_type="application/json",
               description="The human knowledge layer: docs/graph-assertions.json with a computed stale flag per assertion (evidence file changed since it was recorded).")
 def resource_assertions() -> str:
-    af = REPO_ROOT / "docs" / "graph-assertions.json"
-    if not af.exists():
+    # Same candidate set the indexer reads: the parent plus each repo, so a
+    # multi-root workspace does not under-report what is actually in the graph.
+    lst, found = [], False
+    for af in _assertion_files():
+        if not af.exists():
+            continue
+        found = True
+        try:
+            part = json.loads(af.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            return f"{af} exists but is not valid JSON ({e}). Fix it by hand; nothing here will overwrite it."
+        if not isinstance(part, list):
+            return f"{af} is not a JSON array. Fix it by hand; nothing here will overwrite it."
+        lst.extend(part)
+    if not found:
         return json.dumps({"assertions": [], "note": "No graph-assertions.json yet — assert_edge (or the graph view) creates it."}, indent=1, ensure_ascii=False)
-    try:
-        lst = json.loads(af.read_text(encoding="utf-8"))
-    except Exception as e:  # noqa: BLE001
-        return f"docs/graph-assertions.json exists but is not valid JSON ({e}). Fix it by hand; nothing here will overwrite it."
-    if not isinstance(lst, list):
-        return "docs/graph-assertions.json is not a JSON array. Fix it by hand; nothing here will overwrite it."
     try:
         con = db()
         for a in lst:

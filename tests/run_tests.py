@@ -1179,8 +1179,13 @@ await c.close();
         "direction": "produce", "topic": "orders.created.manual",
         "evidence": "PREFIX is a static final 'orders.created'; env resolves to a fixed suffix here.",
         "confidence": "high"})], ws)
-    check("annotate: assertion recorded without clobbering existing file",
-          code == 0 and (ws / "docs" / "graph-assertions.json").exists(), oas[-200:])
+    # assertions now anchor to the repo that owns the evidence file, so they are
+    # actually git-versioned; the workspace parent is not a repo in a multi-root
+    # workspace, which is where they used to land and quietly stay unversioned
+    arepo = gap_row[0].split("/")[0]
+    afile_anchored = ws / arepo / "docs" / "graph-assertions.json"
+    check("annotate: assertion recorded in the repo owning its evidence file",
+          code == 0 and afile_anchored.exists(), oas[-200:])
     code, _oi = run(exe + [idx, "--full"], ws)  # ingest the assertion
     db = sqlite3.connect(ws / ".ariadne" / "index.db")
     srow = db.execute("SELECT source FROM msg_edges WHERE topic='orders.created.manual'").fetchone()
@@ -1203,14 +1208,14 @@ await c.close();
     check("assertion goes stale when its evidence file changes", a_hash != cur_hash)
     code, orf = run(exe + [an, json.dumps({"action": "reaffirm", "kind": "kafka", "file": gap_row[0],
                                            "line": 601, "topic": "orders.created.manual"})], ws)
-    alist = json.loads((ws / "docs" / "graph-assertions.json").read_text(encoding="utf-8"))
+    alist = json.loads(afile_anchored.read_text(encoding="utf-8"))
     hit = [x for x in alist if x.get("topic") == "orders.created.manual"]
     check("annotate: reaffirm moves source_hash to the file's current hash",
           code == 0 and hit and hit[0].get("source_hash") == cur_hash
           and hit[0].get("reaffirmed_by") == "human", orf[-200:])
     code, ort = run(exe + [an, json.dumps({"action": "retract", "kind": "kafka", "file": gap_row[0],
                                            "line": 601, "topic": "orders.created.manual"})], ws)
-    alist = json.loads((ws / "docs" / "graph-assertions.json").read_text(encoding="utf-8"))
+    alist = json.loads(afile_anchored.read_text(encoding="utf-8"))
     check("annotate: retract removes the assertion from the source of truth",
           code == 0 and not any(x.get("topic") == "orders.created.manual" for x in alist), ort[-200:])
     run(exe + [idx, "--incremental"], ws)
@@ -1378,6 +1383,7 @@ const sdRefuse = await call("save_decision", { title: "Probe anchor refusal", de
 const sdOk = await call("save_decision", { title: "Probe anchor rooted", decision: "This decision exists to verify multi-root anchoring behavior.", rationale: "Anchoring test needs it.", root: "docs-repo" });
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import Database from "better-sqlite3";
 const adrDir = path.join(process.cwd(), "docs-repo", "docs", "adr");
 const probeAdr = fs.existsSync(adrDir) ? fs.readdirSync(adrDir).filter((f) => f.includes("probe-anchor-rooted")) : [];
@@ -1401,6 +1407,12 @@ await call("assert_edge", { kind: "kafka", file: "order-service/src/main/java/co
 const asr2 = JSON.parse(await read("ariadne://assertions"));
 const recA = (asr2.assertions ?? []).find((x) => x && x.topic === "probe.contract.check") ?? {};
 const contractOk = recA.confidence === "medium" && !("mode" in recA) && !("method" in recA) && recA.direction === "produce";
+// assert_edge now anchors the file inside the repo that owns the evidence, so it
+// legitimately dirties that worktree until committed — exactly what the tool
+// tells you to do. Commit it, or the freshness probe below sees this file.
+const asrRepo = path.join(process.cwd(), "order-service");
+execFileSync("git", ["add", "-A"], { cwd: asrRepo });
+execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "record assertion"], { cwd: asrRepo });
 
 // ---- batch 18: fresh tells the truth about the worktree ----
 const scratch = path.join(process.cwd(), "order-service", "src", "main", "java", "com", "acme", "ProbeScratch.java");
@@ -1485,7 +1497,7 @@ await c.close();
         sprobe.unlink(missing_ok=True)
     else:
         sprobe = ws / ".ariadne" / "_surface.py"
-        sprobe.write_text('''import asyncio, json, sys
+        sprobe.write_text('''import asyncio, json, os, subprocess, sys
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from pydantic import AnyUrl
@@ -1578,6 +1590,12 @@ async def main():
             rec_a = next((x for x in asr2.get("assertions", []) if isinstance(x, dict) and x.get("topic") == "probe.contract.check"), {})
             contract_ok = (rec_a.get("confidence") == "medium" and "mode" not in rec_a
                            and "method" not in rec_a and rec_a.get("direction") == "produce")
+            # assert_edge now anchors the file inside the repo that owns the
+            # evidence, so it legitimately dirties that worktree until committed.
+            _asr_repo = os.path.join(os.getcwd(), "order-service")
+            subprocess.run(["git", "add", "-A"], cwd=_asr_repo, check=True)
+            subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                            "commit", "-qm", "record assertion"], cwd=_asr_repo, check=True)
 
             # ---- batch 18: fresh tells the truth about the worktree ----
             scratch = os.path.join(os.getcwd(), "order-service", "src", "main", "java", "com", "acme", "ProbeScratch.java")

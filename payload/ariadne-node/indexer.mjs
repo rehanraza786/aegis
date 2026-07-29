@@ -1192,11 +1192,22 @@ async function kafkaPass(db, scopePrefixes = null) {
     db.exec("DELETE FROM db_access WHERE source LIKE 'asserted%'");
     db.exec("DELETE FROM http_endpoints WHERE source LIKE 'asserted%'");
     db.exec("DELETE FROM http_calls WHERE source LIKE 'asserted%'");
-    const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
+    // Parent AND every root. In a multi-root workspace the parent is not a git
+    // repo, so an assertion written there is loaded but never actually
+    // versioned or shared — the "committed and reviewable" promise silently
+    // absent exactly where there are the most repos. Writers now anchor to the
+    // repo owning the evidence file; reading both keeps older placements working.
     let list = [];
-    if (fs.existsSync(af)) {
-      try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
-      catch (e) { log("WARN", `docs/graph-assertions.json is not valid JSON (${e.message}); assertions stay out of the graph until it is fixed`); }
+    const seenA = new Set();
+    for (const root of [REPO_ROOT, ...ROOTS]) {
+      const af = path.join(root, "docs", "graph-assertions.json");
+      if (seenA.has(af) || !fs.existsSync(af)) continue;
+      seenA.add(af);
+      try {
+        const part = JSON.parse(fs.readFileSync(af, "utf8"));
+        if (Array.isArray(part)) list.push(...part);
+        else log("WARN", `${path.relative(REPO_ROOT, af)} is not a JSON array; skipped`);
+      } catch (e) { log("WARN", `${path.relative(REPO_ROOT, af)} is not valid JSON (${e.message}); its assertions stay out of the graph until it is fixed`); }
     }
     if (Array.isArray(list) && list.length) {
       const insA = db.prepare(`INSERT INTO assertions(kind, payload, file_path, line, evidence, confidence, author, source_hash, created_at)

@@ -810,6 +810,33 @@ tool(server, "decision_trace",
  *  multi-root workspace PARENT "succeeds" and then never gets re-parsed, so the
  *  record silently vanishes on the next index — the bug this guards against for
  *  ADRs, and now for insights too. */
+/** Directory whose docs/graph-assertions.json should hold an assertion about
+ *  `file`. Paths are repo-prefixed in a multi-root workspace, so the first
+ *  segment names the repo; anything unrecognised falls back to REPO_ROOT. */
+/** Every place an assertions file may live: the workspace parent, then each
+ *  repo. Readers use all of them; writers pick one via assertionsBase. */
+function assertionFiles() {
+  const out = [path.join(REPO_ROOT, "docs", "graph-assertions.json")];
+  try {
+    for (const r of withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
+      .map((r) => r.key.slice("last_sha:".length)).filter((x) => x !== ".")) {
+      const p = path.join(rootDir(r), "docs", "graph-assertions.json");
+      if (!out.includes(p)) out.push(p);
+    }
+  } catch { /* fresh index */ }
+  return out;
+}
+
+function assertionsBase(file) {
+  try {
+    const prefixes = withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
+      .map((r) => r.key.slice("last_sha:".length)).filter((x) => x !== ".");
+    const seg = String(file ?? "").split("/")[0];
+    if (prefixes.includes(seg)) return rootDir(seg);
+  } catch { /* fresh index */ }
+  return REPO_ROOT;
+}
+
 function resolveWriteRoot(root, what) {
   const prefixes = withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
     .map((r) => r.key.slice("last_sha:".length));
@@ -1007,7 +1034,11 @@ tool(server, "assert_edge",
     try { hash = d.prepare("SELECT hash FROM files WHERE path=?").get(a.file)?.hash ?? null; } finally { d.close(); }
     if (!hash) return `File '${a.file}' is not in the index, check the path (it is repo-prefixed in a multi-repo workspace).`;
 
-    const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
+    // Anchor to the repo that owns the evidence file. Writing to the multi-root
+    // parent "works" — the indexer reads it — but the parent is not a git repo,
+    // so nothing is versioned, reviewed, or shared, which is the entire promise
+    // this tool makes. Falls back to REPO_ROOT for a single-repo workspace.
+    const af = path.join(assertionsBase(a.file), "docs", "graph-assertions.json");
     let list = [];
     if (fs.existsSync(af)) {
       // Never clobber: a malformed file (merge-conflict marker, stray comma) must
@@ -1023,7 +1054,7 @@ tool(server, "assert_edge",
     list.push(rec);
     fs.mkdirSync(path.dirname(af), { recursive: true });
     fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
-    return `Asserted and recorded in docs/graph-assertions.json (${list.length} total). It enters the graph on the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically if ${a.file} changes. Commit the file to share it with the team.`;
+    return `Asserted and recorded in ${path.relative(WS_BASE, af)} (${list.length} total). It enters the graph on the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically if ${a.file} changes. Commit the file to share it with the team.`;
   });
 
 tool(server, "message_flow",
@@ -1898,12 +1929,20 @@ resource(server, "decision", new ResourceTemplate("ariadne://decisions/{id}", { 
 resource(server, "assertions", "ariadne://assertions",
   { description: "The human knowledge layer: docs/graph-assertions.json with a computed stale flag per assertion (evidence file changed since it was recorded).", mimeType: "application/json" },
   () => {
-    const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
-    if (!fs.existsSync(af)) return { assertions: [], note: "No graph-assertions.json yet — assert_edge (or the graph view) creates it." };
-    let list;
-    try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
-    catch (e) { return `docs/graph-assertions.json exists but is not valid JSON (${e.message}). Fix it by hand; nothing here will overwrite it.`; }
-    if (!Array.isArray(list)) return "docs/graph-assertions.json is not a JSON array. Fix it by hand; nothing here will overwrite it.";
+    // Same candidate set the indexer reads: the parent plus each repo, so a
+    // multi-root workspace does not under-report what is actually in the graph.
+    const list = [];
+    let found = false;
+    for (const af of assertionFiles()) {
+      if (!fs.existsSync(af)) continue;
+      found = true;
+      let part;
+      try { part = JSON.parse(fs.readFileSync(af, "utf8")); }
+      catch (e) { return `${path.relative(WS_BASE, af)} exists but is not valid JSON (${e.message}). Fix it by hand; nothing here will overwrite it.`; }
+      if (!Array.isArray(part)) return `${path.relative(WS_BASE, af)} is not a JSON array. Fix it by hand; nothing here will overwrite it.`;
+      list.push(...part);
+    }
+    if (!found) return { assertions: [], note: "No graph-assertions.json yet — assert_edge (or the graph view) creates it." };
     try {
       withDb((d) => {
         const h = d.prepare("SELECT hash FROM files WHERE path=?");

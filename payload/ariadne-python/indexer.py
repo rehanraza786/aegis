@@ -1312,13 +1312,27 @@ def kafka_pass(con, scope_prefixes=None):
     con.execute("DELETE FROM assertions")
     for t in ("msg_edges", "db_access", "http_endpoints", "http_calls"):
         con.execute(f"DELETE FROM {t} WHERE source LIKE 'asserted%'")
-    af = REPO_ROOT / "docs" / "graph-assertions.json"
+    # Parent AND every root. In a multi-root workspace the parent is not a git
+    # repo, so an assertion written there is loaded but never actually versioned
+    # or shared -- the "committed and reviewable" promise silently absent exactly
+    # where there are the most repos. Writers now anchor to the repo owning the
+    # evidence file; reading both keeps older placements working.
     alist = []
-    if af.exists():
+    _seen_a = set()
+    for _root in [REPO_ROOT, *ROOTS]:
+        af = _root / "docs" / "graph-assertions.json"
+        if af in _seen_a or not af.exists():
+            continue
+        _seen_a.add(af)
         try:
-            alist = json.loads(af.read_text(encoding="utf-8"))
+            part = json.loads(af.read_text(encoding="utf-8"))
         except Exception as e:  # noqa: BLE001
-            log.warning("docs/graph-assertions.json is not valid JSON (%s); assertions stay out of the graph until it is fixed", e)
+            log.warning("%s is not valid JSON (%s); its assertions stay out of the graph until it is fixed", af, e)
+            continue
+        if isinstance(part, list):
+            alist.extend(part)
+        else:
+            log.warning("%s is not a JSON array; skipped", af)
     if isinstance(alist, list) and alist:
         loaded = stale = 0
         # Same rule as insights: docs/graph-assertions.json is committed, so its

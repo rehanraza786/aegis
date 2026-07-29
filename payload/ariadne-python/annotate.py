@@ -36,6 +36,55 @@ except Exception:  # noqa: BLE001
     die("annotate expects one JSON argument; see the header of this file.")
 author = a.get("author") or "human"
 
+def _root_prefixes():
+    """Repo prefixes in a multi-root workspace (empty for a single repo)."""
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)
+        try:
+            return [r[0][len("last_sha:"):] for r in
+                    con.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()
+                    if r[0][len("last_sha:"):] != "."]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+
+
+def _assertions_base(file):
+    """Directory whose docs/graph-assertions.json should hold an assertion about `file`.
+
+    Paths are repo-prefixed, so the first segment names the repo. Writing to the
+    multi-root parent "works" -- the indexer reads it -- but the parent is not a
+    git repo, so nothing is versioned, reviewed, or shared.
+    Parity: _assertions_base in server.py.
+    """
+    seg = str(file or "").split("/")[0]
+    return ROOT / seg if seg in _root_prefixes() else ROOT
+
+
+def _assertion_files():
+    """Every place an assertions file may live: parent, then each repo."""
+    out = [ROOT / "docs" / "graph-assertions.json"]
+    for r in _root_prefixes():
+        f = ROOT / r / "docs" / "graph-assertions.json"
+        if f not in out:
+            out.append(f)
+    return out
+
+
+def _read_assertions(af):
+    """Read an assertions file, refusing to proceed on malformed JSON."""
+    if not af.exists():
+        return None
+    try:
+        lst = json.loads(af.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        die(f"{af} is not valid JSON ({e}). Fix or remove it first.")
+    if not isinstance(lst, list):
+        die(f"{af} is not a JSON array. Fix it first.")
+    return lst
+
+
 if a.get("action") == "insight":
     if a.get("kind") not in ("module", "file", "topic", "table") or len(a.get("summary", "")) < 40 or not a.get("target"):
         die("insight needs target, kind (module|file|topic|table), and a summary of at least 40 chars.")
@@ -137,16 +186,8 @@ elif a.get("action") == "assert":
     if not row or not row[0]:
         die(f"File '{a.get('file')}' is not in the index (paths are repo-prefixed in a multi-repo workspace).")
 
-    af = ROOT / "docs" / "graph-assertions.json"
-    lst = []
-    if af.exists():
-        # Never clobber: a malformed file must not erase the team's assertions.
-        try:
-            lst = json.loads(af.read_text(encoding="utf-8"))
-        except Exception as e:  # noqa: BLE001
-            die(f"docs/graph-assertions.json exists but is not valid JSON ({e}). Fix or remove it first.")
-        if not isinstance(lst, list):
-            die("docs/graph-assertions.json is not a JSON array. Fix it first.")
+    af = _assertions_base(a.get("file")) / "docs" / "graph-assertions.json"
+    lst = _read_assertions(af) or []
     rec = {"kind": a["kind"], "file": a["file"], "line": a.get("line", 0), "evidence": a["evidence"],
            "confidence": a.get("confidence") if a.get("confidence") in ("high", "medium", "low") else "medium",
            "author": author, "source_hash": row[0],
@@ -160,7 +201,7 @@ elif a.get("action") == "assert":
     lst.append(rec)
     af.parent.mkdir(parents=True, exist_ok=True)
     af.write_text(json.dumps(lst, indent=2) + "\n", encoding="utf-8")
-    print(f"Asserted (provenance: {author}) and recorded in docs/graph-assertions.json ({len(lst)} total). "
+    print(f"Asserted (provenance: {author}) and recorded in {af.relative_to(ROOT) if str(af).startswith(str(ROOT)) else af} ({len(lst)} total). "
           f"It enters the graph on the next index, marked STALE automatically if {a['file']} changes. "
           "Commit the file to share it.")
 
@@ -171,15 +212,15 @@ elif a.get("action") == "dismiss":
         die("dismiss needs gap (e.g. orphan_topic) and key (topic/table/path).")
     if len(a.get("reason", "")) < 10:
         die("reason must say why this gap is acceptable (10+ chars).")
-    af = ROOT / "docs" / "graph-assertions.json"
-    alist = []
-    if af.exists():
-        try:
-            alist = json.loads(af.read_text(encoding="utf-8"))
-        except Exception as e:  # noqa: BLE001
-            die(f"docs/graph-assertions.json is not valid JSON ({e}). Fix it first.")
-        if not isinstance(alist, list):
-            die("docs/graph-assertions.json is not a JSON array. Fix it first.")
+    # A dismissal is about a gap key, not a file, so there is no repo to infer.
+    # It goes where the caller says, else the workspace root.
+    _prefixes = _root_prefixes()
+    _base = ROOT / a["root"] if a.get("root") in _prefixes else ROOT
+    af = _base / "docs" / "graph-assertions.json"
+    if _prefixes and _base == ROOT:
+        print('Note: the workspace root is not a git repo, so this dismissal will not be versioned. '
+              f'Pass "root":"<repo>" to commit it. Repos: {", ".join(_prefixes)}.', file=sys.stderr)
+    alist = _read_assertions(af) or []
     alist = [x for x in alist if not (x.get("kind") == "dismissal" and x.get("gap") == a["gap"] and x.get("key") == a["key"])]
     alist.append({"kind": "dismissal", "gap": a["gap"], "key": a["key"], "reason": a["reason"],
                   "author": author, "dismissed_at": datetime.date.today().isoformat()})
@@ -191,23 +232,25 @@ elif a.get("action") in ("retract", "reaffirm"):
     # lifecycle for existing assertions, keyed by the same natural key the
     # no-duplicate filter uses. retract removes; reaffirm re-verifies: the
     # source_hash moves to the evidence file's CURRENT hash, clearing STALE.
-    af = ROOT / "docs" / "graph-assertions.json"
-    if not af.exists():
-        die("docs/graph-assertions.json does not exist; nothing to modify.")
-    try:
-        alist = json.loads(af.read_text(encoding="utf-8"))
-    except Exception as e:  # noqa: BLE001
-        die(f"docs/graph-assertions.json is not valid JSON ({e}). Fix it first.")
-    if not isinstance(alist, list):
-        die("docs/graph-assertions.json is not a JSON array. Fix it first.")
-
+    # The record may live in the parent (older placements) or in the repo that
+    # owns its evidence file, so edit whichever one actually holds it. af and
+    # alist are chosen below, once the natural key is known.
     def key(x):
         return "|".join(str(v) for v in (x.get("kind"), x.get("file"), x.get("line", 0),
                                          x.get("topic", ""), x.get("table", ""), x.get("path", "")))
     target = key(a)
-    hits = [x for x in alist if key(x) == target]
+    af = alist = None
+    hits = []
+    for cand in _assertion_files():
+        part = _read_assertions(cand)
+        if part is None:
+            continue
+        found = [x for x in part if key(x) == target]
+        if found:
+            af, alist, hits = cand, part, found
+            break
     if not hits:
-        die("No matching assertion found in docs/graph-assertions.json (key: kind+file+line+topic/table/path).")
+        die("No matching assertion found in any docs/graph-assertions.json (key: kind+file+line+topic/table/path).")
     if a["action"] == "retract":
         alist = [x for x in alist if key(x) != target]
         af.write_text(json.dumps(alist, indent=2) + "\n", encoding="utf-8")
