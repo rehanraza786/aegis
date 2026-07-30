@@ -1,0 +1,78 @@
+From fa3e43e22de00a1274d4ea18662188a1df1227c2 Mon Sep 17 00:00:00 2001
+From: rehanraza786 <rehanraza786@users.noreply.github.com>
+Date: Wed, 29 Jul 2026 03:50:14 +0000
+Subject: [PATCH 12/12] Graph view: send the repo a dismissal belongs to
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Anchoring dismissals fixed the unversioned write and broke the one caller
+that could not answer the new question. An assertion payload carries `file`,
+so its repo resolves itself; a dismissal names a gap, not a file. In a
+multi-root workspace the graph view's dismiss button now hits a refusal
+telling the user to pass "root" — which the webview had no way to do.
+Silently writing to a non-repo parent was worse, but failing with
+instructions the UI cannot follow is not the fix.
+
+The view can answer it. Every gap is rendered next to a site, and paths are
+repo-prefixed: an orphan topic has producers and consumers, a
+declared-but-unused topic has the config file that declares it. anchorOf()
+takes the first path available and sends its first segment as `root`.
+
+A wrong guess is harmless by construction: annotate validates root against
+the real repo list and, when it does not match, falls through to tracing the
+gap through the graph and then to refusing. The hint can make a dismissal
+succeed; it cannot make one land in the wrong place. Verified both ways on a
+two-repo workspace.
+---
+ extension/graph-view.html | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/extension/graph-view.html b/extension/graph-view.html
+index 5a94ff3..f19320f 100644
+--- a/extension/graph-view.html
++++ b/extension/graph-view.html
+@@ -579,9 +579,26 @@ function renderAssertions() {
+ 
+ /* dismissed gaps mute with their audit trail; live ones offer a one-line
+    dismissal (reason mandatory) through the same reviewed write path */
+-function dismissRow(d, gap, key) {
++/* A dismissal names a gap, not a file, so annotate cannot infer which repo it
++   belongs to in a multi-root workspace — it refuses rather than write somewhere
++   git cannot see. The view CAN infer it: every gap is displayed next to a site,
++   and paths are repo-prefixed. Send that as `root`. A wrong guess is harmless:
++   annotate validates it against the real repo list and falls back to tracing
++   the gap itself. */
++function repoOf(p) {
++  const seg = String(p || "").split("/")[0];
++  return seg && seg !== p ? seg : null;
++}
++function anchorOf(...candidates) {
++  for (const c of candidates.flat()) {
++    const r = repoOf(typeof c === "string" ? c : c && c.path);
++    if (r) return r;
++  }
++  return null;
++}
++function dismissRow(d, gap, key, anchor) {
+   if (d) return `<div class="muted">dismissed by ${esc(d.by || "?")}: ${esc(d.reason || "")}</div>`;
+-  return `<form class="annotate" data-dismiss='${esc(JSON.stringify({ gap, key }))}'>
++  return `<form class="annotate" data-dismiss='${esc(JSON.stringify(anchor ? { gap, key, root: anchor } : { gap, key }))}'>
+     <input name="reason" placeholder="Dismiss with reason (≥10 chars — stays auditable)">
+     <button type="submit" class="secondary">Dismiss</button></form>`;
+ }
+@@ -618,9 +635,9 @@ function renderGaps() {
+         <textarea name="evidence" placeholder="Evidence (≥20 chars): how did you resolve it? Quote the constant/config/profile."></textarea>
+         <select name="confidence"><option>high</option><option selected>medium</option><option>low</option></select>
+         <button type="submit">Assert resolved topic</button></form></div>`)}
+-    ${gapSection("declared", "Declared in config, unused", "warn", declUnused, (it) => `<div class="gap-item${it.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(it.topic)}</b> — ${esc(it.config_key)} declares it, but no producer or consumer references it.<div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div>${dismissRow(it.dismissed, "declared_unused", it.topic)}</div>`)}
++    ${gapSection("declared", "Declared in config, unused", "warn", declUnused, (it) => `<div class="gap-item${it.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(it.topic)}</b> — ${esc(it.config_key)} declares it, but no producer or consumer references it.<div class="site"><a data-open="${esc(it.path)}:${it.line}">${esc(it.path)}:${it.line}</a></div>${dismissRow(it.dismissed, "declared_unused", it.topic, anchorOf(it.path))}</div>`)}
+     ${gapSection("drift", "Drift tables", "err", drift, (t) => `<div class="gap-item"><span class="err">⚠</span> <b>${esc(t.table)}</b> — no changeset. Click its node to assert.</div>`)}
+-    ${gapSection("orphans", "Orphan topics", "warn", orphans, (t) => `<div class="gap-item${t.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(t.topic)}</b> — ${t.warnings.orphan_produce ? "no consumer" : "no producer"} found. Often a real bug: investigate before silencing.${dismissRow(t.dismissed, "orphan_topic", t.topic)}</div>`)}
++    ${gapSection("orphans", "Orphan topics", "warn", orphans, (t) => `<div class="gap-item${t.dismissed ? " muted" : ""}"><span class="warn">⚠</span> <b>${esc(t.topic)}</b> — ${t.warnings.orphan_produce ? "no consumer" : "no producer"} found. Often a real bug: investigate before silencing.${dismissRow(t.dismissed, "orphan_topic", t.topic, anchorOf(t.producers || [], t.consumers || []))}</div>`)}
+     ${gapSection("uncalled", "Endpoints with no caller", "warn", uncalled, (e) => `<div class="gap-item"><span class="warn">⚠</span> ${esc(e.method)} <b>${esc(e.path)}</b><div class="site"><a data-open="${esc(e.file)}:${e.line}">${esc(e.file)}:${e.line}</a></div></div>`,
+       `<div class="muted">the full list answers to http_map</div>`)}`;
+   g.querySelectorAll("details.gap-sec").forEach((d) => d.addEventListener("toggle", () => {
+-- 
+2.43.0
+

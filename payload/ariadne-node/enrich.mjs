@@ -47,8 +47,14 @@ const db = new Database(DB_PATH);
 db.pragma("busy_timeout = 10000");
 db.exec(`CREATE TABLE IF NOT EXISTS insights(
   target TEXT PRIMARY KEY, kind TEXT, hash TEXT, summary TEXT,
-  model TEXT, generated_at REAL)`);
+  model TEXT, generated_at REAL, source TEXT)`);
+if (!db.prepare("SELECT COUNT(*) c FROM pragma_table_info('insights') WHERE name='source'").get().c) {
+  db.exec("ALTER TABLE insights ADD COLUMN source TEXT");
+}
 const q = (sql, ...a) => db.prepare(sql).all(...a);
+// LIKE 'p%' cannot use the index (LIKE is case-insensitive by default); a
+// half-open range can. Parity: server.mjs prefixRange.
+const prefixRange = (p) => p ? [p, p.slice(0, -1) + String.fromCharCode(p.charCodeAt(p.length - 1) + 1)] : ["", "\uffff"];
 const svc = (p) => p.split("/")[0];
 // insights describe production intent: seam facts from test files stay out of
 // the prompts (column exists only once an indexer >= schema v5 has run)
@@ -85,16 +91,20 @@ async function complete(prompt) {
 
 /* ---------------- targets: modules + hotspot files, hash-keyed ---------------- */
 function moduleTargets() {
-  const files = q("SELECT path, hash FROM files");
+  // The indexer computes these once per index; reading them here is what keeps
+  // enrich, the server, and annotate from drifting into three different hashes.
+  try {
+    const rows = q("SELECT module, hash FROM module_hashes ORDER BY module");
+    if (rows.length) return rows.map((r) => ({ kind: "module", target: r.module, hash: r.hash }));
+  } catch { /* index predates module_hashes; fall back */ }
   const mods = new Map();
-  for (const f of files) {
-    const m = mods.get(svc(f.path)) ?? { paths: [], hashes: [] };
-    m.paths.push(f.path); m.hashes.push(f.hash ?? "");
-    mods.set(svc(f.path), m);
+  for (const f of q("SELECT path, hash FROM files")) {
+    if (!mods.has(svc(f.path))) mods.set(svc(f.path), []);
+    mods.get(svc(f.path)).push(f.hash ?? "");
   }
-  return [...mods.entries()].map(([name, m]) => ({
+  return [...mods.entries()].map(([name, hs]) => ({
     kind: "module", target: name,
-    hash: createHash("sha1").update(m.hashes.sort().join("|")).digest("hex"),
+    hash: createHash("sha1").update(hs.sort().join("|")).digest("hex"),
   }));
 }
 function hotspotTargets(n = 12) {
@@ -112,10 +122,10 @@ or gotchas a developer must know before changing it. No preamble, no markdown he
 TARGET: ${t.kind} ${t.target}\n`;
   if (t.kind === "module") {
     const syms = q(`SELECT s.name, s.kind FROM symbols s JOIN files f ON f.id=s.file_id
-                    WHERE f.path LIKE ? AND s.kind IN ('class','type') LIMIT 25`, t.target + "/%");
-    const topics = q(`SELECT DISTINCT m.topic, m.direction FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?${PROD}`, t.target + "/%");
+                    WHERE f.path >= ? AND f.path < ? AND s.kind IN ('class','type') LIMIT 25`, ...prefixRange(t.target + "/"));
+    const topics = q(`SELECT DISTINCT m.topic, m.direction FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path >= ? AND f.path < ?${PROD}`, ...prefixRange(t.target + "/"));
     const tables = q(`SELECT DISTINCT a.tbl, a.mode FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?${PROD}`, t.target + "/%");
-    const eps = q(`SELECT e.method, e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ?${PROD} LIMIT 15`, t.target + "/%");
+    const eps = q(`SELECT e.method, e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path >= ? AND f.path < ?${PROD} LIMIT 15`, ...prefixRange(t.target + "/"));
     return header +
       `Classes/types: ${syms.map((s) => s.name).join(", ") || "n/a"}\n` +
       `Kafka: ${topics.map((x) => `${x.direction} ${x.topic}`).join(", ") || "none"}\n` +
@@ -147,6 +157,7 @@ if (APPLY) {
                            VALUES(?,?,?,?,?,?)`);
   for (const it of items) putA.run(it.target, it.kind, it.hash, String(it.summary).slice(0, 4000), it.model ?? "external", Date.now() / 1000);
   console.log(`Applied ${items.length} insights.`);
+  writeInsightsJson();
   writeInsightsMd();
   process.exit(0);
 }
@@ -169,6 +180,19 @@ for (const t of targets) {
   } catch (e) { failed++; console.error(`  ! ${t.target}: ${e.message}`); }
 }
 console.log(`Enrichment: ${fresh} generated, ${cached} cached (hash-unchanged), ${failed} failed.`);
+
+/* ---------------- durable export ---------------- */
+// docs/generated/ is gitignored, so insights.md is a report, not a record.
+// docs/insights.json is the committed source of truth the indexer re-loads.
+function writeInsightsJson() {
+  const rows = q("SELECT target, kind, hash, summary, model, generated_at FROM insights ORDER BY target");
+  if (!rows.length) return;
+  const f = path.join(ROOT, "docs", "insights.json");
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify(rows, null, 2) + "\n");
+  console.log(`  + docs/insights.json (${rows.length} entries, commit to share)`);
+}
+writeInsightsJson();
 
 /* ---------------- insights.md ---------------- */
 writeInsightsMd();

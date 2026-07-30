@@ -136,6 +136,28 @@ except Exception:  # noqa: BLE001
 MAX_ROWS = _cfg.get("maxToolRows", 50)
 MAX_BYTES = _cfg.get("maxToolBytes", 24000)
 SUMMARY_THRESHOLD = _cfg.get("summaryThreshold", 40)
+# One insight is prose an assistant or a committed file wrote, so it is the least
+# predictable thing any pack carries. context_pack advertises ~900 bytes; an
+# untruncated 4000-char summary blows that by 4x on its own.
+MAX_INSIGHT_CHARS = int(_cfg.get("maxInsightChars", 600))
+
+
+def _clamp_insight(t) -> str:
+    t = str(t if t is not None else "")
+    return t if len(t) <= MAX_INSIGHT_CHARS else \
+        t[:MAX_INSIGHT_CHARS] + '… [truncated; call explain("…") for the full insight]'
+
+
+def _prefix_range(p: str):  # noqa: D401
+    """Half-open range for a path prefix.
+
+    SQLite cannot use an index for `path LIKE 'p%'` because LIKE is
+    case-insensitive by default; an explicit range can, and matching paths
+    case-sensitively is more correct anyway.
+    """
+    if not p:
+        return "", "\uffff"
+    return p, p[:-1] + chr(ord(p[-1]) + 1)
 
 
 def _wt_label(con, path_or_id):
@@ -450,13 +472,13 @@ def _status_data(live=False):
 
 @mcp.tool(annotations=RO)
 def index_status() -> str:
-    """Check index freshness: file/symbol/edge counts, whether the indexed git SHA matches HEAD, and dirty_worktree (uncommitted paths — the incremental indexer absorbs them; fresh:false until it has). Call this first if results seem stale."""
+    """Index freshness: counts, indexed SHA vs HEAD, dirty_worktree. Call first if results seem stale."""
     return _status_data(live=True)
 
 
 @mcp.tool(annotations=RO)
 def search_code(query: str, limit: int = 8) -> str:
-    """Full-text search over all code. Returns matching chunks with path and start line. Use for 'where is X handled/configured/used' questions instead of reading files."""
+    """Full-text search over code, returning chunks with path and line. Use for 'where is X handled or configured' instead of opening files."""
     con = db()
     safe = '"' + query.replace('"', '""') + '"'
     rows = con.execute(
@@ -496,7 +518,7 @@ def _resolve_target(con, target):
 
 @mcp.tool(annotations=RO)
 def context_pack(target: str) -> str:
-    """ONE call that assembles everything relevant to working on a target (file path, class, or method): outline, callers, blast radius, the Kafka topics / DB tables / HTTP endpoints it touches, the decisions governing those, and any cached insight. Use INSTEAD of six separate lookups when starting work."""
+    """ONE call to START WORK on a file, class, or method: outline, callers, blast radius, the topics/tables/endpoints it touches, governing decisions, cached insight, covering tests. Use INSTEAD of six lookups."""
     con = db()
     hit = _resolve_target(con, target)
     if not hit:
@@ -539,6 +561,7 @@ def context_pack(target: str) -> str:
     insight = None
     try:
         row = con.execute("SELECT summary FROM insights WHERE target=? OR target=? LIMIT 1", (fpath, mod)).fetchone()
+        row = {"summary": _clamp_insight(row["summary"])} if row else None
         insight = row["summary"] if row else None
     except sqlite3.Error:
         pass
@@ -586,7 +609,7 @@ def context_pack(target: str) -> str:
 
 @mcp.tool(annotations=RO)
 def find_symbol(name: str, exact: bool = False) -> str:
-    """Look up functions/classes/types by name (substring by default). Returns kind, signature, file, and line, enough to reference or jump to it without reading the file."""
+    """Find a function, class, or type BY NAME when you do not know which file holds it. Returns kind, signature, path, line."""
     con = db()
     q = name if exact else f"%{name}%"
     op = "=" if exact else "LIKE"
@@ -599,7 +622,7 @@ def find_symbol(name: str, exact: bool = False) -> str:
 
 @mcp.tool(annotations=RO)
 def file_outline(path: str) -> str:
-    """Get a file's skeleton: language, line count, all symbols with signatures, plus its imports and importers. Use INSTEAD of reading the file when you only need its structure."""
+    """A file's skeleton: its symbols with signatures, plus who imports it. Use INSTEAD of reading the file when you only need structure."""
     con = db()
     f = con.execute("SELECT * FROM files WHERE path=?", (path,)).fetchone()
     if not f:
@@ -658,7 +681,7 @@ def _blast_data(con, path, depth):
 
 @mcp.tool(annotations=RO)
 def blast_radius(path: str, depth: int = 2) -> str:
-    """Find everything that transitively depends on a file (reverse dependency BFS up to `depth`). Call BEFORE modifying shared code to know what to re-test."""
+    """Everything that transitively depends on a file. Call BEFORE modifying shared code to know what to re-test."""
     con = db()
     note_files([path])
     return _blast_data(con, path, max(1, min(depth, 5))) or "File not in index."
@@ -666,7 +689,7 @@ def blast_radius(path: str, depth: int = 2) -> str:
 
 @mcp.tool(annotations=RO)
 def dependencies(path: str) -> str:
-    """List what a file imports (its direct dependencies in this repo)."""
+    """What a file IMPORTS: its direct in-repo dependencies, nothing else."""
     con = db()
     rows = con.execute(
         "SELECT f2.path FROM files f JOIN edges e ON e.src=f.id JOIN files f2 ON f2.id=e.dst "
@@ -676,9 +699,9 @@ def dependencies(path: str) -> str:
 
 @mcp.tool(annotations=RO)
 def module_map(prefix: str = "") -> str:
-    """Directory-level overview: for each top-level directory (or under `prefix`), file count, main languages, and symbol count. Use as the first call to orient in an unfamiliar repo."""
+    """Directory overview: file count and main languages per top-level dir (optionally under prefix). First call in an unfamiliar repo."""
     con = db()
-    rows = con.execute("SELECT path, lang FROM files WHERE path LIKE ?", (f"{prefix}%",)).fetchall()
+    rows = con.execute("SELECT path, lang FROM files WHERE path >= ? AND path < ?", _prefix_range(prefix)).fetchall()
     agg = {}
     strip = len(prefix)
     for r in rows:
@@ -694,7 +717,7 @@ def module_map(prefix: str = "") -> str:
 
 @mcp.tool(annotations=RO)
 def hotspots(limit: int = 10) -> str:
-    """The most-depended-on files in the repo (highest in-degree). These are the highest-risk files to change and the best places to start understanding the architecture."""
+    """Most-depended-on files (highest in-degree). Highest risk to change."""
     con = db()
     rows = con.execute(
         "SELECT f.path, COUNT(e.src) dependents FROM files f JOIN edges e ON e.dst=f.id "
@@ -704,18 +727,31 @@ def hotspots(limit: int = 10) -> str:
 
 @mcp.tool(annotations=RO)
 def find_callers(name: str, limit: int = 40) -> str:
-    """AST-based: who calls this function/method? Heuristic (matched by name); for compiler-resolved precision use find_references (SCIP)."""
+    """Who CALLS this function or method, with file and line. HEURISTIC name match: explore with this, then confirm with find_references."""
     con = db()
     rows = con.execute(
         "SELECT s.name AS caller, s.parent, f.path, c.line FROM calls c "
         "JOIN symbols s ON s.id=c.src_symbol JOIN files f ON f.id=s.file_id "
         "WHERE c.callee=? ORDER BY f.path, c.line LIMIT ?", (name, _clamp(limit, 1, 100))).fetchall()
-    return fmt(rows) if rows else "No callers recorded (AST may not cover this language; try find_references)."
+    if not rows:
+        return "No callers recorded (AST may not cover this language; try find_references)."
+    # Saying "heuristic" in the tool description does not help an agent holding a
+    # plausible-looking result. Say it here, and only when a precise answer
+    # actually exists for this symbol, so the hint costs nothing otherwise.
+    scip = 0
+    try:
+        scip = con.execute("SELECT COUNT(*) c FROM scip_defs WHERE symbol LIKE ?", (f"%{name}%",)).fetchone()["c"]
+    except sqlite3.Error:
+        pass  # no SCIP ingested
+    if scip:
+        return fmt({"callers": rows, "note": f"heuristic (name match). SCIP has compiler-resolved data for "
+                                             f"'{name}' — use find_references before concluding anything is or is not used."})
+    return fmt(rows)
 
 
 @mcp.tool(annotations=RO)
 def find_callees(name: str) -> str:
-    """AST-based: what does this function/method call? Heuristic (by name)."""
+    """What this function or method CALLS OUT TO, with lines. HEURISTIC name match; the outgoing direction of find_callers."""
     con = db()
     rows = con.execute(
         "SELECT DISTINCT c.callee, c.line FROM calls c JOIN symbols s ON s.id=c.src_symbol "
@@ -725,7 +761,7 @@ def find_callees(name: str) -> str:
 
 @mcp.tool(annotations=RO)
 def find_references(name: str, limit: int = 40) -> str:
-    """COMPILER-GRADE (requires SCIP ingest): find every place a symbol is actually used, resolved by the compiler, not text matching. Give a function/class/method name. Returns definition site + all reference sites."""
+    """COMPILER-GRADE (needs SCIP): every place a symbol is USED ANYWHERE, resolved through types, including Lombok-generated members. The only tool certain enough to conclude something is unused and safe to delete."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='scip_refs'").fetchone():
         return "SCIP data not ingested. Run scip-typescript/scip-java then .ariadne/scip_ingest.py (see README). Falling back: use search_code instead."
@@ -748,7 +784,7 @@ def find_references(name: str, limit: int = 40) -> str:
 
 @mcp.tool(annotations=RO)
 def goto_definition(name: str) -> str:
-    """COMPILER-GRADE (requires SCIP ingest): jump to the exact definition of a symbol, with its doc comment. More precise than find_symbol for overloaded/common names."""
+    """COMPILER-GRADE (needs SCIP): jump to a symbol's exact DEFINITION with its doc comment. Beats find_symbol on overloaded or duplicated names."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='scip_defs'").fetchone():
         return "SCIP data not ingested; use find_symbol instead."
@@ -760,26 +796,37 @@ def goto_definition(name: str) -> str:
 
 @mcp.tool(annotations=RO)
 def explain(target: str) -> str:
-    """Cached LLM insight for a module or file: intent, responsibilities, system connections, gotchas. Hash-cached, regenerated only when content changes."""
+    """Cached insight for a module or file: intent, responsibilities, connections, gotchas. Says so when none exists or it is stale."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='insights'").fetchone():
         return ("No insights yet. Run enrichment: python3 .ariadne/enrich.py "
                 "(opt-in, supports fully-local models via OPENAI_BASE_URL, see PRIVACY.md).")
-    row = con.execute("SELECT * FROM insights WHERE target=? OR target LIKE ? LIMIT 1",
-                      (target, f"%{target}%")).fetchone()
+    # Exact match first. The old single `target=? OR target LIKE ?` had no
+    # ORDER BY, so a substring match could outrank the exact row.
+    row = con.execute("SELECT * FROM insights WHERE target=?", (target,)).fetchone()
+    if not row:
+        row = con.execute("SELECT * FROM insights WHERE target LIKE ? ORDER BY LENGTH(target), target LIMIT 1",
+                          (f"%{target}%",)).fetchone()
     if not row:
         return f"No cached insight for '{target}'. Ask Hermes to derive one from the graph, or run enrich."
+    # Staleness applies to modules too. It used to be file-only, so a module
+    # insight was served forever with no warning while the tool description
+    # promised it auto-staled.
+    cur = _insight_subject_hash(con, row)
     stale = ""
-    if row["kind"] == "file":
-        f = con.execute("SELECT hash FROM files WHERE path=?", (row["target"],)).fetchone()
-        if f and f["hash"] != row["hash"]:
-            stale = " [STALE: file changed since this was generated, re-run enrich]"
-    return f"{row['kind']} {row['target']} (model: {row['model']}){stale}\n\n{row['summary']}"
+    if row["hash"] and cur and cur != row["hash"]:
+        stale = f" [STALE: {row['kind']} changed since this was generated, re-run enrich]"
+    # Provenance is the indexer's stamp, not the file's claim: an entry in the
+    # committed docs/insights.json cannot present itself as a parsed fact.
+    src = row["source"] if "source" in row.keys() else None
+    prov = "derived, from committed docs/insights.json" if src == "file" else "derived, written live"
+    return (f"{row['kind']} {row['target']} ({prov}; model: {row['model']}){stale}"
+            f"\n\n{_clamp_insight(row['summary'])}")
 
 
 @mcp.tool(annotations=RO)
 def decisions(query: str = "", target: str = "", status: str = "", as_of: str = "") -> str:
-    """Decision memory (Mnemosyne): query architectural decisions with temporal validity. Filter by text, governed target (topic/table/module), status, or as_of (YYYY-MM-DD) for time-travel."""
+    """Architectural decisions and whether they are STILL CURRENT: filter by text, governed target, status, or as_of to see what was in force on a date. Parsed from ADR markdown."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='decisions'").fetchone():
         return "No decision data; reindex with the current Ariadne"
@@ -810,7 +857,7 @@ def decisions(query: str = "", target: str = "", status: str = "", as_of: str = 
 
 @mcp.tool(annotations=RO)
 def decision_trace(id: str) -> str:
-    """Full lineage of one decision: supersession chain plus governed artifacts with existence check (flags decision drift)."""
+    """One ADR's lineage: what SUPERSEDED what and when, plus the artifacts it governs, flagged when they no longer exist in the graph."""
     con = db()
     rec = con.execute("SELECT * FROM decisions WHERE id=?", (id.upper(),)).fetchone()
     if not rec:
@@ -847,26 +894,105 @@ def decision_trace(id: str) -> str:
         **({"warning": "supersession cycle detected in this chain — fix the ADR frontmatter"} if cycle else {})}
 
 
+def _assertions_base(file: str) -> Path:
+    """Directory whose docs/graph-assertions.json should hold an assertion about `file`.
+
+    Paths are repo-prefixed in a multi-root workspace, so the first segment names
+    the repo. Writing to the parent "works" -- the indexer reads it -- but the
+    parent is not a git repo, so nothing is versioned, reviewed, or shared, which
+    is the entire promise this tool makes. Parity: assertionsBase in server.mjs.
+    """
+    try:
+        con = db()
+        prefixes = [r["key"][len("last_sha:"):] for r in
+                    con.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]
+        seg = str(file or "").split("/")[0]
+        if seg in [p for p in prefixes if p != "."]:
+            return _root_dir(seg)
+    except sqlite3.Error:
+        pass  # fresh index
+    return REPO_ROOT
+
+
+def _assertion_files():
+    """Every place an assertions file may live: parent, then each repo."""
+    out = [REPO_ROOT / "docs" / "graph-assertions.json"]
+    try:
+        con = db()
+        for r in [x["key"][len("last_sha:"):] for x in
+                  con.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]:
+            if r == ".":
+                continue
+            f = _root_dir(r) / "docs" / "graph-assertions.json"
+            if f not in out:
+                out.append(f)
+    except sqlite3.Error:
+        pass  # fresh index
+    return out
+
+
+def _resolve_write_root(root: str, what: str):
+    """Pick a git-versioned root to write durable memory into.
+
+    Writing under the multi-root workspace PARENT "succeeds" and then never gets
+    re-parsed, so the record silently vanishes on the next index -- the bug this
+    guards against for ADRs, and now for insights too.
+    Returns (base, source_base, error).
+    """
+    con0 = db()
+    prefixes = [r["key"][len("last_sha:"):]
+                for r in con0.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]
+    if not any(p != "." for p in prefixes):
+        return REPO_ROOT, REPO_ROOT, None
+    pick = root or (prefixes[0] if len(prefixes) == 1 else None)
+    if not pick or pick not in prefixes:
+        return None, None, (f"Multi-root workspace: pass root=<repo> so {what} lands in a "
+                            f"git-versioned repo the indexer parses. Roots: {', '.join(prefixes)}.")
+    return _root_dir(pick), WS_BASE, None
+
+
+def _module_hash(con, target: str) -> str:
+    """Content hash of a module (a first path segment), for insight staleness.
+
+    INVARIANT: must match enrich.py module targets and the Node edition -- sha1
+    over the module's file hashes, SORTED BY HASH, joined with "|". Sorting by
+    path instead silently makes every assistant-written insight look changed, so
+    enrich regenerates and overwrites it on every run. tests/run_tests.py asserts
+    the two agree; change one, change all three.
+    """
+    try:
+        row = con.execute("SELECT hash FROM module_hashes WHERE module=?", (target,)).fetchone()
+        if row:
+            return row[0]
+    except sqlite3.Error:
+        pass  # index predates module_hashes; fall through
+    lo, hi = _prefix_range(target + "/")
+    hs = sorted((x[0] or "") for x in con.execute("SELECT hash FROM files WHERE path >= ? AND path < ?", (lo, hi)))
+    return hashlib.sha1("|".join(hs).encode()).hexdigest()
+
+
+def _insight_subject_hash(con, row):
+    """Current hash of whatever an insight is about, or None if it is gone."""
+    if row["kind"] == "file":
+        r = con.execute("SELECT hash FROM files WHERE path=?", (row["target"],)).fetchone()
+        return (r["hash"] if r else None) or None
+    if row["kind"] == "module":
+        return _module_hash(con, row["target"])
+    return None  # topic/table notes (annotate.py) have no single backing file
+
+
 @mcp.tool(annotations=WR)
 def save_decision(title: str, decision: str, rationale: str, alternatives: str = "", supersedes: str = "", root: str = "") -> str:
-    """Capture a decision made in this conversation: writes a git-versioned ADR file (docs/adr/) AND indexes it immediately. Use when an architectural/design choice is settled. root: in a multi-root workspace, which repo the ADR belongs to."""
+    """Write a git-versioned ADR and index it now. Use when an architectural or design choice is settled."""
     import datetime
     # Anchor the ADR inside a git-versioned ROOT the indexer parses. Writing
     # under the multi-root workspace PARENT (the old cwd fallback) "succeeded",
     # then the next reindex started from DELETE FROM decisions and never
     # re-parsed the file — the decision silently vanished.
     con0 = db()
-    prefixes = [r["key"][len("last_sha:"):]
-                for r in con0.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]
-    base = REPO_ROOT
-    source_base = REPO_ROOT
-    if any(p != "." for p in prefixes):  # multi-root workspace
-        pick = root or (prefixes[0] if len(prefixes) == 1 else None)
-        if not pick or pick not in prefixes:
-            return ("Multi-root workspace: pass root=<repo> so the ADR lands in a "
-                    f"git-versioned repo the indexer parses. Roots: {', '.join(prefixes)}.")
-        base = _root_dir(pick)
-        source_base = WS_BASE
+    base, source_base, err = _resolve_write_root(root, "the ADR")
+    if err:
+        return err
     adr_dir = base / "docs" / "adr"
     adr_dir.mkdir(parents=True, exist_ok=True)
     # Ids are workspace-global: seed from the decisions table (ADRs may live in
@@ -908,26 +1034,50 @@ def save_decision(title: str, decision: str, rationale: str, alternatives: str =
 
 
 @mcp.tool(annotations=WR)
-def save_insight(target: str, kind: str, summary: str) -> str:
-    """Persist a derived insight for a module or file into the graph (served by explain, hash-keyed so it auto-stales when content changes). kind: 'module' or 'file'. Use after synthesizing understanding from the graph tools."""
+def save_insight(target: str, kind: str, summary: str, root: str = "") -> str:
+    """Persist a derived insight for a module or file, hash-keyed so it auto-stales. Use after synthesizing understanding from the graph."""
     if kind not in ("module", "file") or len(summary) < 40:
         return "kind must be module|file and summary at least 40 chars."
+    base, source_base, err = _resolve_write_root(root, "the insight")
+    if err:
+        return err
     wcon = wdb()
     try:
         wcon.execute("""CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT,
-                        hash TEXT, summary TEXT, model TEXT, generated_at REAL)""")
+                        hash TEXT, summary TEXT, model TEXT, generated_at REAL, source TEXT)""")
+        if not [r for r in wcon.execute("PRAGMA table_info(insights)") if r[1] == "source"]:
+            wcon.execute("ALTER TABLE insights ADD COLUMN source TEXT")
         if kind == "file":
             r = wcon.execute("SELECT hash FROM files WHERE path=?", (target,)).fetchone()
             h = (r[0] if r else "") or ""
         else:
-            hs = [x[0] or "" for x in wcon.execute("SELECT hash FROM files WHERE path LIKE ? ORDER BY path", (target + "/%",))]
-            h = hashlib.sha1("|".join(hs).encode()).hexdigest()
-        wcon.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)",
-                     (target, kind, h, summary[:4000], "assistant", time.time()))
+            h = _module_hash(wcon, target)
+        rec = {"target": target, "kind": kind, "hash": h, "summary": summary[:4000],
+               "model": "assistant", "generated_at": time.time()}
+        # File first: the DB is derived and gitignored, so a row without a file
+        # entry is memory that dies at the next pull-index or rebuild.
+        f = base / "docs" / "insights.json"
+        try:
+            items = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            items = []  # first insight in this repo
+        if not isinstance(items, list):
+            items = []
+        items = [i for i in items if not (isinstance(i, dict) and i.get("target") == target)]
+        items.append(rec)
+        items.sort(key=lambda i: str(i.get("target", "")))  # stable order = reviewable diffs
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(items, indent=2) + "\n", encoding="utf-8")
+        wcon.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at, source) "
+                     "VALUES(?,?,?,?,?,?,'live')",
+                     (target, kind, h, rec["summary"], rec["model"], rec["generated_at"]))
         wcon.commit()
     finally:
         wcon.close()
-    return f"Insight saved for {kind} '{target}'."
+    rel = f.relative_to(source_base) if str(f).startswith(str(source_base)) else f
+    return (f"Insight saved for {kind} '{target}' to {rel} (git-versioned) and indexed. "
+            "It is re-loaded on every reindex and marked stale automatically when content "
+            "changes; commit the file to share it.")
 
 
 def _gaps_data(con, n):
@@ -1007,7 +1157,7 @@ def _gaps_data(con, n):
 
 @mcp.tool(annotations=RO)
 def graph_gaps(limit: int = 20) -> str:
-    """Where static analysis is BLIND, the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, and drift tables, each with file:line. Investigate, then record what you work out with assert_edge. This is how the graph gets better instead of staying wrong."""
+    """Where static analysis is BLIND and CANNOT RESOLVE what it sees: dynamic topic/SQL expressions, orphan topics and endpoints, drift tables, unmatched calls, each with file:line. Answer them with assert_edge."""
     return _gaps_data(db(), _clamp(limit, 1, 60))
 
 
@@ -1015,7 +1165,7 @@ def graph_gaps(limit: int = 20) -> str:
 def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str = "medium",
                 topic: str = "", direction: str = "", table: str = "", mode: str = "",
                 method: str = "", path: str = "") -> str:
-    """Record a fact you DERIVED by reading code that static analysis could not resolve, a runtime-assembled Kafka topic, dynamic SQL, a gateway-rewritten route. kind: kafka|db|http_endpoint|http_call. Writes docs/graph-assertions.json (git-committed and reviewable, like an ADR) and enters the graph tagged with your name, never mistaken for a parsed fact. Requires evidence: quote the code that convinced you."""
+    """RECORD a fact you DERIVED by reading code the parser could not see: a RUNTIME-ASSEMBLED topic name, a dynamically built table. Enters the graph tagged derived, never parsed. Requires evidence: quote the code that convinced you."""
     if kind not in ("kafka", "db", "http_endpoint", "http_call"):
         return "kind must be kafka|db|http_endpoint|http_call."
     if len(evidence) < 20:
@@ -1032,9 +1182,7 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
     if not row:
         return f"File '{file}' is not in the index, check the path (repo-prefixed in a multi-repo workspace)."
 
-    root = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
-                               text=True).stdout.strip() or Path.cwd())
-    af = root / "docs" / "graph-assertions.json"
+    af = _assertions_base(file) / "docs" / "graph-assertions.json"
     lst = []
     if af.exists():
         # Never clobber: a malformed file (merge-conflict marker, stray comma) must
@@ -1060,14 +1208,15 @@ def assert_edge(kind: str, file: str, line: int, evidence: str, confidence: str 
     lst.append(rec)
     af.parent.mkdir(parents=True, exist_ok=True)
     af.write_text(json.dumps(lst, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    return (f"Asserted and recorded in docs/graph-assertions.json ({len(lst)} total). It enters the graph on "
+    _rel = af.relative_to(WS_BASE) if str(af).startswith(str(WS_BASE)) else af
+    return (f"Asserted and recorded in {_rel} ({len(lst)} total). It enters the graph on "
             f"the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically "
             f"if {file} changes. Commit the file to share it with the team.")
 
 
 @mcp.tool(annotations=RO)
 def message_flow(topic: str = "") -> str:
-    """Messaging topology (Kafka, plus RabbitMQ/JMS/SQS/NATS labeled by system): correlate inbound/outbound message handling across modules. No args = full topic map (producers/consumers per topic with file:line, plus orphan warnings). Topics resolved from literals, constants, and application.yaml placeholders."""
+    """Messaging topology (Kafka; RabbitMQ/JMS/SQS/NATS labeled by system). No args = every TOPIC's producers and consumers with file:line, plus orphans. Pass topic for one flow."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='msg_edges'").fetchone():
         return "No message-edge data; reindex with the current Ariadne"
@@ -1177,7 +1326,7 @@ def message_flow(topic: str = "") -> str:
 
 @mcp.tool(annotations=RO)
 def db_map(table: str = "") -> str:
-    """Database topology (Spring Boot + Liquibase): correlate each table with the changesets that shaped it AND every code site touching it (entities, repositories, @Query, JdbcTemplate) with read/write mode. Includes drift warnings. Pass table for one table."""
+    """Database topology: each table's Liquibase changesets and every code site touching it, read or write. No args = full map plus DRIFT (tables code touches that no changelog defines, and tables defined but never touched). Pass table for one."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='db_defs'").fetchone():
         return "No DB-layer data; reindex with the current Ariadne"
@@ -1291,7 +1440,7 @@ def _http_correlation(con, prod_only, has_test):
 
 @mcp.tool(annotations=RO)
 def http_map(path: str = "") -> str:
-    """Full-stack HTTP seam: correlate REST endpoints (Spring controllers) with every caller (TS/React fetch/axios, Java RestTemplate/WebClient/Feign) matched on method + normalized path. Includes orphan endpoints and unmatched calls."""
+    """HTTP seam: REST endpoints correlated with their callers on method + normalized path. No args = full map plus orphans (endpoints NOBODY CALLS, calls hitting no known endpoint). Pass path to filter."""
     from http_extract import paths_match
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='http_endpoints'").fetchone():
@@ -1392,7 +1541,7 @@ def _cap_list(a, n=10):
 
 @mcp.tool(annotations=RO)
 def plan_context(task: str) -> str:
-    """When you have a TASK but no target yet: ONE call that finds the starting set server-side — full-text and symbol matches for the task's terms, the files they concentrate in, the Kafka topics / DB tables / HTTP endpoints those files touch, the decisions governing them, and the tests that cover them. Use INSTEAD of the 3-5 exploratory search calls at session start; then context_pack the target you choose."""
+    """ONE call when you have a TASK but no target: matching files, the seams they touch, governing decisions, covering tests. Use INSTEAD of exploratory search at session start, then context_pack the target you pick."""
     con = db()
     terms = _task_terms(task)
     if not terms:
@@ -1475,7 +1624,7 @@ def plan_context(task: str) -> str:
 
 @mcp.tool(annotations=RO)
 def change_check(files: list[str]) -> str:
-    """PRE-EDIT decision support: given the files you intend to touch, ONE call returning their combined blast radius, the tests to re-run, the seam warnings your edit could introduce (sole producers/consumers, drift tables, uncalled endpoints, unresolved expressions), the decisions governing them, and the assertions your edit will mark STALE. Call BEFORE proposing a diff."""
+    """ONE call before editing: combined blast radius of the files you will touch, tests to re-run, seam warnings your edit introduces, governing decisions, assertions it marks STALE. Call BEFORE proposing a diff."""
     from http_extract import paths_match
     con = db()
     files = [f for f in files if f][:20]
@@ -1577,7 +1726,7 @@ def change_check(files: list[str]) -> str:
 
 @mcp.tool(annotations=RO)
 def explain_path(source: str, target: str) -> str:
-    """WHY does editing A affect B? The shortest provenance-weighted path between two graph nodes — files, symbols, modules, topics (kafka:orders.created or just the topic name), tables (db:payments), endpoints (GET /api/x) — with per-hop evidence (kind + file:line + parsed/asserted provenance). blast_radius asserts the answer; this explains it, in ~300 tokens."""
+    """WHY editing A affects B: shortest path between two nodes (file, symbol, module, topic, table, endpoint) with per-hop evidence and provenance. blast_radius asserts the answer; this explains it."""
     src = source
     to = target
     if not src or not to:
@@ -1696,7 +1845,7 @@ def explain_path(source: str, target: str) -> str:
 
 @mcp.tool(annotations=RO)
 def usage_report(days: int = 7) -> str:
-    """The context-ROI ledger: how many bytes Ariadne served vs what the answered questions would have cost in raw file reads (the files each answer spans, measured from the index). Local-only (.ariadne/usage.jsonl); nothing leaves the machine. days: look-back window (default 7)."""
+    """Context-ROI ledger: bytes served vs what raw file reads would have cost. Local only. days: look-back window (default 7)."""
     win = _clamp(days, 1, 90)
     if not USAGE_PATH.exists():
         return "No usage recorded yet — the ledger starts with the first tool call after this update."
@@ -1734,7 +1883,7 @@ def usage_report(days: int = 7) -> str:
 
 @mcp.tool(annotations=WR)
 async def reindex(mode: str = "incremental") -> str:
-    """Rebuild the index. mode='incremental' (changed files since last indexed commit) or 'full'. Use when index_status reports fresh=false."""
+    """Rebuild the index. mode='incremental' or 'full'. Use when index_status reports fresh=false."""
     flag = "--full" if mode == "full" else "--incremental"
 
     def _run():
@@ -1870,7 +2019,7 @@ def aegis_impact(target: str) -> str:
 @_prompt_guard
 def aegis_orient(module: str) -> str:
     con = db()
-    rows = con.execute("SELECT id, path, lang FROM files WHERE path LIKE ?", (module + "/%",)).fetchall()
+    rows = con.execute("SELECT id, path, lang FROM files WHERE path >= ? AND path < ?", _prefix_range(module + "/")).fetchall()
     if not rows:
         return f"No files under module '{module}'. module_map lists the modules in this workspace."
     langs = {}
@@ -1878,13 +2027,13 @@ def aegis_orient(module: str) -> str:
         langs[r["lang"]] = langs.get(r["lang"], 0) + 1
     hot = con.execute(
         "SELECT f.path, COUNT(e.src) n FROM files f JOIN edges e ON e.dst=f.id "
-        "WHERE f.path LIKE ? GROUP BY f.id ORDER BY n DESC LIMIT 5", (module + "/%",)).fetchall()
+        "WHERE f.path >= ? AND f.path < ? GROUP BY f.id ORDER BY n DESC LIMIT 5", _prefix_range(module + "/")).fetchall()
     topics = [r[0] for r in con.execute(
-        "SELECT DISTINCT m.direction || ' ' || m.topic FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?", (module + "/%",))]
+        "SELECT DISTINCT m.direction || ' ' || m.topic FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path >= ? AND f.path < ?", _prefix_range(module + "/"))]
     tables = [r[0] for r in con.execute(
-        "SELECT DISTINCT a.mode || ' ' || a.tbl FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?", (module + "/%",))]
+        "SELECT DISTINCT a.mode || ' ' || a.tbl FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path >= ? AND f.path < ?", _prefix_range(module + "/"))]
     eps = [r[0] for r in con.execute(
-        "SELECT DISTINCT e.method || ' ' || e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ?", (module + "/%",))]
+        "SELECT DISTINCT e.method || ' ' || e.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path >= ? AND f.path < ?", _prefix_range(module + "/"))]
     govern = _governing(con, list(dict.fromkeys(
         [s.split(" ")[-1] for s in topics] + [s.split(" ")[-1] for s in tables] + [module])))
     insight = None
@@ -1895,8 +2044,8 @@ def aegis_orient(module: str) -> str:
         pass  # none yet
     n_tests = 0
     try:
-        n_tests = con.execute("SELECT COUNT(*) c FROM files WHERE path LIKE ? AND is_test=1",
-                              (module + "/%",)).fetchone()["c"]
+        n_tests = con.execute("SELECT COUNT(*) c FROM files WHERE path >= ? AND path < ? AND is_test=1",
+                              _prefix_range(module + "/")).fetchone()["c"]
     except sqlite3.Error:
         pass  # pre-is_test build
     top_langs = ", ".join(sorted(langs, key=langs.get, reverse=True)[:3])
@@ -2170,15 +2319,22 @@ def resource_decision(id: str) -> str:
 @mcp.resource("ariadne://assertions", name="assertions", mime_type="application/json",
               description="The human knowledge layer: docs/graph-assertions.json with a computed stale flag per assertion (evidence file changed since it was recorded).")
 def resource_assertions() -> str:
-    af = REPO_ROOT / "docs" / "graph-assertions.json"
-    if not af.exists():
+    # Same candidate set the indexer reads: the parent plus each repo, so a
+    # multi-root workspace does not under-report what is actually in the graph.
+    lst, found = [], False
+    for af in _assertion_files():
+        if not af.exists():
+            continue
+        found = True
+        try:
+            part = json.loads(af.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            return f"{af} exists but is not valid JSON ({e}). Fix it by hand; nothing here will overwrite it."
+        if not isinstance(part, list):
+            return f"{af} is not a JSON array. Fix it by hand; nothing here will overwrite it."
+        lst.extend(part)
+    if not found:
         return json.dumps({"assertions": [], "note": "No graph-assertions.json yet — assert_edge (or the graph view) creates it."}, indent=1, ensure_ascii=False)
-    try:
-        lst = json.loads(af.read_text(encoding="utf-8"))
-    except Exception as e:  # noqa: BLE001
-        return f"docs/graph-assertions.json exists but is not valid JSON ({e}). Fix it by hand; nothing here will overwrite it."
-    if not isinstance(lst, list):
-        return "docs/graph-assertions.json is not a JSON array. Fix it by hand; nothing here will overwrite it."
     try:
         con = db()
         for a in lst:

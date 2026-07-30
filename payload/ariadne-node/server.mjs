@@ -145,6 +145,15 @@ try { cfg = JSON.parse(fs.readFileSync(path.join(GR_DIR, "config.json"), "utf8")
 const MAX_ROWS = cfg.maxToolRows ?? 50;
 const MAX_BYTES = cfg.maxToolBytes ?? 24000;
 const SUMMARY_THRESHOLD = cfg.summaryThreshold ?? 40;
+// One insight is prose an assistant or a committed file wrote, so it is the
+// least predictable thing any pack carries. context_pack advertises ~900 bytes;
+// an untruncated 4000-char summary blows that by 4x on its own.
+const MAX_INSIGHT_CHARS = cfg.maxInsightChars ?? 600;
+const clampInsight = (t) => {
+  const s = String(t ?? "");
+  return s.length <= MAX_INSIGHT_CHARS ? s
+    : s.slice(0, MAX_INSIGHT_CHARS) + `… [truncated; call explain("…") for the full insight]`;
+};
 
 const hasWarning = (r) => r && typeof r === "object" &&
   (r.warning || r.warnings || r.unresolved_expressions || r.unmatched_calls);
@@ -381,11 +390,11 @@ function statusData(live = false) {
 }
 
 tool(server, "index_status",
-  "Check index freshness: file/symbol/edge counts, whether the indexed git SHA matches HEAD, and dirty_worktree (uncommitted paths — the incremental indexer absorbs them; fresh:false until it has). Call first if results seem stale.",
+  "Index freshness: counts, indexed SHA vs HEAD, dirty_worktree. Call first if results seem stale.",
   {}, () => statusData(true));
 
 tool(server, "search_code",
-  "Full-text search over all code. Returns matching chunks with path and start line. Use for 'where is X handled/configured/used' questions instead of reading files.",
+  "Full-text search over code, returning chunks with path and line. Use for 'where is X handled or configured' instead of opening files.",
   { query: z.string().min(2).max(200), limit: z.number().int().optional() },
   ({ query, limit }) => withDb((d) => {
     const safe = '"' + query.replaceAll('"', '""') + '"';
@@ -407,6 +416,14 @@ tool(server, "search_code",
 // Resolve a target (file path, symbol name, or fragment) to a file row —
 // shared by context_pack and the /aegis-impact prompt.
 // dirty-state provenance label for a file row: '' (committed) | 'working-tree' | 'untracked'
+/** Half-open range for a path prefix. SQLite cannot use an index for
+ *  `path LIKE 'p%'` because LIKE is case-insensitive by default; an explicit
+ *  range can, and matching paths case-sensitively is more correct anyway. */
+function prefixRange(p) {
+  if (!p) return ["", "\uffff"];
+  return [p, p.slice(0, -1) + String.fromCharCode(p.charCodeAt(p.length - 1) + 1)];
+}
+
 function wtLabel(d, pathOrId) {
   try {
     const row = typeof pathOrId === "number"
@@ -433,7 +450,7 @@ function resolveTarget(d, target) {
 }
 
 tool(server, "context_pack",
-  "ONE call that assembles everything relevant to working on a target (a file path, class, or method): its outline, callers, blast radius, the Kafka topics / DB tables / HTTP endpoints it touches, the architectural decisions governing those, and any cached insight. Use this INSTEAD of six separate lookups when starting work on something, it is the cheapest way to load focused context, and it is budgeted so it cannot flood the window.",
+  "ONE call to START WORK on a file, class, or method: outline, callers, blast radius, the topics/tables/endpoints it touches, governing decisions, cached insight, covering tests. Use INSTEAD of six lookups.",
   { target: z.string().min(1).max(300) },
   ({ target }) => withDb((d) => {
     // resolve target -> a file (accept a path, or a symbol name)
@@ -472,7 +489,7 @@ tool(server, "context_pack",
     let insight = null;
     try {
       const row = d.prepare("SELECT summary FROM insights WHERE target=? OR target=? LIMIT 1").get(file.path, mod);
-      if (row) insight = row.summary;
+      if (row) insight = clampInsight(row.summary);
     } catch { /* no insights yet */ }
 
     // which tests import this target, and the behaviors they assert
@@ -516,7 +533,7 @@ tool(server, "context_pack",
   }));
 
 tool(server, "find_symbol",
-  "Look up functions/classes/types by name (substring by default). Returns kind, signature, file, line, enough to reference without reading the file.",
+  "Find a function, class, or type BY NAME when you do not know which file holds it. Returns kind, signature, path, line.",
   { name: z.string().min(1).max(120), exact: z.boolean().optional() },
   ({ name, exact }) => withDb((d) => {
     const rows = exact
@@ -528,7 +545,7 @@ tool(server, "find_symbol",
   }));
 
 tool(server, "file_outline",
-  "A file's skeleton: language, line count, all symbols with signatures, plus its imports and importers. Use INSTEAD of reading the file when you only need structure.",
+  "A file's skeleton: its symbols with signatures, plus who imports it. Use INSTEAD of reading the file when you only need structure.",
   { path: z.string().min(1).max(500) },
   ({ path: p }) => withDb((d) => {
     const f = d.prepare("SELECT * FROM files WHERE path=?").get(p);
@@ -575,12 +592,12 @@ function blastData(d, p, depth) {
 }
 
 tool(server, "blast_radius",
-  "Everything that transitively depends on a file (reverse dependency BFS). Call BEFORE modifying shared code to know what to re-test.",
+  "Everything that transitively depends on a file. Call BEFORE modifying shared code to know what to re-test.",
   { path: z.string().min(1).max(500), depth: z.number().int().optional() },
   ({ path: p, depth }) => withDb((d) => { noteFiles([p]); return blastData(d, p, clamp(depth ?? 2, 1, 5)) ?? "File not in index."; }));
 
 tool(server, "dependencies",
-  "What a file imports (its direct in-repo dependencies).",
+  "What a file IMPORTS: its direct in-repo dependencies, nothing else.",
   { path: z.string().min(1).max(500) },
   ({ path: p }) => withDb((d) => {
     const rows = d.prepare(
@@ -590,10 +607,10 @@ tool(server, "dependencies",
   }));
 
 tool(server, "module_map",
-  "Directory-level overview: file count and main languages per top-level directory (optionally under `prefix`). First call to orient in an unfamiliar repo.",
+  "Directory overview: file count and main languages per top-level dir (optionally under prefix). First call in an unfamiliar repo.",
   { prefix: z.string().max(300).optional() },
   ({ prefix = "" }) => withDb((d) => {
-    const rows = d.prepare("SELECT path, lang FROM files WHERE path LIKE ?").all(`${prefix}%`);
+    const rows = d.prepare("SELECT path, lang FROM files WHERE path >= ? AND path < ?").all(...prefixRange(prefix));
     const agg = new Map();
     for (const r of rows) {
       const rest = r.path.slice(prefix.length).replace(/^\//, "");
@@ -610,14 +627,14 @@ tool(server, "module_map",
   }));
 
 tool(server, "hotspots",
-  "Most-depended-on files (highest in-degree), highest-risk to change, best places to start understanding the architecture.",
+  "Most-depended-on files (highest in-degree). Highest risk to change.",
   { limit: z.number().int().optional() },
   ({ limit }) => withDb((d) =>
     d.prepare(`SELECT f.path, COUNT(e.src) dependents FROM files f JOIN edges e ON e.dst=f.id
                GROUP BY f.id ORDER BY dependents DESC LIMIT ?`).all(clamp(limit ?? 10, 1, 30))));
 
 tool(server, "find_callers",
-  "AST-based: who calls this function/method? Returns each calling function with its file and line. Heuristic (matched by name); for compiler-resolved precision use find_references (SCIP).",
+  "Who CALLS this function or method, with file and line. HEURISTIC name match: explore with this, then confirm with find_references.",
   { name: z.string().min(1).max(120), limit: z.number().int().optional() },
   ({ name, limit }) => withDb((d) => {
     const rows = d.prepare(
@@ -625,11 +642,20 @@ tool(server, "find_callers",
        JOIN symbols s ON s.id=c.src_symbol JOIN files f ON f.id=s.file_id
        WHERE c.callee = ? ORDER BY f.path, c.line LIMIT ?`
 ).all(name, clamp(limit ?? 40, 1, 100));
-    return rows.length ? rows : "No callers recorded (AST index may not cover this file's language, or name mismatch, try find_references for SCIP-grade lookup).";
+    if (!rows.length) return "No callers recorded (AST index may not cover this file's language, or name mismatch, try find_references for SCIP-grade lookup).";
+    // Saying "heuristic" in the tool description does not help an agent holding
+    // a plausible-looking result. Say it here, and only when a precise answer
+    // actually exists for this symbol, so the hint costs nothing when it cannot
+    // be acted on.
+    let scip = 0;
+    try { scip = d.prepare("SELECT COUNT(*) c FROM scip_defs WHERE symbol LIKE ?").get(`%${name}%`).c; } catch { /* no SCIP ingested */ }
+    return scip
+      ? { callers: rows, note: `heuristic (name match). SCIP has compiler-resolved data for '${name}' — use find_references before concluding anything is or is not used.` }
+      : rows;
   }));
 
 tool(server, "find_callees",
-  "AST-based: what does this function/method call? Returns callee names with lines. Heuristic (by name).",
+  "What this function or method CALLS OUT TO, with lines. HEURISTIC name match; the outgoing direction of find_callers.",
   { name: z.string().min(1).max(120) },
   ({ name }) => withDb((d) => {
     const rows = d.prepare(
@@ -640,7 +666,7 @@ tool(server, "find_callees",
   }));
 
 tool(server, "find_references",
-  "COMPILER-GRADE (requires SCIP ingest): every place a symbol is actually used, resolved by the compiler, not text matching. Returns definition site + reference sites.",
+  "COMPILER-GRADE (needs SCIP): every place a symbol is USED ANYWHERE, resolved through types, including Lombok-generated members. The only tool certain enough to conclude something is unused and safe to delete.",
   { name: z.string().min(1).max(200), limit: z.number().int().optional() },
   ({ name, limit }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='scip_refs'").get()) {
@@ -657,7 +683,7 @@ tool(server, "find_references",
   }));
 
 tool(server, "goto_definition",
-  "COMPILER-GRADE (requires SCIP ingest): exact definition of a symbol with its doc comment. More precise than find_symbol for overloaded/common names.",
+  "COMPILER-GRADE (needs SCIP): jump to a symbol's exact DEFINITION with its doc comment. Beats find_symbol on overloaded or duplicated names.",
   { name: z.string().min(1).max(200) },
   ({ name }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='scip_defs'").get()) {
@@ -669,25 +695,55 @@ tool(server, "goto_definition",
     return rows.length ? rows : "Not found in SCIP index; try find_symbol.";
   }));
 
+/** Content hash of a module (a first path segment), for insight staleness.
+ *  INVARIANT: must match enrich.mjs moduleTargets() and the Python edition —
+ *  sha1 over the module's file hashes, SORTED BY HASH, joined with "|". Sorting
+ *  by path instead silently makes every assistant-written insight look changed,
+ *  so enrich regenerates and overwrites it on every run. tests/run_tests.py
+ *  asserts the two agree; change one, change all three. */
+function moduleHash(d, target) {
+  try {
+    const row = d.prepare("SELECT hash FROM module_hashes WHERE module=?").get(target);
+    if (row) return row.hash;
+  } catch { /* index predates module_hashes; fall through */ }
+  const [lo, hi] = prefixRange(target + "/");
+  const hs = d.prepare("SELECT hash FROM files WHERE path >= ? AND path < ?").all(lo, hi).map((r) => r.hash ?? "");
+  return createHash("sha1").update(hs.sort().join("|")).digest("hex");
+}
+
+/** Current hash of whatever an insight is about, or null if it's gone. */
+function insightSubjectHash(d, row) {
+  if (row.kind === "file") return d.prepare("SELECT hash FROM files WHERE path=?").get(row.target)?.hash ?? null;
+  if (row.kind === "module") return moduleHash(d, row.target);
+  return null; // topic/table notes (annotate.mjs) have no single backing file
+}
+
 tool(server, "explain",
-  "Cached LLM insight for a module or file: intent, responsibilities, system connections, gotchas. Generated by the enrichment layer (hash-cached, regenerated only when content changes). Falls back with guidance if no insight exists or it's stale.",
+  "Cached insight for a module or file: intent, responsibilities, connections, gotchas. Says so when none exists or it is stale.",
   { target: z.string().min(1).max(300) },
   ({ target }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='insights'").get()) {
       return "No insights yet. Run enrichment: node .ariadne/enrich.mjs (see PRIVACY.md, opt-in, supports fully-local models via OPENAI_BASE_URL).";
     }
-    const row = d.prepare("SELECT * FROM insights WHERE target=? OR target LIKE ? LIMIT 1").get(target, "%" + target + "%");
+    // Exact match first. The old single `target=? OR target LIKE ?` had no
+    // ORDER BY, so a substring match could outrank the exact row.
+    const row = d.prepare("SELECT * FROM insights WHERE target=?").get(target)
+      ?? d.prepare("SELECT * FROM insights WHERE target LIKE ? ORDER BY LENGTH(target), target LIMIT 1").get("%" + target + "%");
     if (!row) return `No cached insight for '${target}'. Ask Hermes to derive one from the graph, or run enrich.`;
-    let stale = "";
-    if (row.kind === "file") {
-      const f = d.prepare("SELECT hash FROM files WHERE path=?").get(row.target);
-      if (f && f.hash !== row.hash) stale = " [STALE: file changed since this was generated, re-run enrich]";
-    }
-    return `${row.kind} ${row.target} (model: ${row.model})${stale}\n\n${row.summary}`;
+    // Staleness applies to modules too. It used to be file-only, so a module
+    // insight was served forever with no warning while the tool description
+    // promised it auto-staled.
+    const cur = insightSubjectHash(d, row);
+    const stale = row.hash && cur && cur !== row.hash
+      ? ` [STALE: ${row.kind} changed since this was generated, re-run enrich]` : "";
+    // Provenance is the indexer's stamp, not the file's claim: an entry in the
+    // committed docs/insights.json cannot present itself as a parsed fact.
+    const prov = row.source === "file" ? "derived, from committed docs/insights.json" : "derived, written live";
+    return `${row.kind} ${row.target} (${prov}; model: ${row.model})${stale}\n\n${clampInsight(row.summary)}`;
   }));
 
 tool(server, "decisions",
-  "Decision memory (Mnemosyne): query architectural decisions with temporal validity. Filter by free text, a governed target (topic/table/module), status, or as_of (YYYY-MM-DD) for time-travel ('what was valid last March'). Decisions are parsed from ADR markdown in the repos, the source of truth stays in git.",
+  "Architectural decisions and whether they are STILL CURRENT: filter by text, governed target, status, or as_of to see what was in force on a date. Parsed from ADR markdown.",
   { query: z.string().max(200).optional(), target: z.string().max(200).optional(),
     status: z.string().max(30).optional(), as_of: z.string().max(10).optional() },
   ({ query, target, status, as_of }) => withDb((d) => {
@@ -711,7 +767,7 @@ tool(server, "decisions",
   }));
 
 tool(server, "decision_trace",
-  "Full lineage of one decision: supersession chain (what replaced what, when), governed artifacts with existence check (flags decisions referencing topics/tables that no longer exist in the graph, decision drift).",
+  "One ADR's lineage: what SUPERSEDED what and when, plus the artifacts it governs, flagged when they no longer exist in the graph.",
   { id: z.string().min(1).max(60) },
   ({ id }) => withDb((d) => {
     const rec = d.prepare("SELECT * FROM decisions WHERE id=?").get(id.toUpperCase());
@@ -750,8 +806,50 @@ tool(server, "decision_trace",
     };
   }));
 
+/** Pick a git-versioned root to write durable memory into. Writing under the
+ *  multi-root workspace PARENT "succeeds" and then never gets re-parsed, so the
+ *  record silently vanishes on the next index — the bug this guards against for
+ *  ADRs, and now for insights too. */
+/** Directory whose docs/graph-assertions.json should hold an assertion about
+ *  `file`. Paths are repo-prefixed in a multi-root workspace, so the first
+ *  segment names the repo; anything unrecognised falls back to REPO_ROOT. */
+/** Every place an assertions file may live: the workspace parent, then each
+ *  repo. Readers use all of them; writers pick one via assertionsBase. */
+function assertionFiles() {
+  const out = [path.join(REPO_ROOT, "docs", "graph-assertions.json")];
+  try {
+    for (const r of withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
+      .map((r) => r.key.slice("last_sha:".length)).filter((x) => x !== ".")) {
+      const p = path.join(rootDir(r), "docs", "graph-assertions.json");
+      if (!out.includes(p)) out.push(p);
+    }
+  } catch { /* fresh index */ }
+  return out;
+}
+
+function assertionsBase(file) {
+  try {
+    const prefixes = withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
+      .map((r) => r.key.slice("last_sha:".length)).filter((x) => x !== ".");
+    const seg = String(file ?? "").split("/")[0];
+    if (prefixes.includes(seg)) return rootDir(seg);
+  } catch { /* fresh index */ }
+  return REPO_ROOT;
+}
+
+function resolveWriteRoot(root, what) {
+  const prefixes = withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
+    .map((r) => r.key.slice("last_sha:".length));
+  if (!prefixes.some((p) => p !== ".")) return { baseDir: REPO_ROOT, sourceBase: REPO_ROOT };
+  const pick = root ?? (prefixes.length === 1 ? prefixes[0] : null);
+  if (!pick || !prefixes.includes(pick)) {
+    return { error: `Multi-root workspace: pass root=<repo> so ${what} lands in a git-versioned repo the indexer parses. Roots: ${prefixes.join(", ")}.` };
+  }
+  return { baseDir: rootDir(pick), sourceBase: WS_BASE };
+}
+
 tool(server, "save_decision",
-  "Capture a decision made in this conversation into durable decision memory: writes a git-versioned ADR markdown file (docs/adr/) AND indexes it immediately. Use when the human and you settle an architectural/design choice. supersedes: optional ADR id this replaces. root: in a multi-root workspace, which repo the ADR belongs to.",
+  "Write a git-versioned ADR and index it now. Use when an architectural or design choice is settled.",
   { title: z.string().min(5).max(150), decision: z.string().min(20).max(2000),
     rationale: z.string().min(10).max(2000), alternatives: z.string().max(1000).optional(),
     supersedes: z.string().max(30).optional(), root: z.string().max(200).optional() },
@@ -760,18 +858,9 @@ tool(server, "save_decision",
     // under the multi-root workspace PARENT (the old REPO_ROOT fallback =
     // process cwd) "succeeded", then the next reindex started from DELETE FROM
     // decisions and never re-parsed the file — the decision silently vanished.
-    const prefixes = withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
-      .map((r) => r.key.slice("last_sha:".length));
-    let baseDir = REPO_ROOT;
-    let sourceBase = REPO_ROOT;
-    if (prefixes.some((p) => p !== ".")) { // multi-root workspace
-      const pick = root ?? (prefixes.length === 1 ? prefixes[0] : null);
-      if (!pick || !prefixes.includes(pick)) {
-        return `Multi-root workspace: pass root=<repo> so the ADR lands in a git-versioned repo the indexer parses. Roots: ${prefixes.join(", ")}.`;
-      }
-      baseDir = rootDir(pick);
-      sourceBase = WS_BASE;
-    }
+    const picked = resolveWriteRoot(root, "the ADR");
+    if (picked.error) return picked.error;
+    const { baseDir, sourceBase } = picked;
     const adrDir = path.join(baseDir, "docs", "adr");
     fs.mkdirSync(adrDir, { recursive: true });
     // Ids are workspace-global: seed from the decisions table (ADRs may live in
@@ -812,25 +901,43 @@ tool(server, "save_decision",
   });
 
 tool(server, "save_insight",
-  "Persist a derived insight for a module or file into the graph (served by `explain`, hash-keyed so it auto-stales when content changes). Use after synthesizing understanding from the graph tools, this is how assistants (Copilot, Claude, etc.) enrich the shared knowledge layer.",
-  { target: z.string().min(1).max(300), kind: z.enum(["module", "file"]), summary: z.string().min(40).max(4000) },
-  ({ target, kind, summary }) => {
+  "Persist a derived insight for a module or file, hash-keyed so it auto-stales. Use after synthesizing understanding from the graph.",
+  { target: z.string().min(1).max(300), kind: z.enum(["module", "file"]), summary: z.string().min(40).max(4000),
+    root: z.string().max(200).optional() },
+  ({ target, kind, summary, root }) => {
+    const picked = resolveWriteRoot(root, "the insight");
+    if (picked.error) return picked.error;
+    const { baseDir, sourceBase } = picked;
     // dedicated writable connection: the shared handle is read-only by design
     const d = new Database(DB_PATH);
     d.pragma("busy_timeout = 10000");
+    let rel;
     try {
-    d.exec(`CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT, hash TEXT,
-               summary TEXT, model TEXT, generated_at REAL)`);
-    let hash = "";
-    if (kind === "file") hash = d.prepare("SELECT hash FROM files WHERE path=?").get(target)?.hash ?? "";
-    else {
-      const hs = d.prepare("SELECT hash FROM files WHERE path LIKE ? ORDER BY path").all(target + "/%").map((r) => r.hash ?? "");
-      hash = require("node:crypto").createHash("sha1").update(hs.join("|")).digest("hex");
-    }
-    d.prepare(`INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at)
-               VALUES(?,?,?,?,?,?)`).run(target, kind, hash, summary, "assistant", Date.now() / 1000);
-    return `Insight saved for ${kind} '${target}'. It will be served by explain() and marked stale automatically when content changes.`;
+      const hash = kind === "file"
+        ? (d.prepare("SELECT hash FROM files WHERE path=?").get(target)?.hash ?? "")
+        : moduleHash(d, target);
+      const rec = { target, kind, hash, summary, model: "assistant", generated_at: Date.now() / 1000 };
+      // File first: the DB is derived and gitignored, so a row without a file
+      // entry is memory that dies at the next pull-index or rebuild.
+      const file = path.join(baseDir, "docs", "insights.json");
+      rel = path.relative(sourceBase, file);
+      let list = [];
+      try { list = JSON.parse(fs.readFileSync(file, "utf8")); } catch { /* first insight in this repo */ }
+      if (!Array.isArray(list)) list = [];
+      list = list.filter((i) => i?.target !== target);
+      list.push(rec);
+      list.sort((a, b) => String(a.target).localeCompare(String(b.target))); // stable order = reviewable diffs
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(list, null, 2) + "\n");
+        d.exec(`CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT, hash TEXT,
+                 summary TEXT, model TEXT, generated_at REAL, source TEXT)`);
+      if (!d.prepare("SELECT COUNT(*) c FROM pragma_table_info('insights') WHERE name='source'").get().c) {
+        d.exec("ALTER TABLE insights ADD COLUMN source TEXT");
+      }
+      d.prepare(`INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at, source)
+                 VALUES(?,?,?,?,?,?,'live')`).run(target, kind, hash, summary, rec.model, rec.generated_at);
     } finally { d.close(); }
+    return `Insight saved for ${kind} '${target}' to ${rel} (git-versioned) and indexed. It is re-loaded on every reindex and marked stale automatically when content changes; commit the file to share it.`;
   });
 
 // The gap worklist — shared by the graph_gaps tool and the /aegis-resolve-gap
@@ -895,12 +1002,12 @@ function gapsData(d, n) {
 }
 
 tool(server, "graph_gaps",
-  "Where static analysis is BLIND, the graph's own to-do list. Returns dynamic topic/SQL expressions it could not resolve, orphan topics and endpoints, drift tables, and unmatched calls, each with file:line. Use this to find what needs a human or an assistant to work out, then record the answer with assert_edge. This is how the graph gets better instead of staying wrong.",
+  "Where static analysis is BLIND and CANNOT RESOLVE what it sees: dynamic topic/SQL expressions, orphan topics and endpoints, drift tables, unmatched calls, each with file:line. Answer them with assert_edge.",
   { limit: z.number().int().optional() },
   ({ limit }) => withDb((d) => gapsData(d, clamp(limit ?? 20, 1, 60))));
 
 tool(server, "assert_edge",
-  "Record a fact you DERIVED by reading code that static analysis could not resolve, a runtime-assembled Kafka topic, a dynamically built SQL table, a gateway-rewritten route. Writes to docs/graph-assertions.json (git-committed and reviewable, exactly like an ADR) and into the graph, tagged with your name so it is never mistaken for a parsed fact. Requires evidence: quote the code that convinced you. Only assert what you can defend.",
+  "RECORD a fact you DERIVED by reading code the parser could not see: a RUNTIME-ASSEMBLED topic name, a dynamically built table. Enters the graph tagged derived, never parsed. Requires evidence: quote the code that convinced you.",
   {
     kind: z.enum(["kafka", "db", "http_endpoint", "http_call"]),
     file: z.string().min(1).max(400),
@@ -927,7 +1034,11 @@ tool(server, "assert_edge",
     try { hash = d.prepare("SELECT hash FROM files WHERE path=?").get(a.file)?.hash ?? null; } finally { d.close(); }
     if (!hash) return `File '${a.file}' is not in the index, check the path (it is repo-prefixed in a multi-repo workspace).`;
 
-    const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
+    // Anchor to the repo that owns the evidence file. Writing to the multi-root
+    // parent "works" — the indexer reads it — but the parent is not a git repo,
+    // so nothing is versioned, reviewed, or shared, which is the entire promise
+    // this tool makes. Falls back to REPO_ROOT for a single-repo workspace.
+    const af = path.join(assertionsBase(a.file), "docs", "graph-assertions.json");
     let list = [];
     if (fs.existsSync(af)) {
       // Never clobber: a malformed file (merge-conflict marker, stray comma) must
@@ -943,11 +1054,11 @@ tool(server, "assert_edge",
     list.push(rec);
     fs.mkdirSync(path.dirname(af), { recursive: true });
     fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
-    return `Asserted and recorded in docs/graph-assertions.json (${list.length} total). It enters the graph on the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically if ${a.file} changes. Commit the file to share it with the team.`;
+    return `Asserted and recorded in ${path.relative(WS_BASE, af)} (${list.length} total). It enters the graph on the next index, tagged 'asserted', never mixed with parsed facts, and marked STALE automatically if ${a.file} changes. Commit the file to share it with the team.`;
   });
 
 tool(server, "message_flow",
-  "Messaging topology (Kafka, plus RabbitMQ/JMS/SQS/NATS labeled by system): correlate inbound/outbound message handling across modules. No args = full topic map (each topic's producers and consumers with file:line, plus orphans, topics produced but never consumed or vice versa). Pass topic for one topic's flow. Topics resolved from literals, constants, and application.yaml placeholders.",
+  "Messaging topology (Kafka; RabbitMQ/JMS/SQS/NATS labeled by system). No args = every TOPIC's producers and consumers with file:line, plus orphans. Pass topic for one flow.",
   { topic: z.string().max(200).optional() },
   ({ topic }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='msg_edges'").get()) {
@@ -1042,7 +1153,7 @@ tool(server, "message_flow",
   }));
 
 tool(server, "db_map",
-  "Database topology (Spring Boot + Liquibase): correlate every table with the changesets that shaped it AND every code site touching it (JPA entities, Spring Data repositories, @Query, JdbcTemplate) with read/write mode. No args = full map with drift warnings (code accessing tables no changelog defines; tables defined but never accessed). Pass table for one table.",
+  "Database topology: each table's Liquibase changesets and every code site touching it, read or write. No args = full map plus DRIFT (tables code touches that no changelog defines, and tables defined but never touched). Pass table for one.",
   { table: z.string().max(200).optional() },
   ({ table }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='db_defs'").get()) {
@@ -1147,7 +1258,7 @@ function httpCorrelation(d, prodOnly, hasTest) {
 }
 
 tool(server, "http_map",
-  "Full-stack HTTP seam: correlate REST endpoints (Spring controllers) with every caller (TS/React fetch/axios, Java RestTemplate/WebClient/Feign) matched on method + normalized path ({id}, :id, ${expr} all correlate). No args = full map with orphans (endpoints nobody calls; calls hitting no known endpoint). Pass path to filter.",
+  "HTTP seam: REST endpoints correlated with their callers on method + normalized path. No args = full map plus orphans (endpoints NOBODY CALLS, calls hitting no known endpoint). Pass path to filter.",
   { path: z.string().max(300).optional() },
   ({ path: pf }) => withDb((d) => {
     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='http_endpoints'").get()) {
@@ -1234,7 +1345,7 @@ function governingFor(d, targets) {
 const capList = (a, n = 10) => (a.length > n ? [...a.slice(0, n), `…and ${a.length - n} more`] : a);
 
 tool(server, "plan_context",
-  "When you have a TASK but no target yet: ONE call that finds the starting set server-side — full-text and symbol matches for the task's terms, the files they concentrate in, the Kafka topics / DB tables / HTTP endpoints those files touch, the decisions governing them, and the tests that cover them. Use INSTEAD of the 3-5 exploratory search calls at session start; then context_pack the target you choose.",
+  "ONE call when you have a TASK but no target: matching files, the seams they touch, governing decisions, covering tests. Use INSTEAD of exploratory search at session start, then context_pack the target you pick.",
   { task: z.string().min(3).max(500) },
   ({ task }) => withDb((d) => {
     const terms = taskTerms(task);
@@ -1306,7 +1417,7 @@ tool(server, "plan_context",
   }));
 
 tool(server, "explain_path",
-  "WHY does editing A affect B? The shortest provenance-weighted path between two graph nodes — files, symbols, modules, topics (kafka:orders.created or just the topic name), tables (db:payments), endpoints (GET /api/x) — with per-hop evidence (kind + file:line + parsed/asserted provenance). blast_radius asserts the answer; this explains it, in ~300 tokens.",
+  "WHY editing A affects B: shortest path between two nodes (file, symbol, module, topic, table, endpoint) with per-hop evidence and provenance. blast_radius asserts the answer; this explains it.",
   { source: z.string().min(1).max(300), target: z.string().min(1).max(300) },
   ({ source, target }) => withDb((d) => {
     // --- resolve an endpoint of the path to a node id in the traversal space:
@@ -1416,7 +1527,7 @@ tool(server, "explain_path",
   }));
 
 tool(server, "usage_report",
-  "The context-ROI ledger: how many bytes Ariadne served vs what the answered questions would have cost in raw file reads (the files each answer spans, measured from the index). Local-only (.ariadne/usage.jsonl); nothing leaves the machine. days: look-back window (default 7).",
+  "Context-ROI ledger: bytes served vs what raw file reads would have cost. Local only. days: look-back window (default 7).",
   { days: z.number().int().optional() },
   ({ days }) => {
     const win = clamp(days ?? 7, 1, 90);
@@ -1448,7 +1559,7 @@ tool(server, "usage_report",
   });
 
 tool(server, "change_check",
-  "PRE-EDIT decision support: given the files you intend to touch, ONE call returning their combined blast radius, the tests to re-run, the seam warnings your edit could introduce (sole producers/consumers, drift tables, uncalled endpoints, unresolved expressions), the decisions governing them, and the assertions your edit will mark STALE. Call BEFORE proposing a diff.",
+  "ONE call before editing: combined blast radius of the files you will touch, tests to re-run, seam warnings your edit introduces, governing decisions, assertions it marks STALE. Call BEFORE proposing a diff.",
   { files: z.array(z.string().min(1).max(500)).min(1).max(20) },
   ({ files }) => withDb((d) => {
     noteFiles(files);
@@ -1534,7 +1645,7 @@ tool(server, "change_check",
   }));
 
 tool(server, "reindex",
-  "Rebuild the index. mode='incremental' (changed files since last indexed commit) or 'full'. Use when index_status reports fresh=false.",
+  "Rebuild the index. mode='incremental' or 'full'. Use when index_status reports fresh=false.",
   { mode: z.enum(["incremental", "full"]).optional() },
   ({ mode = "incremental" }) => new Promise((resolve) => {
     execFile(process.execPath, [path.join(GR_DIR, "indexer.mjs"), `--${mode}`],
@@ -1617,20 +1728,20 @@ prompt(server, "aegis-orient",
   "First encounter with a module: files, the most-depended-on entry points, the seams it participates in, governing decisions, and cached insight — the reading plan before any code is read.",
   { module: z.string().min(1).max(200) },
   ({ module }) => withDb((d) => {
-    const rows = d.prepare("SELECT id, path, lang FROM files WHERE path LIKE ?").all(module + "/%");
+    const rows = d.prepare("SELECT id, path, lang FROM files WHERE path >= ? AND path < ?").all(...prefixRange(module + "/"));
     if (!rows.length) return `No files under module '${module}'. module_map lists the modules in this workspace.`;
     const langs = {};
     for (const r of rows) langs[r.lang] = (langs[r.lang] ?? 0) + 1;
     const hot = d.prepare(`SELECT f.path, COUNT(e.src) n FROM files f JOIN edges e ON e.dst=f.id
-      WHERE f.path LIKE ? GROUP BY f.id ORDER BY n DESC LIMIT 5`).all(module + "/%");
-    const topics = d.prepare(`SELECT DISTINCT m.direction || ' ' || m.topic s FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path LIKE ?`).all(module + "/%").map((r) => r.s);
-    const tables = d.prepare(`SELECT DISTINCT a.mode || ' ' || a.tbl s FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path LIKE ?`).all(module + "/%").map((r) => r.s);
-    const eps = d.prepare(`SELECT DISTINCT e.method || ' ' || e.path s FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path LIKE ?`).all(module + "/%").map((r) => r.s);
+      WHERE f.path >= ? AND f.path < ? GROUP BY f.id ORDER BY n DESC LIMIT 5`).all(...prefixRange(module + "/"));
+    const topics = d.prepare(`SELECT DISTINCT m.direction || ' ' || m.topic s FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE f.path >= ? AND f.path < ?`).all(...prefixRange(module + "/")).map((r) => r.s);
+    const tables = d.prepare(`SELECT DISTINCT a.mode || ' ' || a.tbl s FROM db_access a JOIN files f ON f.id=a.file_id WHERE f.path >= ? AND f.path < ?`).all(...prefixRange(module + "/")).map((r) => r.s);
+    const eps = d.prepare(`SELECT DISTINCT e.method || ' ' || e.path s FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE f.path >= ? AND f.path < ?`).all(...prefixRange(module + "/")).map((r) => r.s);
     const govern = governingFor(d, [...new Set([...topics.map((s) => s.split(" ").pop()), ...tables.map((s) => s.split(" ").pop()), module])]);
     let insight = null;
     try { insight = d.prepare("SELECT summary FROM insights WHERE target=?").get(module)?.summary ?? null; } catch { /* none yet */ }
     let nTests = 0;
-    try { nTests = d.prepare("SELECT COUNT(*) c FROM files WHERE path LIKE ? AND is_test=1").get(module + "/%").c; } catch { /* pre-is_test build */ }
+    try { nTests = d.prepare("SELECT COUNT(*) c FROM files WHERE path >= ? AND path < ? AND is_test=1").get(...prefixRange(module + "/")).c; } catch { /* pre-is_test build */ }
     const lines = [
       `Orientation for module ${module}: ${rows.length} files (${Object.keys(langs).sort((a, b) => langs[b] - langs[a]).slice(0, 3).join(", ")}), ${nTests} of them tests.`,
       "",
@@ -1818,12 +1929,20 @@ resource(server, "decision", new ResourceTemplate("ariadne://decisions/{id}", { 
 resource(server, "assertions", "ariadne://assertions",
   { description: "The human knowledge layer: docs/graph-assertions.json with a computed stale flag per assertion (evidence file changed since it was recorded).", mimeType: "application/json" },
   () => {
-    const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
-    if (!fs.existsSync(af)) return { assertions: [], note: "No graph-assertions.json yet — assert_edge (or the graph view) creates it." };
-    let list;
-    try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
-    catch (e) { return `docs/graph-assertions.json exists but is not valid JSON (${e.message}). Fix it by hand; nothing here will overwrite it.`; }
-    if (!Array.isArray(list)) return "docs/graph-assertions.json is not a JSON array. Fix it by hand; nothing here will overwrite it.";
+    // Same candidate set the indexer reads: the parent plus each repo, so a
+    // multi-root workspace does not under-report what is actually in the graph.
+    const list = [];
+    let found = false;
+    for (const af of assertionFiles()) {
+      if (!fs.existsSync(af)) continue;
+      found = true;
+      let part;
+      try { part = JSON.parse(fs.readFileSync(af, "utf8")); }
+      catch (e) { return `${path.relative(WS_BASE, af)} exists but is not valid JSON (${e.message}). Fix it by hand; nothing here will overwrite it.`; }
+      if (!Array.isArray(part)) return `${path.relative(WS_BASE, af)} is not a JSON array. Fix it by hand; nothing here will overwrite it.`;
+      list.push(...part);
+    }
+    if (!found) return { assertions: [], note: "No graph-assertions.json yet — assert_edge (or the graph view) creates it." };
     try {
       withDb((d) => {
         const h = d.prepare("SELECT hash FROM files WHERE path=?");

@@ -1,0 +1,241 @@
+From 3357c01c2a703c677a87031eae5126df47b062f9 Mon Sep 17 00:00:00 2001
+From: rehanraza786 <rehanraza786@users.noreply.github.com>
+Date: Wed, 29 Jul 2026 02:38:35 +0000
+Subject: [PATCH 08/12] Anchor dismissals to the repo that owns the gap, or
+ refuse
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The dismissal branch was the one place still writing to the multi-root
+workspace parent, with a warning on stderr. A note is easy to miss and the
+result is an unversioned file — the exact bug the surrounding commit exists
+to fix.
+
+A dismissal has no evidence FILE, but it does have evidence: the thing being
+dismissed. An orphan topic has producers, a drift table has access sites, an
+unresolved expression carries a path, and every path is repo-prefixed — so
+the graph can say which repo owns the argument. Resolved through msg_edges,
+db_access, db_defs and the http tables.
+
+One owner, write there. Several owners or none, refuse and name the
+candidates, which is what save_decision already does for an unanchored
+multi-root ADR. That leaves one rule for the whole system: anchor to the
+evidence; if the evidence is ambiguous, refuse and say what to pass.
+
+run_tests.py gains both halves — a dismissal lands in a git-versioned repo,
+and an untraceable one is refused rather than written to the parent — plus
+commit_all_repos(), because anchoring writes into repos legitimately dirties
+those worktrees until committed, which the freshness assertions measure.
+---
+ payload/ariadne-node/annotate.mjs  | 50 ++++++++++++++++++++++----
+ payload/ariadne-python/annotate.py | 58 ++++++++++++++++++++++++++----
+ tests/run_tests.py                 | 25 +++++++++++++
+ 3 files changed, 119 insertions(+), 14 deletions(-)
+
+diff --git a/payload/ariadne-node/annotate.mjs b/payload/ariadne-node/annotate.mjs
+index 90fc114..1d4b05a 100644
+--- a/payload/ariadne-node/annotate.mjs
++++ b/payload/ariadne-node/annotate.mjs
+@@ -43,6 +43,32 @@ function assertionsBase(file) {
+   return prefixes.includes(seg) ? path.join(ROOT, seg) : ROOT;
+ }
+ 
++/** Repos a gap key touches. A dismissal has no evidence FILE, but it does have
++ *  evidence: the thing being dismissed. An orphan topic has producers, a drift
++ *  table has access sites, an unresolved expression has a path — and every path
++ *  is repo-prefixed, so the graph can say which repo owns the argument. Same
++ *  rule as everywhere else: anchor to the evidence. */
++function dismissalRepos(gap, key) {
++  const prefixes = rootPrefixes();
++  if (!prefixes.length) return [];
++  const paths = new Set();
++  // "unresolved" keys are already a path:line
++  const asPath = String(key ?? "").split(":")[0];
++  if (asPath.includes("/")) paths.add(asPath);
++  const db = new Database(DB_PATH, { readonly: true });
++  try {
++    const add = (sql, ...args) => {
++      try { for (const r of db.prepare(sql).all(...args)) if (r.path) paths.add(r.path); } catch { /* table may not exist */ }
++    };
++    add("SELECT f.path FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE m.topic=?", key);
++    add("SELECT f.path FROM db_access a JOIN files f ON f.id=a.file_id WHERE a.tbl=?", key);
++    add("SELECT f.path FROM db_defs d JOIN files f ON f.id=d.file_id WHERE d.tbl=?", key);
++    add("SELECT f.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE e.norm=? OR e.path=?", key, key);
++    add("SELECT f.path FROM http_calls c JOIN files f ON f.id=c.file_id WHERE c.norm=? OR c.path=?", key, key);
++  } finally { db.close(); }
++  return [...new Set([...paths].map((p) => p.split("/")[0]))].filter((x) => prefixes.includes(x)).sort();
++}
++
+ /** Every place an assertions file may live: parent, then each repo. */
+ function assertionFiles() {
+   const out = [path.join(ROOT, "docs", "graph-assertions.json")];
+@@ -167,21 +193,31 @@ if (a.action === "insight") {
+   // the same reviewed file, kind "dismissal"; the export mutes matching gaps.
+   if (!a.gap || !a.key) die("dismiss needs gap (e.g. orphan_topic) and key (topic/table/path).");
+   if (!(a.reason?.length >= 10)) die("reason must say why this gap is acceptable (10+ chars).");
+-  // A dismissal is about a gap key, not a file, so there is no repo to infer.
+-  // It goes where the caller says, else the workspace root.
++  // Anchor to the evidence, like every other write. Ambiguity is refused rather
++  // than written to the multi-root parent: that parent is not a git repo, so
++  // "succeeded" there means unversioned, unreviewed, and unshared.
+   const prefixes = rootPrefixes();
+-  const dismissBase = a.root && prefixes.includes(a.root) ? path.join(ROOT, a.root) : ROOT;
+-  const af = path.join(dismissBase, "docs", "graph-assertions.json");
+-  if (prefixes.length && dismissBase === ROOT) {
+-    console.error(`Note: the workspace root is not a git repo, so this dismissal will not be versioned. Pass "root":"<repo>" to commit it. Repos: ${prefixes.join(", ")}.`);
++  let dismissBase = ROOT;
++  if (prefixes.length) {
++    let pick = a.root && prefixes.includes(a.root) ? a.root : null;
++    if (!pick) {
++      const repos = dismissalRepos(a.gap, a.key);
++      if (repos.length === 1) pick = repos[0];
++      else {
++        const opts = (repos.length ? repos : prefixes).join(", ");
++        die(`'${a.key}' ${repos.length ? `spans ${repos.length} repos` : "could not be traced to a repo"}; pass "root":"<repo>" so the dismissal lands somewhere git-versioned. Candidates: ${opts}.`);
++      }
++    }
++    dismissBase = path.join(ROOT, pick);
+   }
++  const af = path.join(dismissBase, "docs", "graph-assertions.json");
+   let list = readAssertions(af) ?? [];
+   list = list.filter((x) => !(x.kind === "dismissal" && x.gap === a.gap && x.key === a.key));
+   list.push({ kind: "dismissal", gap: a.gap, key: a.key, reason: a.reason, author,
+     dismissed_at: new Date().toISOString().slice(0, 10) });
+   fs.mkdirSync(path.dirname(af), { recursive: true });
+   fs.writeFileSync(af, JSON.stringify(list, null, 2) + "\n");
+-  console.log(`Dismissed ${a.gap} '${a.key}' (by: ${author}). It mutes in the worklist after reindex but stays auditable; commit the file to share.`);
++  console.log(`Dismissed ${a.gap} '${a.key}' (by: ${author}) in ${path.relative(ROOT, af)}. It mutes in the worklist after reindex but stays auditable; commit the file to share.`);
+ 
+ } else if (a.action === "retract" || a.action === "reaffirm") {
+   // lifecycle for existing assertions, keyed by the same natural key the
+diff --git a/payload/ariadne-python/annotate.py b/payload/ariadne-python/annotate.py
+index d06555b..b06c557 100644
+--- a/payload/ariadne-python/annotate.py
++++ b/payload/ariadne-python/annotate.py
+@@ -62,6 +62,41 @@ def _assertions_base(file):
+     return ROOT / seg if seg in _root_prefixes() else ROOT
+ 
+ 
++def _dismissal_repos(gap, key):
++    """Repos a gap key touches.
++
++    A dismissal has no evidence FILE, but it does have evidence: the thing being
++    dismissed. An orphan topic has producers, a drift table has access sites, an
++    unresolved expression has a path -- and every path is repo-prefixed, so the
++    graph can say which repo owns the argument. Same rule as everywhere else:
++    anchor to the evidence. Parity: dismissalRepos in annotate.mjs.
++    """
++    prefixes = _root_prefixes()
++    if not prefixes:
++        return []
++    paths = set()
++    as_path = str(key or "").split(":")[0]
++    if "/" in as_path:
++        paths.add(as_path)
++    con = sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)
++    try:
++        def add(sql, *args):
++            try:
++                for r in con.execute(sql, args):
++                    if r[0]:
++                        paths.add(r[0])
++            except sqlite3.Error:
++                pass  # table may not exist
++        add("SELECT f.path FROM msg_edges m JOIN files f ON f.id=m.file_id WHERE m.topic=?", key)
++        add("SELECT f.path FROM db_access a JOIN files f ON f.id=a.file_id WHERE a.tbl=?", key)
++        add("SELECT f.path FROM db_defs d JOIN files f ON f.id=d.file_id WHERE d.tbl=?", key)
++        add("SELECT f.path FROM http_endpoints e JOIN files f ON f.id=e.file_id WHERE e.norm=? OR e.path=?", key, key)
++        add("SELECT f.path FROM http_calls c JOIN files f ON f.id=c.file_id WHERE c.norm=? OR c.path=?", key, key)
++    finally:
++        con.close()
++    return sorted({p.split("/")[0] for p in paths} & set(prefixes))
++
++
+ def _assertion_files():
+     """Every place an assertions file may live: parent, then each repo."""
+     out = [ROOT / "docs" / "graph-assertions.json"]
+@@ -212,21 +247,30 @@ elif a.get("action") == "dismiss":
+         die("dismiss needs gap (e.g. orphan_topic) and key (topic/table/path).")
+     if len(a.get("reason", "")) < 10:
+         die("reason must say why this gap is acceptable (10+ chars).")
+-    # A dismissal is about a gap key, not a file, so there is no repo to infer.
+-    # It goes where the caller says, else the workspace root.
++    # Anchor to the evidence, like every other write. Ambiguity is refused rather
++    # than written to the multi-root parent: that parent is not a git repo, so
++    # "succeeded" there means unversioned, unreviewed, and unshared.
+     _prefixes = _root_prefixes()
+-    _base = ROOT / a["root"] if a.get("root") in _prefixes else ROOT
++    _base = ROOT
++    if _prefixes:
++        pick = a["root"] if a.get("root") in _prefixes else None
++        if not pick:
++            repos = _dismissal_repos(a["gap"], a["key"])
++            if len(repos) == 1:
++                pick = repos[0]
++            else:
++                opts = ", ".join(repos or _prefixes)
++                die(f"'{a['key']}' " + (f"spans {len(repos)} repos" if repos else "could not be traced to a repo")
++                    + f'; pass "root":"<repo>" so the dismissal lands somewhere git-versioned. Candidates: {opts}.')
++        _base = ROOT / pick
+     af = _base / "docs" / "graph-assertions.json"
+-    if _prefixes and _base == ROOT:
+-        print('Note: the workspace root is not a git repo, so this dismissal will not be versioned. '
+-              f'Pass "root":"<repo>" to commit it. Repos: {", ".join(_prefixes)}.', file=sys.stderr)
+     alist = _read_assertions(af) or []
+     alist = [x for x in alist if not (x.get("kind") == "dismissal" and x.get("gap") == a["gap"] and x.get("key") == a["key"])]
+     alist.append({"kind": "dismissal", "gap": a["gap"], "key": a["key"], "reason": a["reason"],
+                   "author": author, "dismissed_at": datetime.date.today().isoformat()})
+     af.parent.mkdir(parents=True, exist_ok=True)
+     af.write_text(json.dumps(alist, indent=2) + "\n", encoding="utf-8")
+-    print(f"Dismissed {a['gap']} '{a['key']}' (by: {author}). It mutes in the worklist after reindex but stays auditable; commit the file to share.")
++    print(f"Dismissed {a['gap']} '{a['key']}' (by: {author}) in {af.relative_to(ROOT) if str(af).startswith(str(ROOT)) else af}. It mutes in the worklist after reindex but stays auditable; commit the file to share.")
+ 
+ elif a.get("action") in ("retract", "reaffirm"):
+     # lifecycle for existing assertions, keyed by the same natural key the
+diff --git a/tests/run_tests.py b/tests/run_tests.py
+index bb84dab..163b4fd 100644
+--- a/tests/run_tests.py
++++ b/tests/run_tests.py
+@@ -66,6 +66,20 @@ def git(args, cwd):
+                           cwd=str(cwd), capture_output=True, text=True)
+ 
+ 
++def commit_all_repos(ws: Path, message: str):
++    """Commit every dirty fixture repo.
++
++    Writes that anchor into a repo (assertions, dismissals, insights) leave that
++    worktree dirty until committed -- which is what the tools tell you to do, and
++    what the freshness assertions later in this suite measure.
++    """
++    for d in sorted(ws.iterdir()):
++        if d.is_dir() and (d / ".git").exists():
++            git(["add", "-A"], d)
++            if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=d).returncode != 0:
++                git(["commit", "-qm", message], d)
++
++
+ def w(path: Path, content: str):
+     path.parent.mkdir(parents=True, exist_ok=True)
+     path.write_text(content, encoding="utf-8")
+@@ -1222,6 +1236,17 @@ await c.close();
+     db = sqlite3.connect(ws / ".ariadne" / "index.db")
+     code, odm = run(exe + [an, json.dumps({"action": "dismiss", "gap": "orphan_topic",
+                                            "key": "audit.q", "reason": "fire-and-forget audit stream; consumer lives outside this workspace"})], ws)
++    check("annotate: dismissal is anchored to the repo that owns the gap",
++          code == 0 and any((d / "docs" / "graph-assertions.json").exists()
++                            for d in ws.iterdir() if d.is_dir() and (d / ".git").exists()), odm[-200:])
++    # an ambiguous key has no single owner, so it must be refused rather than
++    # written to the non-versioned workspace parent
++    code_amb, oamb = run(exe + [an, json.dumps({"action": "dismiss", "gap": "orphan_topic",
++                                                "key": "no.such.topic.anywhere", "reason": "not traceable to any repo at all"})], ws)
++    check("annotate: an untraceable dismissal is refused with candidates, not written to the parent",
++          code_amb != 0 and "root" in oamb
++          and "no.such.topic.anywhere" not in (ws / "docs" / "graph-assertions.json").read_text(encoding="utf-8"), oamb[-200:])
++    commit_all_repos(ws, "record dismissal")
+     run(exe + [idx, "--incremental"], ws)
+     code2, og2 = run(exe + [ge], ws)
+     gx2 = json.loads(og2.strip().splitlines()[-1])
+-- 
+2.43.0
+

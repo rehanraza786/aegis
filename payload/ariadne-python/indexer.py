@@ -99,6 +99,8 @@ SKIP_DIRS = {".git", ".ariadne", "node_modules", "vendor", "dist", "build", "tar
              "__pycache__", ".venv", "venv", ".next", "coverage", ".idea", ".vscode"}
 SKIP_DIRS |= set(_cfg.get("skipDirs", []))
 MAX_FILE_BYTES = int(_cfg.get("maxFileBytes", 1_500_000))
+# ceiling on entries loaded from docs/insights.json. parity: Node DEFAULTS.maxInsights
+MAX_INSIGHTS_CFG = int(_cfg.get("maxInsights", 2000)) or 2000
 CHUNK_LINES = int(_cfg.get("chunkLines", 40))
 
 # classifies WHERE a file lives (test vs production), decided once at index time;
@@ -310,6 +312,16 @@ CREATE TABLE IF NOT EXISTS decisions(
   valid_until TEXT, superseded_by TEXT, source_path TEXT, summary TEXT);
 CREATE TABLE IF NOT EXISTS decision_links(decision_id TEXT, kind TEXT, target TEXT);
 CREATE INDEX IF NOT EXISTS idx_dlinks ON decision_links(target);
+-- Prose memory. Rows are derived from docs/insights.json, exactly like
+-- assertions and ADRs; owning the DDL here is what makes that true (it used
+-- to be CREATE-IF-NOT-EXISTS'd lazily in enrich and the server instead).
+-- One module hash per index, not one per explain() call. Single source of truth
+-- for staleness: the server, enrich, and annotate all read it instead of each
+-- recomputing (three implementations is how they drifted before).
+CREATE TABLE IF NOT EXISTS module_hashes(module TEXT PRIMARY KEY, hash TEXT, files INTEGER);
+CREATE TABLE IF NOT EXISTS insights(
+  target TEXT PRIMARY KEY, kind TEXT, hash TEXT, summary TEXT,
+  model TEXT, generated_at REAL, source TEXT);
 CREATE TABLE IF NOT EXISTS extract_cache(
   path TEXT PRIMARY KEY, hash TEXT, constants TEXT, entities TEXT);
 CREATE TABLE IF NOT EXISTS test_cases(
@@ -1300,22 +1312,51 @@ def kafka_pass(con, scope_prefixes=None):
     con.execute("DELETE FROM assertions")
     for t in ("msg_edges", "db_access", "http_endpoints", "http_calls"):
         con.execute(f"DELETE FROM {t} WHERE source LIKE 'asserted%'")
-    af = REPO_ROOT / "docs" / "graph-assertions.json"
+    # Parent AND every root. In a multi-root workspace the parent is not a git
+    # repo, so an assertion written there is loaded but never actually versioned
+    # or shared -- the "committed and reviewable" promise silently absent exactly
+    # where there are the most repos. Writers now anchor to the repo owning the
+    # evidence file; reading both keeps older placements working.
     alist = []
-    if af.exists():
+    _seen_a = set()
+    for _root in [REPO_ROOT, *ROOTS]:
+        af = _root / "docs" / "graph-assertions.json"
+        if af in _seen_a or not af.exists():
+            continue
+        _seen_a.add(af)
         try:
-            alist = json.loads(af.read_text(encoding="utf-8"))
+            part = json.loads(af.read_text(encoding="utf-8"))
         except Exception as e:  # noqa: BLE001
-            log.warning("docs/graph-assertions.json is not valid JSON (%s); assertions stay out of the graph until it is fixed", e)
+            log.warning("%s is not valid JSON (%s); its assertions stay out of the graph until it is fixed", af, e)
+            continue
+        if isinstance(part, list):
+            alist.extend(part)
+        else:
+            log.warning("%s is not a JSON array; skipped", af)
     if isinstance(alist, list) and alist:
         loaded = stale = 0
+        # Same rule as insights: docs/graph-assertions.json is committed, so its
+        # contents are attacker-controlled in any repo that takes PRs. An entry
+        # must not be able to write author="parser" and be displayed as a parsed
+        # fact -- provenance is stamped here, from a clamped token, and every
+        # asserted row is already tagged 'asserted:' in the source column.
+        _RESERVED = {"parser", "ariadne", "ariadne-parser", "scip", "tree-sitter", "indexer"}
+
+        def _safe_author(x):
+            a = re.sub(r"[^\w.:@-]", "", str(x if x is not None else "assistant"))[:40] or "assistant"
+            return f"claimed-{a}" if a.lower() in _RESERVED else a
+
         for a in alist:
             fr = con.execute("SELECT id, hash FROM files WHERE path=?", (a.get("file"),)).fetchone()
-            src = f"asserted:{a.get('author', 'assistant')}"
+            author = _safe_author(a.get("author"))
+            conf = a.get("confidence") if a.get("confidence") in ("high", "medium", "low") else "medium"
+            src = f"asserted:{author}"
+            ev = a.get("evidence")
             con.execute("INSERT INTO assertions(kind, payload, file_path, line, evidence, confidence, author, source_hash, created_at) "
                         "VALUES(?,?,?,?,?,?,?,?,?)",
-                        (a.get("kind"), json.dumps(a), a.get("file"), a.get("line"), a.get("evidence"),
-                         a.get("confidence", "medium"), a.get("author", "assistant"), a.get("source_hash"), time.time()))
+                        (a.get("kind"), json.dumps(a), a.get("file"), a.get("line"),
+                         None if ev is None else str(ev)[:2000],
+                         conf, author, a.get("source_hash"), time.time()))
             if a.get("source_hash") and fr and fr[1] != a["source_hash"]:
                 stale += 1
             if not fr:
@@ -1336,6 +1377,81 @@ def kafka_pass(con, scope_prefixes=None):
             loaded += 1
         log.info("Assertions: %d loaded into the graph%s", loaded,
                  f", {stale} STALE (evidence file changed since)" if stale else "")
+
+    # ---- Module hashes: derived once, read by explain/enrich/annotate ----
+    _mods: dict[str, list[str]] = {}
+    for _p, _h in con.execute("SELECT path, hash FROM files"):
+        seg = str(_p).split("/")[0]
+        if seg:
+            _mods.setdefault(seg, []).append(_h or "")
+    con.execute("DELETE FROM module_hashes")
+    for _name, _hs in _mods.items():
+        con.execute("INSERT OR REPLACE INTO module_hashes(module, hash, files) VALUES(?,?,?)",
+                    (_name, hashlib.sha1("|".join(sorted(_hs)).encode()).hexdigest(), len(_hs)))
+
+    # ---- Insights: prose memory an assistant or enrichment derived ----
+    # Source of truth is docs/insights.json, committed and reviewed in PRs, same
+    # contract as assertions and ADRs. Before this the only copy lived in
+    # index.db, which is gitignored, so pull-index.sh and corruption recovery
+    # both destroyed it silently -- the failure save_decision already guards
+    # against for ADRs.
+    # Older indexes predate the source column; add it before the first write.
+    if not [r for r in con.execute("PRAGMA table_info(insights)") if r[1] == "source"]:
+        con.execute("ALTER TABLE insights ADD COLUMN source TEXT")
+    # docs/insights.json is committed, so its contents are attacker-controlled in
+    # any repo that takes PRs. Two rules follow. (1) Provenance is ours, not the
+    # file's: an entry cannot claim to be a parsed fact by writing
+    # model="ariadne-parser", because every row loaded here is stamped
+    # source='file' and its model string is clamped to a display-safe token.
+    # (2) Volume is bounded, so a single commit cannot bloat the index or the
+    # model's context.
+    MAX_INSIGHTS, MAX_SUMMARY = MAX_INSIGHTS_CFG, 4000
+
+    def _safe_model(m):
+        return re.sub(r"[^\w.:@-]", "", str(m if m is not None else "assistant"))[:40] or "unknown"
+
+    ins_loaded = ins_dropped = 0
+    # REPO_ROOT as well as each root: in a multi-root workspace REPO_ROOT is the
+    # parent, which is where assert_edge and the graph view have always put
+    # docs/graph-assertions.json. Reading both means a file placed either way
+    # still loads; the writers prefer a git-versioned root.
+    seen = set()
+    for root in [REPO_ROOT, *ROOTS]:
+        inf = root / "docs" / "insights.json"
+        if inf in seen or not inf.exists():
+            continue
+        seen.add(inf)
+        try:
+            items = json.loads(inf.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.warning("%s is not valid JSON (%s); its insights stay out of the graph until it is fixed", inf, e)
+            continue
+        if not isinstance(items, list):
+            log.warning("%s is not a JSON array; skipped", inf)
+            continue
+        for i in items:
+            if not isinstance(i, dict) or not i.get("target") or not i.get("summary"):
+                continue
+            try:
+                gen = float(i.get("generated_at") or 0) or time.time()
+            except (TypeError, ValueError):
+                gen = time.time()
+            # annotate.py also writes topic/table notes; collapsing them to
+            # "module" would make explain compute a module hash for a topic
+            if ins_loaded >= MAX_INSIGHTS:
+                ins_dropped += 1
+                continue
+            kind = i.get("kind") if i.get("kind") in ("module", "file", "topic", "table") else "module"
+            con.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at, source) "
+                        "VALUES(?,?,?,?,?,?,'file')",
+                        (str(i["target"])[:300], kind, str(i.get("hash", ""))[:64],
+                         str(i["summary"])[:MAX_SUMMARY], _safe_model(i.get("model")), gen))
+            ins_loaded += 1
+    if ins_loaded:
+        log.info("Insights: %d loaded from docs/insights.json (provenance: file)", ins_loaded)
+    if ins_dropped:
+        log.warning("Insights: %d entries past the %d cap were ignored; split or prune docs/insights.json",
+                    ins_dropped, MAX_INSIGHTS)
 
     # ---- Mnemosyne: decision memory from ADR files ----
     con.execute("DELETE FROM decisions")
@@ -1446,6 +1562,10 @@ def full_index(con, rebuild=False):
         try:
             con.execute("DELETE FROM extract_cache")
             con.execute("DELETE FROM meta WHERE key='config_fp'")
+            # Only --rebuild wipes insights: it makes docs/insights.json exactly
+            # authoritative (deletions in the file propagate). A normal index is
+            # additive so an un-exported local enrich run isn't destroyed.
+            con.execute("DELETE FROM insights")
         except sqlite3.OperationalError:
             pass
     files = list(repo_files())

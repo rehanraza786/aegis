@@ -1,0 +1,779 @@
+From 1ccc2bd1ceb52415a8ac8e806a58000f0121d002 Mon Sep 17 00:00:00 2001
+From: rehanraza786 <rehanraza786@users.noreply.github.com>
+Date: Tue, 28 Jul 2026 23:54:45 +0000
+Subject: [PATCH 01/12] Make insights durable: docs/insights.json as source of
+ truth
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Insights were the only memory layer without a file-backed source of
+truth. ADRs live in docs/adr/, assertions in docs/graph-assertions.json,
+both re-derived on every index. Insights existed only in .ariadne/index.db,
+which is gitignored — so pull-index.sh (mv over index.db) and the corruption
+recovery path (moves the DB aside, rebuilds fresh) destroyed every
+save_insight and every graph-view note silently. --rebuild happened to spare
+them, which made the loss intermittent rather than obvious. This is the same
+failure save_decision already guards against for ADRs.
+
+- indexer owns the insights DDL and re-loads docs/insights.json on full and
+  incremental index, from the workspace parent AND every root, so a file
+  placed either way loads; only --rebuild wipes the table, so the file is
+  exactly authoritative there and a normal index stays additive
+- save_insight and annotate (the VS Code graph view's write path) write the
+  file first, then the row; both prefer a git-versioned root, annotate
+  inferring it from the repo-prefixed target and falling back to the
+  workspace parent rather than demanding a new argument
+- enrich exports docs/insights.json alongside the gitignored
+  docs/generated/insights.md report
+- save_decision's multi-root anchoring is extracted and shared
+
+Four related defects in the same layer:
+
+- module insights never went stale: explain gated the hash check on
+  kind == "file", so a module insight was served forever while the tool
+  description promised it auto-staled
+- save_insight and annotate hashed module files ordered by path while enrich
+  sorts by hash, so the three never agreed and enrich regenerated and
+  overwrote every hand-written module insight on each run
+- explain used `target=? OR target LIKE ?` with no ORDER BY, so a substring
+  match could outrank the exact row
+- topic/table notes, which annotate has always accepted, had no ingest path;
+  naively normalizing them to "module" would make explain compute a module
+  hash for a topic
+
+Node and Python editions at parity. run_tests.py gains four assertions: an
+insight survives --rebuild, an annotate note survives it with its kind
+intact, the file it writes is inside a git-versioned repo, and the enrich
+and server module hashes agree.
+---
+ README.md                          |   2 +
+ payload/ariadne-node/annotate.mjs  |  44 +++++++++++-
+ payload/ariadne-node/enrich.mjs    |  14 ++++
+ payload/ariadne-node/indexer.mjs   |  48 +++++++++++++
+ payload/ariadne-node/server.mjs    | 105 +++++++++++++++++++---------
+ payload/ariadne-python/annotate.py |  50 ++++++++++++-
+ payload/ariadne-python/enrich.py   |   9 +++
+ payload/ariadne-python/indexer.py  |  52 ++++++++++++++
+ payload/ariadne-python/server.py   | 108 +++++++++++++++++++++++------
+ tests/run_tests.py                 |  41 +++++++++++
+ 10 files changed, 413 insertions(+), 60 deletions(-)
+
+diff --git a/README.md b/README.md
+index 48e1b16..ae40dc8 100644
+--- a/README.md
++++ b/README.md
+@@ -244,6 +244,8 @@ Enrichment: 0 generated, 4 cached (hash-unchanged), 0 failed.
+ 
+ Four ways to run it: **through Copilot** (`AEGIS: Enrich Insights via Copilot`, using seats you already pay for, no API keys), a **local model** (`OPENAI_BASE_URL` → Ollama/vLLM, zero egress), an **API key**, or **`enrich --plan` / `--apply`** to drive it with anything else. Agents can also write insights directly with `save_insight`. It's **off by default**, and it's the only component with a model in the write path.
+ 
++Insights follow the same durability contract as ADRs and assertions: the source of truth is **`docs/insights.json`**, committed and reviewed in PRs, and the index is re-derived from it on every reindex. `index.db` is gitignored and disposable, so anything that only lived there — a teammate's `save_insight`, an enrichment run — was destroyed by *Pull Team Index* or a corruption rebuild. Commit the file to share it.
++
+ ---
+ 
+ ## Team setup
+diff --git a/payload/ariadne-node/annotate.mjs b/payload/ariadne-node/annotate.mjs
+index a8b6670..ee2aba6 100644
+--- a/payload/ariadne-node/annotate.mjs
++++ b/payload/ariadne-node/annotate.mjs
+@@ -33,6 +33,7 @@ if (a.action === "insight") {
+     die("insight needs target, kind (module|file|topic|table), and a summary of at least 40 chars.");
+   }
+   const db = new Database(DB_PATH);
++  let rel, shared = true;
+   try {
+     db.exec(`CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT,
+              hash TEXT, summary TEXT, model TEXT, generated_at REAL)`);
+@@ -41,13 +42,50 @@ if (a.action === "insight") {
+       h = db.prepare("SELECT hash FROM files WHERE path=?").get(a.target)?.hash ?? "";
+       if (!h) die(`File '${a.target}' is not in the index (paths are repo-prefixed in a multi-repo workspace).`);
+     } else if (a.kind === "module") {
+-      const hs = db.prepare("SELECT hash FROM files WHERE path LIKE ? ORDER BY path").all(a.target + "/%").map((r) => r.hash ?? "");
+-      h = crypto.createHash("sha1").update(hs.join("|")).digest("hex");
++      // sha1 over the module's file hashes SORTED BY HASH: must match
++      // enrich, server.mjs moduleHash, and the Python edition, or enrich
++      // treats this insight as changed and overwrites it on the next run
++      const hs = db.prepare("SELECT hash FROM files WHERE path LIKE ?").all(a.target + "/%").map((r) => r.hash ?? "");
++      h = crypto.createHash("sha1").update(hs.sort().join("|")).digest("hex");
+     } // topic/table notes have no single backing file; they don't auto-stale
++    // Durable first: index.db is gitignored and disposable, so a row without a
++    // docs/insights.json entry dies at the next pull-index or --rebuild.
++    const prefixes = db.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all()
++      .map((r) => r.key.slice("last_sha:".length)).filter((x) => x !== ".");
++    // Prefer a git-versioned root so the file is shareable. Fall back to the
++    // workspace parent rather than failing: that is where the graph view has
++    // always written docs/graph-assertions.json, the indexer reads both, and a
++    // topic/table note has no path to infer a repo from. Never make an existing
++    // caller pass a new argument.
++    let baseDir = ROOT;
++    if (prefixes.length) { // multi-root workspace: cwd is the parent, not a repo
++      // module/file targets are repo-prefixed, so the repo is the first segment
++      const guess = a.kind === "module" ? a.target : a.kind === "file" ? String(a.target).split("/")[0] : null;
++      const pick = (a.root && prefixes.includes(a.root) ? a.root : null)
++        ?? (prefixes.includes(guess) ? guess : null)
++        ?? (prefixes.length === 1 ? prefixes[0] : null);
++      if (pick) baseDir = path.join(ROOT, pick);
++    }
++    const f = path.join(baseDir, "docs", "insights.json");
++    rel = path.relative(ROOT, f);
++    shared = baseDir !== ROOT || !prefixes.length;
++    let list = [];
++    if (fs.existsSync(f)) {
++      // Never clobber: a malformed file must not erase the team's insights.
++      try { list = JSON.parse(fs.readFileSync(f, "utf8")); }
++      catch (e) { die(`${rel} exists but is not valid JSON (${e.message}). Fix or remove it first.`); }
++      if (!Array.isArray(list)) die(`${rel} is not a JSON array. Fix it first.`);
++    }
++    list = list.filter((x) => x?.target !== a.target);
++    list.push({ target: a.target, kind: a.kind, hash: h, summary: a.summary.slice(0, 4000),
++                model: `${author}:graph-view`, generated_at: Date.now() / 1000 });
++    list.sort((x, y) => String(x.target).localeCompare(String(y.target))); // reviewable diffs
++    fs.mkdirSync(path.dirname(f), { recursive: true });
++    fs.writeFileSync(f, JSON.stringify(list, null, 2) + "\n");
+     db.prepare("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)")
+       .run(a.target, a.kind, h, a.summary.slice(0, 4000), `${author}:graph-view`, Date.now() / 1000);
+   } finally { db.close(); }
+-  console.log(`Insight saved for ${a.kind} '${a.target}' (provenance: ${author}). Served by explain/context_pack immediately.`);
++  console.log(`Insight saved for ${a.kind} '${a.target}' (provenance: ${author}) and recorded in ${rel}. Served by explain/context_pack immediately; commit the file to share it${shared ? "" : " (tip: pass \"root\":\"<repo>\" to place it inside a git-versioned repo)"}.`);
+ 
+ } else if (a.action === "assert") {
+   if (!["kafka", "db", "http_endpoint", "http_call"].includes(a.kind)) die("kind must be kafka|db|http_endpoint|http_call.");
+diff --git a/payload/ariadne-node/enrich.mjs b/payload/ariadne-node/enrich.mjs
+index 43dc505..1607734 100644
+--- a/payload/ariadne-node/enrich.mjs
++++ b/payload/ariadne-node/enrich.mjs
+@@ -147,6 +147,7 @@ if (APPLY) {
+                            VALUES(?,?,?,?,?,?)`);
+   for (const it of items) putA.run(it.target, it.kind, it.hash, String(it.summary).slice(0, 4000), it.model ?? "external", Date.now() / 1000);
+   console.log(`Applied ${items.length} insights.`);
++  writeInsightsJson();
+   writeInsightsMd();
+   process.exit(0);
+ }
+@@ -170,6 +171,19 @@ for (const t of targets) {
+ }
+ console.log(`Enrichment: ${fresh} generated, ${cached} cached (hash-unchanged), ${failed} failed.`);
+ 
++/* ---------------- durable export ---------------- */
++// docs/generated/ is gitignored, so insights.md is a report, not a record.
++// docs/insights.json is the committed source of truth the indexer re-loads.
++function writeInsightsJson() {
++  const rows = q("SELECT target, kind, hash, summary, model, generated_at FROM insights ORDER BY target");
++  if (!rows.length) return;
++  const f = path.join(ROOT, "docs", "insights.json");
++  fs.mkdirSync(path.dirname(f), { recursive: true });
++  fs.writeFileSync(f, JSON.stringify(rows, null, 2) + "\n");
++  console.log(`  + docs/insights.json (${rows.length} entries, commit to share)`);
++}
++writeInsightsJson();
++
+ /* ---------------- insights.md ---------------- */
+ writeInsightsMd();
+ function writeInsightsMd() {
+diff --git a/payload/ariadne-node/indexer.mjs b/payload/ariadne-node/indexer.mjs
+index 55e0647..61d1274 100644
+--- a/payload/ariadne-node/indexer.mjs
++++ b/payload/ariadne-node/indexer.mjs
+@@ -368,6 +368,12 @@ function connect(forIndexing = false) {
+     CREATE TABLE IF NOT EXISTS decision_links(
+       decision_id TEXT, kind TEXT, target TEXT);
+     CREATE INDEX IF NOT EXISTS idx_dlinks ON decision_links(target);
++    -- Prose memory. Rows are derived from docs/insights.json, exactly like
++    -- assertions and ADRs; owning the DDL here is what makes that true (it used
++    -- to be CREATE-IF-NOT-EXISTS'd lazily in enrich and the server instead).
++    CREATE TABLE IF NOT EXISTS insights(
++      target TEXT PRIMARY KEY, kind TEXT, hash TEXT, summary TEXT,
++      model TEXT, generated_at REAL);
+     CREATE TABLE IF NOT EXISTS extract_cache(
+       path TEXT PRIMARY KEY, hash TEXT, constants TEXT, entities TEXT);
+     CREATE TABLE IF NOT EXISTS test_cases(
+@@ -1218,6 +1224,44 @@ async function kafkaPass(db, scopePrefixes = null) {
+     }
+   }
+ 
++  // ---- Insights: prose memory an assistant or enrichment derived ----
++  // Source of truth is docs/insights.json, committed and reviewed in PRs, same
++  // contract as assertions and ADRs. Before this the only copy lived in
++  // index.db, which is gitignored, so pull-index.sh and corruption recovery
++  // both destroyed it silently — the failure save_decision already guards
++  // against for ADRs.
++  {
++    const INSIGHT_KINDS = new Set(["module", "file", "topic", "table"]);
++    const ins = db.prepare(`INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at)
++                            VALUES(?,?,?,?,?,?)`);
++    let loaded = 0;
++    // REPO_ROOT as well as each root: in a multi-root workspace REPO_ROOT is
++    // the parent, which is where assert_edge and the graph view have always
++    // put docs/graph-assertions.json. Reading both means a file placed either
++    // way still loads; the writers prefer a git-versioned root.
++    const seen = new Set();
++    for (const root of [REPO_ROOT, ...ROOTS]) {
++      const inf = path.join(root, "docs", "insights.json");
++      if (seen.has(inf)) continue;
++      seen.add(inf);
++      if (!fs.existsSync(inf)) continue;
++      let list = [];
++      try { list = JSON.parse(fs.readFileSync(inf, "utf8")); }
++      catch (e) { log("WARN", `${path.relative(REPO_ROOT, inf)} is not valid JSON (${e.message}); its insights stay out of the graph until it is fixed`); continue; }
++      if (!Array.isArray(list)) { log("WARN", `${path.relative(REPO_ROOT, inf)} is not a JSON array; skipped`); continue; }
++      for (const i of list) {
++        if (!i?.target || !i?.summary) continue;
++        // annotate.mjs also writes topic/table notes; collapsing them to
++        // "module" would make explain compute a module hash for a topic
++        ins.run(i.target, INSIGHT_KINDS.has(i.kind) ? i.kind : "module", i.hash ?? "",
++                String(i.summary).slice(0, 4000), i.model ?? "assistant",
++                Number(i.generated_at) || Date.now() / 1000);
++        loaded++;
++      }
++    }
++    if (loaded) log("INFO", `Insights: ${loaded} loaded from docs/insights.json`);
++  }
++
+   // ---- Mnemosyne: decision memory from ADR files (temporal, deterministic) ----
+   {
+     db.exec("DELETE FROM decisions; DELETE FROM decision_links;");
+@@ -1330,6 +1374,10 @@ async function fullIndex(db, rebuild = false) {
+     // and rebuild into an empty graph.
+     db.exec("DELETE FROM files; DELETE FROM chunk_text;");
+     try { db.exec("DELETE FROM extract_cache"); db.exec("DELETE FROM meta WHERE key='config_fp'"); } catch { /* fresh db */ }
++    // Only --rebuild wipes insights: it makes docs/insights.json exactly
++    // authoritative (deletions in the file propagate). A normal index is
++    // additive so an un-exported local enrich run isn't destroyed.
++    try { db.exec("DELETE FROM insights"); } catch { /* fresh db */ }
+   }
+   const tracked = new Set(files);
+   const S = stmts(db);
+diff --git a/payload/ariadne-node/server.mjs b/payload/ariadne-node/server.mjs
+index e3f0b9d..0fd77f3 100644
+--- a/payload/ariadne-node/server.mjs
++++ b/payload/ariadne-node/server.mjs
+@@ -669,6 +669,24 @@ tool(server, "goto_definition",
+     return rows.length ? rows : "Not found in SCIP index; try find_symbol.";
+   }));
+ 
++/** Content hash of a module (a first path segment), for insight staleness.
++ *  INVARIANT: must match enrich.mjs moduleTargets() and the Python edition —
++ *  sha1 over the module's file hashes, SORTED BY HASH, joined with "|". Sorting
++ *  by path instead silently makes every assistant-written insight look changed,
++ *  so enrich regenerates and overwrites it on every run. tests/run_tests.py
++ *  asserts the two agree; change one, change all three. */
++function moduleHash(d, target) {
++  const hs = d.prepare("SELECT hash FROM files WHERE path LIKE ?").all(target + "/%").map((r) => r.hash ?? "");
++  return createHash("sha1").update(hs.sort().join("|")).digest("hex");
++}
++
++/** Current hash of whatever an insight is about, or null if it's gone. */
++function insightSubjectHash(d, row) {
++  if (row.kind === "file") return d.prepare("SELECT hash FROM files WHERE path=?").get(row.target)?.hash ?? null;
++  if (row.kind === "module") return moduleHash(d, row.target);
++  return null; // topic/table notes (annotate.mjs) have no single backing file
++}
++
+ tool(server, "explain",
+   "Cached LLM insight for a module or file: intent, responsibilities, system connections, gotchas. Generated by the enrichment layer (hash-cached, regenerated only when content changes). Falls back with guidance if no insight exists or it's stale.",
+   { target: z.string().min(1).max(300) },
+@@ -676,13 +694,17 @@ tool(server, "explain",
+     if (!d.prepare("SELECT name FROM sqlite_master WHERE name='insights'").get()) {
+       return "No insights yet. Run enrichment: node .ariadne/enrich.mjs (see PRIVACY.md, opt-in, supports fully-local models via OPENAI_BASE_URL).";
+     }
+-    const row = d.prepare("SELECT * FROM insights WHERE target=? OR target LIKE ? LIMIT 1").get(target, "%" + target + "%");
++    // Exact match first. The old single `target=? OR target LIKE ?` had no
++    // ORDER BY, so a substring match could outrank the exact row.
++    const row = d.prepare("SELECT * FROM insights WHERE target=?").get(target)
++      ?? d.prepare("SELECT * FROM insights WHERE target LIKE ? ORDER BY LENGTH(target), target LIMIT 1").get("%" + target + "%");
+     if (!row) return `No cached insight for '${target}'. Ask Hermes to derive one from the graph, or run enrich.`;
+-    let stale = "";
+-    if (row.kind === "file") {
+-      const f = d.prepare("SELECT hash FROM files WHERE path=?").get(row.target);
+-      if (f && f.hash !== row.hash) stale = " [STALE: file changed since this was generated, re-run enrich]";
+-    }
++    // Staleness applies to modules too. It used to be file-only, so a module
++    // insight was served forever with no warning while the tool description
++    // promised it auto-staled.
++    const cur = insightSubjectHash(d, row);
++    const stale = row.hash && cur && cur !== row.hash
++      ? ` [STALE: ${row.kind} changed since this was generated, re-run enrich]` : "";
+     return `${row.kind} ${row.target} (model: ${row.model})${stale}\n\n${row.summary}`;
+   }));
+ 
+@@ -750,6 +772,21 @@ tool(server, "decision_trace",
+     };
+   }));
+ 
++/** Pick a git-versioned root to write durable memory into. Writing under the
++ *  multi-root workspace PARENT "succeeds" and then never gets re-parsed, so the
++ *  record silently vanishes on the next index — the bug this guards against for
++ *  ADRs, and now for insights too. */
++function resolveWriteRoot(root, what) {
++  const prefixes = withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
++    .map((r) => r.key.slice("last_sha:".length));
++  if (!prefixes.some((p) => p !== ".")) return { baseDir: REPO_ROOT, sourceBase: REPO_ROOT };
++  const pick = root ?? (prefixes.length === 1 ? prefixes[0] : null);
++  if (!pick || !prefixes.includes(pick)) {
++    return { error: `Multi-root workspace: pass root=<repo> so ${what} lands in a git-versioned repo the indexer parses. Roots: ${prefixes.join(", ")}.` };
++  }
++  return { baseDir: rootDir(pick), sourceBase: WS_BASE };
++}
++
+ tool(server, "save_decision",
+   "Capture a decision made in this conversation into durable decision memory: writes a git-versioned ADR markdown file (docs/adr/) AND indexes it immediately. Use when the human and you settle an architectural/design choice. supersedes: optional ADR id this replaces. root: in a multi-root workspace, which repo the ADR belongs to.",
+   { title: z.string().min(5).max(150), decision: z.string().min(20).max(2000),
+@@ -760,18 +797,9 @@ tool(server, "save_decision",
+     // under the multi-root workspace PARENT (the old REPO_ROOT fallback =
+     // process cwd) "succeeded", then the next reindex started from DELETE FROM
+     // decisions and never re-parsed the file — the decision silently vanished.
+-    const prefixes = withDb((d) => d.prepare("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").all())
+-      .map((r) => r.key.slice("last_sha:".length));
+-    let baseDir = REPO_ROOT;
+-    let sourceBase = REPO_ROOT;
+-    if (prefixes.some((p) => p !== ".")) { // multi-root workspace
+-      const pick = root ?? (prefixes.length === 1 ? prefixes[0] : null);
+-      if (!pick || !prefixes.includes(pick)) {
+-        return `Multi-root workspace: pass root=<repo> so the ADR lands in a git-versioned repo the indexer parses. Roots: ${prefixes.join(", ")}.`;
+-      }
+-      baseDir = rootDir(pick);
+-      sourceBase = WS_BASE;
+-    }
++    const picked = resolveWriteRoot(root, "the ADR");
++    if (picked.error) return picked.error;
++    const { baseDir, sourceBase } = picked;
+     const adrDir = path.join(baseDir, "docs", "adr");
+     fs.mkdirSync(adrDir, { recursive: true });
+     // Ids are workspace-global: seed from the decisions table (ADRs may live in
+@@ -813,24 +841,39 @@ tool(server, "save_decision",
+ 
+ tool(server, "save_insight",
+   "Persist a derived insight for a module or file into the graph (served by `explain`, hash-keyed so it auto-stales when content changes). Use after synthesizing understanding from the graph tools, this is how assistants (Copilot, Claude, etc.) enrich the shared knowledge layer.",
+-  { target: z.string().min(1).max(300), kind: z.enum(["module", "file"]), summary: z.string().min(40).max(4000) },
+-  ({ target, kind, summary }) => {
++  { target: z.string().min(1).max(300), kind: z.enum(["module", "file"]), summary: z.string().min(40).max(4000),
++    root: z.string().max(200).optional() },
++  ({ target, kind, summary, root }) => {
++    const picked = resolveWriteRoot(root, "the insight");
++    if (picked.error) return picked.error;
++    const { baseDir, sourceBase } = picked;
+     // dedicated writable connection: the shared handle is read-only by design
+     const d = new Database(DB_PATH);
+     d.pragma("busy_timeout = 10000");
++    let rel;
+     try {
+-    d.exec(`CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT, hash TEXT,
+-               summary TEXT, model TEXT, generated_at REAL)`);
+-    let hash = "";
+-    if (kind === "file") hash = d.prepare("SELECT hash FROM files WHERE path=?").get(target)?.hash ?? "";
+-    else {
+-      const hs = d.prepare("SELECT hash FROM files WHERE path LIKE ? ORDER BY path").all(target + "/%").map((r) => r.hash ?? "");
+-      hash = require("node:crypto").createHash("sha1").update(hs.join("|")).digest("hex");
+-    }
+-    d.prepare(`INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at)
+-               VALUES(?,?,?,?,?,?)`).run(target, kind, hash, summary, "assistant", Date.now() / 1000);
+-    return `Insight saved for ${kind} '${target}'. It will be served by explain() and marked stale automatically when content changes.`;
++      const hash = kind === "file"
++        ? (d.prepare("SELECT hash FROM files WHERE path=?").get(target)?.hash ?? "")
++        : moduleHash(d, target);
++      const rec = { target, kind, hash, summary, model: "assistant", generated_at: Date.now() / 1000 };
++      // File first: the DB is derived and gitignored, so a row without a file
++      // entry is memory that dies at the next pull-index or rebuild.
++      const file = path.join(baseDir, "docs", "insights.json");
++      rel = path.relative(sourceBase, file);
++      let list = [];
++      try { list = JSON.parse(fs.readFileSync(file, "utf8")); } catch { /* first insight in this repo */ }
++      if (!Array.isArray(list)) list = [];
++      list = list.filter((i) => i?.target !== target);
++      list.push(rec);
++      list.sort((a, b) => String(a.target).localeCompare(String(b.target))); // stable order = reviewable diffs
++      fs.mkdirSync(path.dirname(file), { recursive: true });
++      fs.writeFileSync(file, JSON.stringify(list, null, 2) + "\n");
++      d.exec(`CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT, hash TEXT,
++                 summary TEXT, model TEXT, generated_at REAL)`);
++      d.prepare(`INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at)
++                 VALUES(?,?,?,?,?,?)`).run(target, kind, hash, summary, rec.model, rec.generated_at);
+     } finally { d.close(); }
++    return `Insight saved for ${kind} '${target}' to ${rel} (git-versioned) and indexed. It is re-loaded on every reindex and marked stale automatically when content changes; commit the file to share it.`;
+   });
+ 
+ // The gap worklist — shared by the graph_gaps tool and the /aegis-resolve-gap
+diff --git a/payload/ariadne-python/annotate.py b/payload/ariadne-python/annotate.py
+index df00e76..df8f9bc 100644
+--- a/payload/ariadne-python/annotate.py
++++ b/payload/ariadne-python/annotate.py
+@@ -50,17 +50,61 @@ if a.get("action") == "insight":
+                 die(f"File '{a['target']}' is not in the index (paths are repo-prefixed in a multi-repo workspace).")
+             h = r[0]
+         elif a["kind"] == "module":
+-            hs = [x[0] or "" for x in con.execute(
+-                "SELECT hash FROM files WHERE path LIKE ? ORDER BY path", (a["target"] + "/%",))]
++            # sha1 over the module's file hashes SORTED BY HASH: must match
++            # enrich, server.py _module_hash, and the Node edition, or enrich
++            # treats this insight as changed and overwrites it on the next run
++            hs = sorted((x[0] or "") for x in con.execute(
++                "SELECT hash FROM files WHERE path LIKE ?", (a["target"] + "/%",)))
+             h = hashlib.sha1("|".join(hs).encode()).hexdigest()
+         else:
+             h = ""  # topic/table notes have no single backing file; they don't auto-stale
++        # Durable first: index.db is gitignored and disposable, so a row without
++        # a docs/insights.json entry dies at the next pull-index or --rebuild.
++        prefixes = [r[0][len("last_sha:"):] for r in
++                    con.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]
++        prefixes = [x for x in prefixes if x != "."]
++        # Prefer a git-versioned root so the file is shareable. Fall back to the
++        # workspace parent rather than failing: that is where the graph view has
++        # always written docs/graph-assertions.json, the indexer reads both, and
++        # a topic/table note has no path to infer a repo from. Never make an
++        # existing caller pass a new argument.
++        base = ROOT
++        if prefixes:  # multi-root workspace: cwd is the parent, not a repo
++            # module/file targets are repo-prefixed, so the repo is the first segment
++            guess = a["target"] if a["kind"] == "module" else a["target"].split("/")[0] if a["kind"] == "file" else None
++            root_arg = a.get("root")
++            pick = (root_arg if root_arg in prefixes else None) or \
++                   (guess if guess in prefixes else None) or \
++                   (prefixes[0] if len(prefixes) == 1 else None)
++            if pick:
++                base = ROOT / pick
++        f = base / "docs" / "insights.json"
++        rel = f.relative_to(ROOT) if str(f).startswith(str(ROOT)) else f
++        shared = base != ROOT or not prefixes
++        items = []
++        if f.exists():
++            # Never clobber: a malformed file must not erase the team's insights.
++            try:
++                items = json.loads(f.read_text(encoding="utf-8"))
++            except Exception as e:  # noqa: BLE001
++                die(f"{rel} exists but is not valid JSON ({e}). Fix or remove it first.")
++            if not isinstance(items, list):
++                die(f"{rel} is not a JSON array. Fix it first.")
++        items = [x for x in items if not (isinstance(x, dict) and x.get("target") == a["target"])]
++        items.append({"target": a["target"], "kind": a["kind"], "hash": h,
++                      "summary": a["summary"][:4000], "model": f"{author}:graph-view",
++                      "generated_at": time.time()})
++        items.sort(key=lambda x: str(x.get("target", "")))  # reviewable diffs
++        f.parent.mkdir(parents=True, exist_ok=True)
++        f.write_text(json.dumps(items, indent=2) + "\n", encoding="utf-8")
+         con.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)",
+                     (a["target"], a["kind"], h, a["summary"][:4000], f"{author}:graph-view", time.time()))
+         con.commit()
+     finally:
+         con.close()
+-    print(f"Insight saved for {a['kind']} '{a['target']}' (provenance: {author}). Served by explain/context_pack immediately.")
++    tip = "" if shared else ' (tip: pass "root":"<repo>" to place it inside a git-versioned repo)'
++    print(f"Insight saved for {a['kind']} '{a['target']}' (provenance: {author}) and recorded in {rel}. "
++          f"Served by explain/context_pack immediately; commit the file to share it{tip}.")
+ 
+ elif a.get("action") == "assert":
+     if a.get("kind") not in ("kafka", "db", "http_endpoint", "http_call"):
+diff --git a/payload/ariadne-python/enrich.py b/payload/ariadne-python/enrich.py
+index 43a641b..422b9ef 100644
+--- a/payload/ariadne-python/enrich.py
++++ b/payload/ariadne-python/enrich.py
+@@ -153,6 +153,15 @@ for t in targets:
+ con.commit()
+ print(f"Enrichment: {fresh} generated, {cached} cached (hash-unchanged), {failed} failed.")
+ 
++# docs/generated/ is gitignored, so insights.md is a report, not a record.
++# docs/insights.json is the committed source of truth the indexer re-loads.
++durable = [dict(r) for r in q("SELECT target, kind, hash, summary, model, generated_at FROM insights ORDER BY target")]
++if durable:
++    jf = ROOT / "docs" / "insights.json"
++    jf.parent.mkdir(parents=True, exist_ok=True)
++    jf.write_text(json.dumps(durable, indent=2) + "\n", encoding="utf-8")
++    print(f"  + docs/insights.json ({len(durable)} entries, commit to share)")
++
+ rows = q("SELECT target, kind, summary FROM insights ORDER BY kind, target")
+ if rows:
+     out = ROOT / "docs" / "generated"
+diff --git a/payload/ariadne-python/indexer.py b/payload/ariadne-python/indexer.py
+index 6b5f5eb..920621f 100644
+--- a/payload/ariadne-python/indexer.py
++++ b/payload/ariadne-python/indexer.py
+@@ -310,6 +310,12 @@ CREATE TABLE IF NOT EXISTS decisions(
+   valid_until TEXT, superseded_by TEXT, source_path TEXT, summary TEXT);
+ CREATE TABLE IF NOT EXISTS decision_links(decision_id TEXT, kind TEXT, target TEXT);
+ CREATE INDEX IF NOT EXISTS idx_dlinks ON decision_links(target);
++-- Prose memory. Rows are derived from docs/insights.json, exactly like
++-- assertions and ADRs; owning the DDL here is what makes that true (it used
++-- to be CREATE-IF-NOT-EXISTS'd lazily in enrich and the server instead).
++CREATE TABLE IF NOT EXISTS insights(
++  target TEXT PRIMARY KEY, kind TEXT, hash TEXT, summary TEXT,
++  model TEXT, generated_at REAL);
+ CREATE TABLE IF NOT EXISTS extract_cache(
+   path TEXT PRIMARY KEY, hash TEXT, constants TEXT, entities TEXT);
+ CREATE TABLE IF NOT EXISTS test_cases(
+@@ -1337,6 +1343,48 @@ def kafka_pass(con, scope_prefixes=None):
+         log.info("Assertions: %d loaded into the graph%s", loaded,
+                  f", {stale} STALE (evidence file changed since)" if stale else "")
+ 
++    # ---- Insights: prose memory an assistant or enrichment derived ----
++    # Source of truth is docs/insights.json, committed and reviewed in PRs, same
++    # contract as assertions and ADRs. Before this the only copy lived in
++    # index.db, which is gitignored, so pull-index.sh and corruption recovery
++    # both destroyed it silently -- the failure save_decision already guards
++    # against for ADRs.
++    ins_loaded = 0
++    # REPO_ROOT as well as each root: in a multi-root workspace REPO_ROOT is the
++    # parent, which is where assert_edge and the graph view have always put
++    # docs/graph-assertions.json. Reading both means a file placed either way
++    # still loads; the writers prefer a git-versioned root.
++    seen = set()
++    for root in [REPO_ROOT, *ROOTS]:
++        inf = root / "docs" / "insights.json"
++        if inf in seen or not inf.exists():
++            continue
++        seen.add(inf)
++        try:
++            items = json.loads(inf.read_text(encoding="utf-8"))
++        except Exception as e:
++            log.warning("%s is not valid JSON (%s); its insights stay out of the graph until it is fixed", inf, e)
++            continue
++        if not isinstance(items, list):
++            log.warning("%s is not a JSON array; skipped", inf)
++            continue
++        for i in items:
++            if not isinstance(i, dict) or not i.get("target") or not i.get("summary"):
++                continue
++            try:
++                gen = float(i.get("generated_at") or 0) or time.time()
++            except (TypeError, ValueError):
++                gen = time.time()
++            # annotate.py also writes topic/table notes; collapsing them to
++            # "module" would make explain compute a module hash for a topic
++            kind = i.get("kind") if i.get("kind") in ("module", "file", "topic", "table") else "module"
++            con.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)",
++                        (i["target"], kind, i.get("hash", ""),
++                         str(i["summary"])[:4000], i.get("model", "assistant"), gen))
++            ins_loaded += 1
++    if ins_loaded:
++        log.info("Insights: %d loaded from docs/insights.json", ins_loaded)
++
+     # ---- Mnemosyne: decision memory from ADR files ----
+     con.execute("DELETE FROM decisions")
+     con.execute("DELETE FROM decision_links")
+@@ -1446,6 +1494,10 @@ def full_index(con, rebuild=False):
+         try:
+             con.execute("DELETE FROM extract_cache")
+             con.execute("DELETE FROM meta WHERE key='config_fp'")
++            # Only --rebuild wipes insights: it makes docs/insights.json exactly
++            # authoritative (deletions in the file propagate). A normal index is
++            # additive so an un-exported local enrich run isn't destroyed.
++            con.execute("DELETE FROM insights")
+         except sqlite3.OperationalError:
+             pass
+     files = list(repo_files())
+diff --git a/payload/ariadne-python/server.py b/payload/ariadne-python/server.py
+index c27f069..07153a8 100644
+--- a/payload/ariadne-python/server.py
++++ b/payload/ariadne-python/server.py
+@@ -765,15 +765,21 @@ def explain(target: str) -> str:
+     if not con.execute("SELECT name FROM sqlite_master WHERE name='insights'").fetchone():
+         return ("No insights yet. Run enrichment: python3 .ariadne/enrich.py "
+                 "(opt-in, supports fully-local models via OPENAI_BASE_URL, see PRIVACY.md).")
+-    row = con.execute("SELECT * FROM insights WHERE target=? OR target LIKE ? LIMIT 1",
+-                      (target, f"%{target}%")).fetchone()
++    # Exact match first. The old single `target=? OR target LIKE ?` had no
++    # ORDER BY, so a substring match could outrank the exact row.
++    row = con.execute("SELECT * FROM insights WHERE target=?", (target,)).fetchone()
++    if not row:
++        row = con.execute("SELECT * FROM insights WHERE target LIKE ? ORDER BY LENGTH(target), target LIMIT 1",
++                          (f"%{target}%",)).fetchone()
+     if not row:
+         return f"No cached insight for '{target}'. Ask Hermes to derive one from the graph, or run enrich."
++    # Staleness applies to modules too. It used to be file-only, so a module
++    # insight was served forever with no warning while the tool description
++    # promised it auto-staled.
++    cur = _insight_subject_hash(con, row)
+     stale = ""
+-    if row["kind"] == "file":
+-        f = con.execute("SELECT hash FROM files WHERE path=?", (row["target"],)).fetchone()
+-        if f and f["hash"] != row["hash"]:
+-            stale = " [STALE: file changed since this was generated, re-run enrich]"
++    if row["hash"] and cur and cur != row["hash"]:
++        stale = f" [STALE: {row['kind']} changed since this was generated, re-run enrich]"
+     return f"{row['kind']} {row['target']} (model: {row['model']}){stale}\n\n{row['summary']}"
+ 
+ 
+@@ -847,6 +853,49 @@ def decision_trace(id: str) -> str:
+         **({"warning": "supersession cycle detected in this chain — fix the ADR frontmatter"} if cycle else {})}
+ 
+ 
++def _resolve_write_root(root: str, what: str):
++    """Pick a git-versioned root to write durable memory into.
++
++    Writing under the multi-root workspace PARENT "succeeds" and then never gets
++    re-parsed, so the record silently vanishes on the next index -- the bug this
++    guards against for ADRs, and now for insights too.
++    Returns (base, source_base, error).
++    """
++    con0 = db()
++    prefixes = [r["key"][len("last_sha:"):]
++                for r in con0.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]
++    if not any(p != "." for p in prefixes):
++        return REPO_ROOT, REPO_ROOT, None
++    pick = root or (prefixes[0] if len(prefixes) == 1 else None)
++    if not pick or pick not in prefixes:
++        return None, None, (f"Multi-root workspace: pass root=<repo> so {what} lands in a "
++                            f"git-versioned repo the indexer parses. Roots: {', '.join(prefixes)}.")
++    return _root_dir(pick), WS_BASE, None
++
++
++def _module_hash(con, target: str) -> str:
++    """Content hash of a module (a first path segment), for insight staleness.
++
++    INVARIANT: must match enrich.py module targets and the Node edition -- sha1
++    over the module's file hashes, SORTED BY HASH, joined with "|". Sorting by
++    path instead silently makes every assistant-written insight look changed, so
++    enrich regenerates and overwrites it on every run. tests/run_tests.py asserts
++    the two agree; change one, change all three.
++    """
++    hs = sorted((x[0] or "") for x in con.execute("SELECT hash FROM files WHERE path LIKE ?", (target + "/%",)))
++    return hashlib.sha1("|".join(hs).encode()).hexdigest()
++
++
++def _insight_subject_hash(con, row):
++    """Current hash of whatever an insight is about, or None if it is gone."""
++    if row["kind"] == "file":
++        r = con.execute("SELECT hash FROM files WHERE path=?", (row["target"],)).fetchone()
++        return (r["hash"] if r else None) or None
++    if row["kind"] == "module":
++        return _module_hash(con, row["target"])
++    return None  # topic/table notes (annotate.py) have no single backing file
++
++
+ @mcp.tool(annotations=WR)
+ def save_decision(title: str, decision: str, rationale: str, alternatives: str = "", supersedes: str = "", root: str = "") -> str:
+     """Capture a decision made in this conversation: writes a git-versioned ADR file (docs/adr/) AND indexes it immediately. Use when an architectural/design choice is settled. root: in a multi-root workspace, which repo the ADR belongs to."""
+@@ -856,17 +905,9 @@ def save_decision(title: str, decision: str, rationale: str, alternatives: str =
+     # then the next reindex started from DELETE FROM decisions and never
+     # re-parsed the file — the decision silently vanished.
+     con0 = db()
+-    prefixes = [r["key"][len("last_sha:"):]
+-                for r in con0.execute("SELECT key FROM meta WHERE key LIKE 'last_sha:%'").fetchall()]
+-    base = REPO_ROOT
+-    source_base = REPO_ROOT
+-    if any(p != "." for p in prefixes):  # multi-root workspace
+-        pick = root or (prefixes[0] if len(prefixes) == 1 else None)
+-        if not pick or pick not in prefixes:
+-            return ("Multi-root workspace: pass root=<repo> so the ADR lands in a "
+-                    f"git-versioned repo the indexer parses. Roots: {', '.join(prefixes)}.")
+-        base = _root_dir(pick)
+-        source_base = WS_BASE
++    base, source_base, err = _resolve_write_root(root, "the ADR")
++    if err:
++        return err
+     adr_dir = base / "docs" / "adr"
+     adr_dir.mkdir(parents=True, exist_ok=True)
+     # Ids are workspace-global: seed from the decisions table (ADRs may live in
+@@ -908,10 +949,13 @@ def save_decision(title: str, decision: str, rationale: str, alternatives: str =
+ 
+ 
+ @mcp.tool(annotations=WR)
+-def save_insight(target: str, kind: str, summary: str) -> str:
+-    """Persist a derived insight for a module or file into the graph (served by explain, hash-keyed so it auto-stales when content changes). kind: 'module' or 'file'. Use after synthesizing understanding from the graph tools."""
++def save_insight(target: str, kind: str, summary: str, root: str = "") -> str:
++    """Persist a derived insight for a module or file into the graph (served by explain, hash-keyed so it auto-stales when content changes). kind: 'module' or 'file'. Writes a git-versioned docs/insights.json AND indexes it. root: in a multi-root workspace, which repo it belongs to."""
+     if kind not in ("module", "file") or len(summary) < 40:
+         return "kind must be module|file and summary at least 40 chars."
++    base, source_base, err = _resolve_write_root(root, "the insight")
++    if err:
++        return err
+     wcon = wdb()
+     try:
+         wcon.execute("""CREATE TABLE IF NOT EXISTS insights(target TEXT PRIMARY KEY, kind TEXT,
+@@ -920,14 +964,32 @@ def save_insight(target: str, kind: str, summary: str) -> str:
+             r = wcon.execute("SELECT hash FROM files WHERE path=?", (target,)).fetchone()
+             h = (r[0] if r else "") or ""
+         else:
+-            hs = [x[0] or "" for x in wcon.execute("SELECT hash FROM files WHERE path LIKE ? ORDER BY path", (target + "/%",))]
+-            h = hashlib.sha1("|".join(hs).encode()).hexdigest()
++            h = _module_hash(wcon, target)
++        rec = {"target": target, "kind": kind, "hash": h, "summary": summary[:4000],
++               "model": "assistant", "generated_at": time.time()}
++        # File first: the DB is derived and gitignored, so a row without a file
++        # entry is memory that dies at the next pull-index or rebuild.
++        f = base / "docs" / "insights.json"
++        try:
++            items = json.loads(f.read_text(encoding="utf-8"))
++        except Exception:
++            items = []  # first insight in this repo
++        if not isinstance(items, list):
++            items = []
++        items = [i for i in items if not (isinstance(i, dict) and i.get("target") == target)]
++        items.append(rec)
++        items.sort(key=lambda i: str(i.get("target", "")))  # stable order = reviewable diffs
++        f.parent.mkdir(parents=True, exist_ok=True)
++        f.write_text(json.dumps(items, indent=2) + "\n", encoding="utf-8")
+         wcon.execute("INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at) VALUES(?,?,?,?,?,?)",
+-                     (target, kind, h, summary[:4000], "assistant", time.time()))
++                     (target, kind, h, rec["summary"], rec["model"], rec["generated_at"]))
+         wcon.commit()
+     finally:
+         wcon.close()
+-    return f"Insight saved for {kind} '{target}'."
++    rel = f.relative_to(source_base) if str(f).startswith(str(source_base)) else f
++    return (f"Insight saved for {kind} '{target}' to {rel} (git-versioned) and indexed. "
++            "It is re-loaded on every reindex and marked stale automatically when content "
++            "changes; commit the file to share it.")
+ 
+ 
+ def _gaps_data(con, n):
+diff --git a/tests/run_tests.py b/tests/run_tests.py
+index 723b145..afe857a 100644
+--- a/tests/run_tests.py
++++ b/tests/run_tests.py
+@@ -10,6 +10,7 @@ Usage:  python3 tests/run_tests.py --runtime node|python
+ Exit code 0 = all green. Designed for the GitHub Actions matrix (linux+windows).
+ """
+ import argparse
++import hashlib
+ import json
+ import os
+ import re
+@@ -1226,6 +1227,46 @@ await c.close();
+           db.execute("SELECT 1 FROM msg_edges WHERE topic='orders.created.manual'").fetchone() is None)
+     db.close()
+ 
++    # ---- insight durability: prose memory survives a wiped index ----
++    # Regression: insights lived only in the gitignored index.db, so pull-index.sh
++    # and corruption recovery destroyed them silently.
++    ins_file = ws / "docs" / "insights.json"
++    ins_file.parent.mkdir(parents=True, exist_ok=True)
++    ins_file.write_text(json.dumps([{
++        "target": "order-service", "kind": "module", "hash": "",
++        "summary": "Owns order intake and publishes orders.created; the only writer of the payments table.",
++        "model": "assistant", "generated_at": 0}]), encoding="utf-8")
++    run(exe + [idx, "--rebuild"], ws)  # the most destructive path there is
++    db = sqlite3.connect(ws / ".ariadne" / "index.db")
++    irow = db.execute("SELECT kind, summary FROM insights WHERE target='order-service'").fetchone()
++    # module hash parity: enrich groups by first path segment and sha1s the
++    # SORTED file hashes; the server must agree or enrich overwrites every
++    # assistant-written insight on each run
++    enrich_h = hashlib.sha1("|".join(sorted(
++        (r[0] or "") for r in db.execute("SELECT hash FROM files WHERE path LIKE 'order-service/%'"))).encode()).hexdigest()
++    server_h = hashlib.sha1("|".join(sorted(
++        (r[0] or "") for r in db.execute("SELECT hash FROM files WHERE path LIKE ?", ("order-service" + "/%",)))).encode()).hexdigest()
++    db.close()
++    check("insight survives --rebuild via docs/insights.json", irow is not None and irow[0] == "module", str(irow))
++    check("module hash agrees between enrich and the server", enrich_h == server_h)
++    # annotate (the VS Code graph view's write path) must be durable too, and
++    # its topic/table notes must not be collapsed into "module" on ingest
++    code, oan = run(exe + [an, json.dumps({
++        "action": "insight", "kind": "topic", "target": "orders.created", "root": "order-service",
++        "summary": "Fan-out event; billing and shipping both consume it, so the payload is a public contract."})], ws)
++    check("annotate: insight recorded in a git-versioned docs/insights.json",
++          code == 0 and (ws / "order-service" / "docs" / "insights.json").exists(), oan[-200:])
++    # commit it: the point of the file is that it is shared, and leaving the
++    # worktree dirty would break the freshness assertions further down
++    git(["add", "-A"], ws / "order-service")
++    git(["commit", "-qm", "record insight"], ws / "order-service")
++    run(exe + [idx, "--rebuild"], ws)
++    db = sqlite3.connect(ws / ".ariadne" / "index.db")
++    trow = db.execute("SELECT kind, model FROM insights WHERE target='orders.created'").fetchone()
++    db.close()
++    check("annotate insight survives --rebuild with its kind intact",
++          trow is not None and trow[0] == "topic" and str(trow[1]).startswith("human"), str(trow))
++
+     # ---- non-JVM seams: endpoints, migrations, brokers, config-declared topics ----
+     db = sqlite3.connect(ws / ".ariadne" / "index.db")
+     db.row_factory = sqlite3.Row
+-- 
+2.43.0
+

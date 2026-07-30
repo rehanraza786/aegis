@@ -120,15 +120,24 @@ do not care which engine answers; swapping is a one line edit and a reload.
       "maxFileBytes": 1000000,
       "chunkLines": 60,
       "tableNameOverrides": { "OrderEntity": "ord_orders" },
+      "maxInsights": 2000,
 
       "maxToolRows": 50,
       "maxToolBytes": 24000,
       "summaryThreshold": 40,
       "maxDiagramNodes": 30,
-      "maxDocItems": 60
+      "maxDocItems": 60,
+      "maxInsightChars": 600
     }
 
-The last five control how much a tool is allowed to return. Past
+`maxInsights` caps how many entries the indexer will load from
+`docs/insights.json`, and `maxInsightChars` caps how much of one insight
+`context_pack` and `explain` will inline before pointing at the full text. Both
+exist because that file is committed, so in a repo that takes PRs its contents
+are attacker-controlled: nobody should be able to bloat your index or your
+agent's context in a single commit.
+
+The budget knobs control how much a tool is allowed to return. Past
 `summaryThreshold` items, an unscoped `message_flow`, `db_map`, or `http_map` returns
 a summary with the complete warning lists rather than an exhaustive dump. Everything
 is capped at `maxToolRows` and `maxToolBytes` regardless. Warnings are always kept

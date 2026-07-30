@@ -91,6 +91,7 @@ const DEFAULTS = {
   extraExtensions: {},
   testPathPatterns: [],
   prodPathPatterns: [],
+  maxInsights: 2000, // ceiling on entries loaded from docs/insights.json
   workers: null, // parallel extract: null = auto (cores-1, capped 8); 1 = sequential
 };
 let config = DEFAULTS;
@@ -368,6 +369,16 @@ function connect(forIndexing = false) {
     CREATE TABLE IF NOT EXISTS decision_links(
       decision_id TEXT, kind TEXT, target TEXT);
     CREATE INDEX IF NOT EXISTS idx_dlinks ON decision_links(target);
+    -- Prose memory. Rows are derived from docs/insights.json, exactly like
+    -- assertions and ADRs; owning the DDL here is what makes that true (it used
+    -- to be CREATE-IF-NOT-EXISTS'd lazily in enrich and the server instead).
+    -- One module hash per index, not one per explain() call. Single source of
+    -- truth for staleness: the server, enrich, and annotate all read it instead
+    -- of each recomputing (three implementations is how they drifted before).
+    CREATE TABLE IF NOT EXISTS module_hashes(module TEXT PRIMARY KEY, hash TEXT, files INTEGER);
+    CREATE TABLE IF NOT EXISTS insights(
+      target TEXT PRIMARY KEY, kind TEXT, hash TEXT, summary TEXT,
+      model TEXT, generated_at REAL, source TEXT);
     CREATE TABLE IF NOT EXISTS extract_cache(
       path TEXT PRIMARY KEY, hash TEXT, constants TEXT, entities TEXT);
     CREATE TABLE IF NOT EXISTS test_cases(
@@ -1181,22 +1192,44 @@ async function kafkaPass(db, scopePrefixes = null) {
     db.exec("DELETE FROM db_access WHERE source LIKE 'asserted%'");
     db.exec("DELETE FROM http_endpoints WHERE source LIKE 'asserted%'");
     db.exec("DELETE FROM http_calls WHERE source LIKE 'asserted%'");
-    const af = path.join(REPO_ROOT, "docs", "graph-assertions.json");
+    // Parent AND every root. In a multi-root workspace the parent is not a git
+    // repo, so an assertion written there is loaded but never actually
+    // versioned or shared — the "committed and reviewable" promise silently
+    // absent exactly where there are the most repos. Writers now anchor to the
+    // repo owning the evidence file; reading both keeps older placements working.
     let list = [];
-    if (fs.existsSync(af)) {
-      try { list = JSON.parse(fs.readFileSync(af, "utf8")); }
-      catch (e) { log("WARN", `docs/graph-assertions.json is not valid JSON (${e.message}); assertions stay out of the graph until it is fixed`); }
+    const seenA = new Set();
+    for (const root of [REPO_ROOT, ...ROOTS]) {
+      const af = path.join(root, "docs", "graph-assertions.json");
+      if (seenA.has(af) || !fs.existsSync(af)) continue;
+      seenA.add(af);
+      try {
+        const part = JSON.parse(fs.readFileSync(af, "utf8"));
+        if (Array.isArray(part)) list.push(...part);
+        else log("WARN", `${path.relative(REPO_ROOT, af)} is not a JSON array; skipped`);
+      } catch (e) { log("WARN", `${path.relative(REPO_ROOT, af)} is not valid JSON (${e.message}); its assertions stay out of the graph until it is fixed`); }
     }
     if (Array.isArray(list) && list.length) {
       const insA = db.prepare(`INSERT INTO assertions(kind, payload, file_path, line, evidence, confidence, author, source_hash, created_at)
                                VALUES(?,?,?,?,?,?,?,?,?)`);
       const fid = db.prepare("SELECT id, hash FROM files WHERE path=?");
       let loaded = 0, stale = 0;
+      // Same rule as insights: docs/graph-assertions.json is committed, so its
+      // contents are attacker-controlled in any repo that takes PRs. An entry
+      // must not be able to write author:"parser" and be displayed as a parsed
+      // fact — provenance is stamped here, from a clamped token, and every
+      // asserted row is already tagged 'asserted:' in the source column.
+      const safeAuthor = (x) => String(x ?? "assistant").replace(/[^\w.:@-]/g, "").slice(0, 40) || "assistant";
+      const RESERVED = new Set(["parser", "ariadne", "ariadne-parser", "scip", "tree-sitter", "indexer"]);
       for (const a of list) {
         const f = fid.get(a.file);
-        const src = `asserted:${a.author ?? "assistant"}`;
-        insA.run(a.kind, JSON.stringify(a), a.file ?? null, a.line ?? null, a.evidence ?? null,
-                 a.confidence ?? "medium", a.author ?? "assistant", a.source_hash ?? null, Date.now() / 1000);
+        let author = safeAuthor(a.author);
+        if (RESERVED.has(author.toLowerCase())) author = `claimed-${author}`;
+        const conf = ["high", "medium", "low"].includes(a.confidence) ? a.confidence : "medium";
+        const src = `asserted:${author}`;
+        insA.run(a.kind, JSON.stringify(a), a.file ?? null, a.line ?? null,
+                 a.evidence == null ? null : String(a.evidence).slice(0, 2000),
+                 conf, author, a.source_hash ?? null, Date.now() / 1000);
         if (a.source_hash && f && f.hash !== a.source_hash) stale++;
         if (!f) continue;
         if (a.kind === "kafka" && a.topic && a.direction) {
@@ -1216,6 +1249,76 @@ async function kafkaPass(db, scopePrefixes = null) {
       }
       log("INFO", `Assertions: ${loaded} loaded into the graph${stale ? `, ${stale} STALE (evidence file changed since)` : ""}`);
     }
+  }
+
+  // ---- Module hashes: derived once, read by explain/enrich/annotate ----
+  {
+    const mods = new Map();
+    for (const r of db.prepare("SELECT path, hash FROM files").all()) {
+      const seg = String(r.path).split("/")[0];
+      if (!seg) continue;
+      if (!mods.has(seg)) mods.set(seg, []);
+      mods.get(seg).push(r.hash ?? "");
+    }
+    db.exec("DELETE FROM module_hashes");
+    const insM = db.prepare("INSERT OR REPLACE INTO module_hashes(module, hash, files) VALUES(?,?,?)");
+    for (const [name, hs] of mods) {
+      insM.run(name, createHash("sha1").update(hs.sort().join("|")).digest("hex"), hs.length);
+    }
+  }
+
+  // ---- Insights: prose memory an assistant or enrichment derived ----
+  // Source of truth is docs/insights.json, committed and reviewed in PRs, same
+  // contract as assertions and ADRs. Before this the only copy lived in
+  // index.db, which is gitignored, so pull-index.sh and corruption recovery
+  // both destroyed it silently — the failure save_decision already guards
+  // against for ADRs.
+  {
+    // Older indexes predate the source column; add it before the first write.
+    if (!db.prepare("SELECT COUNT(*) c FROM pragma_table_info('insights') WHERE name='source'").get().c) {
+      db.exec("ALTER TABLE insights ADD COLUMN source TEXT");
+    }
+    const INSIGHT_KINDS = new Set(["module", "file", "topic", "table"]);
+    // docs/insights.json is committed, so its contents are attacker-controlled
+    // in any repo that takes PRs. Two rules follow. (1) Provenance is ours, not
+    // the file's: an entry cannot claim to be a parsed fact by writing
+    // model:"ariadne-parser", because every row loaded here is stamped
+    // source='file' and its model string is clamped to a display-safe token.
+    // (2) Volume is bounded, so a single commit cannot bloat the index or the
+    // model's context.
+    const MAX_INSIGHTS = Number(config.maxInsights) > 0 ? Number(config.maxInsights) : 2000;
+    const MAX_SUMMARY = 4000;
+    const safeModel = (m) => String(m ?? "assistant").replace(/[^\w.:@-]/g, "").slice(0, 40) || "unknown";
+    const ins = db.prepare(`INSERT OR REPLACE INTO insights(target, kind, hash, summary, model, generated_at, source)
+                            VALUES(?,?,?,?,?,?,'file')`);
+    let loaded = 0, dropped = 0;
+    // REPO_ROOT as well as each root: in a multi-root workspace REPO_ROOT is
+    // the parent, which is where assert_edge and the graph view have always
+    // put docs/graph-assertions.json. Reading both means a file placed either
+    // way still loads; the writers prefer a git-versioned root.
+    const seen = new Set();
+    for (const root of [REPO_ROOT, ...ROOTS]) {
+      const inf = path.join(root, "docs", "insights.json");
+      if (seen.has(inf)) continue;
+      seen.add(inf);
+      if (!fs.existsSync(inf)) continue;
+      let list = [];
+      try { list = JSON.parse(fs.readFileSync(inf, "utf8")); }
+      catch (e) { log("WARN", `${path.relative(REPO_ROOT, inf)} is not valid JSON (${e.message}); its insights stay out of the graph until it is fixed`); continue; }
+      if (!Array.isArray(list)) { log("WARN", `${path.relative(REPO_ROOT, inf)} is not a JSON array; skipped`); continue; }
+      for (const i of list) {
+        if (!i?.target || !i?.summary) continue;
+        if (loaded >= MAX_INSIGHTS) { dropped += 1; continue; }
+        // annotate.mjs also writes topic/table notes; collapsing them to
+        // "module" would make explain compute a module hash for a topic
+        ins.run(String(i.target).slice(0, 300), INSIGHT_KINDS.has(i.kind) ? i.kind : "module",
+                String(i.hash ?? "").slice(0, 64), String(i.summary).slice(0, MAX_SUMMARY),
+                safeModel(i.model), Number(i.generated_at) || Date.now() / 1000);
+        loaded++;
+      }
+    }
+    if (loaded) log("INFO", `Insights: ${loaded} loaded from docs/insights.json (provenance: file)`);
+    if (dropped) log("WARN", `Insights: ${dropped} entries past the ${MAX_INSIGHTS} cap were ignored; split or prune docs/insights.json`);
   }
 
   // ---- Mnemosyne: decision memory from ADR files (temporal, deterministic) ----
@@ -1330,6 +1433,10 @@ async function fullIndex(db, rebuild = false) {
     // and rebuild into an empty graph.
     db.exec("DELETE FROM files; DELETE FROM chunk_text;");
     try { db.exec("DELETE FROM extract_cache"); db.exec("DELETE FROM meta WHERE key='config_fp'"); } catch { /* fresh db */ }
+    // Only --rebuild wipes insights: it makes docs/insights.json exactly
+    // authoritative (deletions in the file propagate). A normal index is
+    // additive so an un-exported local enrich run isn't destroyed.
+    try { db.exec("DELETE FROM insights"); } catch { /* fresh db */ }
   }
   const tracked = new Set(files);
   const S = stmts(db);

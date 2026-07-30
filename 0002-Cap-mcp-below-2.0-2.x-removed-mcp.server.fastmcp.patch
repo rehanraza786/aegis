@@ -1,0 +1,53 @@
+From 6310a3eb0122ffbbc98e6a2c5235898889271948 Mon Sep 17 00:00:00 2001
+From: rehanraza786 <rehanraza786@users.noreply.github.com>
+Date: Tue, 28 Jul 2026 23:54:45 +0000
+Subject: [PATCH 02/12] Cap mcp below 2.0: 2.x removed mcp.server.fastmcp
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+server.py imports mcp.server.fastmcp at module scope. The dependency was
+unpinned above 1.2.0, so a fresh `pip install -r requirements.txt` today
+resolves mcp 2.0.0 and the Python edition fails to start at all —
+ModuleNotFoundError before a single tool registers, which presents as "the
+whole server is broken" rather than "one dependency moved". Every MCP test
+in the python edition of the suite fails as a block.
+
+Unrelated to the insights change; split out so it can land on its own.
+Revisit when server.py targets the 2.x API.
+---
+ payload/ariadne-python/pyproject.toml   | 2 +-
+ payload/ariadne-python/requirements.txt | 7 ++++++-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/payload/ariadne-python/pyproject.toml b/payload/ariadne-python/pyproject.toml
+index 8afa40e..8e2908b 100644
+--- a/payload/ariadne-python/pyproject.toml
++++ b/payload/ariadne-python/pyproject.toml
+@@ -18,7 +18,7 @@ readme = { text = "Ariadne (Python edition) — see https://github.com/rehanraza
+ license = { text = "MIT" }
+ requires-python = ">=3.10"
+ dependencies = [
+-    "mcp[cli]>=1.2.0",
++    "mcp[cli]>=1.2.0,<2",  # mcp 2.0 removed mcp.server.fastmcp; see requirements.txt
+     "protobuf>=7.35",
+     "tree-sitter>=0.23",
+     # <1 is load-bearing: the 1.x line downloads grammars from GitHub at
+diff --git a/payload/ariadne-python/requirements.txt b/payload/ariadne-python/requirements.txt
+index a65c17e..2398afb 100644
+--- a/payload/ariadne-python/requirements.txt
++++ b/payload/ariadne-python/requirements.txt
+@@ -1,4 +1,9 @@
+-mcp[cli]>=1.2.0
++# <2 is load-bearing: mcp 2.0 removed mcp.server.fastmcp, which server.py
++# imports at module scope. Without the cap a fresh `pip install -r` resolves to
++# 2.x and the Python edition fails to start at all (ModuleNotFoundError before
++# any tool is registered), which reads as "the whole server is broken" rather
++# than "one dependency moved". Revisit when server.py targets the 2.x API.
++mcp[cli]>=1.2.0,<2
+ protobuf>=7.35
+ tree-sitter>=0.23
+ # <1 is load-bearing: the language pack's 1.x line stopped vendoring grammars in
+-- 
+2.43.0
+
