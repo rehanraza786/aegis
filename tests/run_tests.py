@@ -1422,6 +1422,7 @@ const sdRefuse = await call("save_decision", { title: "Probe anchor refusal", de
 const sdOk = await call("save_decision", { title: "Probe anchor rooted", decision: "This decision exists to verify multi-root anchoring behavior.", rationale: "Anchoring test needs it.", root: "docs-repo" });
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import Database from "better-sqlite3";
 const adrDir = path.join(process.cwd(), "docs-repo", "docs", "adr");
 const probeAdr = fs.existsSync(adrDir) ? fs.readdirSync(adrDir).filter((f) => f.includes("probe-anchor-rooted")) : [];
@@ -1445,6 +1446,12 @@ await call("assert_edge", { kind: "kafka", file: "order-service/src/main/java/co
 const asr2 = JSON.parse(await read("ariadne://assertions"));
 const recA = (asr2.assertions ?? []).find((x) => x && x.topic === "probe.contract.check") ?? {};
 const contractOk = recA.confidence === "medium" && !("mode" in recA) && !("method" in recA) && recA.direction === "produce";
+// assert_edge now anchors the file inside the repo that owns the evidence, so it
+// legitimately dirties that worktree until committed — exactly what the tool
+// tells you to do. Commit it, or the freshness probe below sees this file.
+const asrRepo = path.join(process.cwd(), "order-service");
+execFileSync("git", ["add", "-A"], { cwd: asrRepo });
+execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "record assertion"], { cwd: asrRepo });
 
 // ---- batch 18: fresh tells the truth about the worktree ----
 // Measured as a DELTA from whatever is already uncommitted, not against zero:
@@ -1628,6 +1635,12 @@ async def main():
             rec_a = next((x for x in asr2.get("assertions", []) if isinstance(x, dict) and x.get("topic") == "probe.contract.check"), {})
             contract_ok = (rec_a.get("confidence") == "medium" and "mode" not in rec_a
                            and "method" not in rec_a and rec_a.get("direction") == "produce")
+            # assert_edge now anchors the file inside the repo that owns the
+            # evidence, so it legitimately dirties that worktree until committed.
+            _asr_repo = os.path.join(os.getcwd(), "order-service")
+            subprocess.run(["git", "add", "-A"], cwd=_asr_repo, check=True)
+            subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                            "commit", "-qm", "record assertion"], cwd=_asr_repo, check=True)
 
             # ---- batch 18: fresh tells the truth about the worktree ----
             # Measured as a DELTA from whatever is already uncommitted, not
