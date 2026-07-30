@@ -1750,6 +1750,18 @@ asyncio.run(main())
         sprobe.unlink(missing_ok=True)
     msf = re.search(r"SURFACE:(\{.*\})", osf)
     sf = json.loads(msf.group(1)) if msf else {}
+    if not sf:
+        # Every protocol check reads from this one payload, so a probe that dies
+        # before emitting it fails ~28 checks at once and the summary line says
+        # nothing about why. The tail was previously visible only as truncated
+        # detail on the first check. Print the whole thing, once, unmissably.
+        print("\n" + "=" * 72)
+        print(f"  PROTOCOL PROBE PRODUCED NO SURFACE PAYLOAD (exit {code}).")
+        print("  Every check below reads from it, so they all fail together.")
+        print("  Full probe output follows; the real error is in here.")
+        print("=" * 72)
+        print(osf if osf.strip() else "  (no output at all: the probe never started)")
+        print("=" * 72 + "\n")
     check("prompt registry served over the protocol (4 aegis prompts)",
           sf.get("prompts") == ["aegis-impact", "aegis-orient", "aegis-release-check", "aegis-resolve-gap"], osf[-400:])
     check("aegis-impact renders blast radius, seams, decisions, tests from the live graph",
