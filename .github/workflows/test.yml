@@ -12,6 +12,11 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         runtime: [node, python]
     runs-on: ${{ matrix.os }}
+    # The harness forces UTF-8 on its own streams; this makes every CHILD python
+    # process (servers, indexer, probes) do the same, so a tool's em-dash cannot
+    # take down a job on the Windows runner's cp1252 codepage.
+    env:
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6

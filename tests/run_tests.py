@@ -21,6 +21,18 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Windows console I/O defaults to the locale codepage (cp1252 on the GitHub
+# runners), and both this harness and the tools it drives emit arrows, em-dashes
+# and ellipses. Printing one raised UnicodeEncodeError and took the whole job
+# down mid-run, which reads as "the suite is broken" rather than "the console
+# cannot spell". Force UTF-8 on the way out, and never let an unencodable
+# character be the thing that fails a test run.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass  # already replaced, or not a real stream
+
 TOOLKIT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FAILURES = []
@@ -50,7 +62,8 @@ def run(cmd, cwd, env=None):
             cmd[0] = resolved
             if resolved.lower().endswith((".cmd", ".bat")):
                 cmd = [os.environ.get("COMSPEC", "cmd.exe"), "/c"] + cmd
-    r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, env=e)
+    r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, env=e,
+                       encoding="utf-8", errors="replace")
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
@@ -63,7 +76,22 @@ def pip_install(pkgs, cwd):
 
 def git(args, cwd):
     return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t"] + args,
-                          cwd=str(cwd), capture_output=True, text=True)
+                          cwd=str(cwd), capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+
+
+def commit_all_repos(ws: Path, message: str):
+    """Commit every dirty fixture repo.
+
+    Writes that anchor into a repo (assertions, dismissals, insights) leave that
+    worktree dirty until committed -- which is what the tools tell you to do, and
+    what the freshness assertions later in this suite measure.
+    """
+    for d in sorted(ws.iterdir()):
+        if d.is_dir() and (d / ".git").exists():
+            git(["add", "-A"], d)
+            if subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=d).returncode != 0:
+                git(["commit", "-qm", message], d)
 
 
 def commit_all_repos(ws: Path, message: str):
