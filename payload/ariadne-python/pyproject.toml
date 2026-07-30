@@ -24,7 +24,7 @@ dependencies = [
     # <1 is load-bearing: the 1.x line downloads grammars from GitHub at
     # runtime, which breaks offline environments and violates the project's
     # zero-egress promise. The 0.x line vendors every grammar in the wheel.
-    "tree-sitter-language-pack>=0.7,<1",
+    "tree-sitter-language-pack>=0.7,<2",
     "pypdf>=4",
 ]
 
