@@ -1422,7 +1422,6 @@ const sdRefuse = await call("save_decision", { title: "Probe anchor refusal", de
 const sdOk = await call("save_decision", { title: "Probe anchor rooted", decision: "This decision exists to verify multi-root anchoring behavior.", rationale: "Anchoring test needs it.", root: "docs-repo" });
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
 import Database from "better-sqlite3";
 const adrDir = path.join(process.cwd(), "docs-repo", "docs", "adr");
 const probeAdr = fs.existsSync(adrDir) ? fs.readdirSync(adrDir).filter((f) => f.includes("probe-anchor-rooted")) : [];
@@ -1446,14 +1445,14 @@ await call("assert_edge", { kind: "kafka", file: "order-service/src/main/java/co
 const asr2 = JSON.parse(await read("ariadne://assertions"));
 const recA = (asr2.assertions ?? []).find((x) => x && x.topic === "probe.contract.check") ?? {};
 const contractOk = recA.confidence === "medium" && !("mode" in recA) && !("method" in recA) && recA.direction === "produce";
-// assert_edge now anchors the file inside the repo that owns the evidence, so it
-// legitimately dirties that worktree until committed — exactly what the tool
-// tells you to do. Commit it, or the freshness probe below sees this file.
-const asrRepo = path.join(process.cwd(), "order-service");
-execFileSync("git", ["add", "-A"], { cwd: asrRepo });
-execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "record assertion"], { cwd: asrRepo });
 
 // ---- batch 18: fresh tells the truth about the worktree ----
+// Measured as a DELTA from whatever is already uncommitted, not against zero:
+// earlier batches legitimately leave files behind (assert_edge anchors one into
+// this very repo), and an absolute expectation would force this probe to run
+// git mid-session — which is how the Windows leg deadlocked.
+const stBase = JSON.parse(await call("index_status"));
+const dirtyBase = stBase.dirty_worktree ?? 0;
 const scratch = path.join(process.cwd(), "order-service", "src", "main", "java", "com", "acme", "ProbeScratch.java");
 fs.writeFileSync(scratch, "package com.acme;\\npublic class ProbeScratch {}\\n");
 const stDirty = JSON.parse(await call("index_status"));
@@ -1466,9 +1465,9 @@ const wtOk = (ccDirty.per_file ?? []).some((f) => f.state === "untracked")
 fs.rmSync(scratch);
 await call("reindex", { mode: "incremental" });
 const stClean = JSON.parse(await call("index_status"));
-const freshOk = stDirty.fresh === false && stDirty.dirty_worktree >= 1
-  && stAbsorbed.fresh === true && stAbsorbed.dirty_worktree >= 1
-  && stClean.fresh === true && stClean.dirty_worktree === 0;
+const freshOk = stDirty.fresh === false && stDirty.dirty_worktree > dirtyBase
+  && stAbsorbed.fresh === true && stAbsorbed.dirty_worktree > dirtyBase
+  && stClean.fresh === true && stClean.dirty_worktree === dirtyBase;
 
 // ---- batch 18: a replaced DB inode is picked up by the long-lived server ----
 // (POSIX-only: Windows cannot unlink a file another process holds open, and
@@ -1536,7 +1535,7 @@ await c.close();
         sprobe.unlink(missing_ok=True)
     else:
         sprobe = ws / ".ariadne" / "_surface.py"
-        sprobe.write_text('''import asyncio, json, os, subprocess, sys
+        sprobe.write_text('''import asyncio, json, os, sys
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from pydantic import AnyUrl
@@ -1629,14 +1628,15 @@ async def main():
             rec_a = next((x for x in asr2.get("assertions", []) if isinstance(x, dict) and x.get("topic") == "probe.contract.check"), {})
             contract_ok = (rec_a.get("confidence") == "medium" and "mode" not in rec_a
                            and "method" not in rec_a and rec_a.get("direction") == "produce")
-            # assert_edge now anchors the file inside the repo that owns the
-            # evidence, so it legitimately dirties that worktree until committed.
-            _asr_repo = os.path.join(os.getcwd(), "order-service")
-            subprocess.run(["git", "add", "-A"], cwd=_asr_repo, check=True)
-            subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                            "commit", "-qm", "record assertion"], cwd=_asr_repo, check=True)
 
             # ---- batch 18: fresh tells the truth about the worktree ----
+            # Measured as a DELTA from whatever is already uncommitted, not
+            # against zero: earlier batches legitimately leave files behind
+            # (assert_edge anchors one into this very repo), and an absolute
+            # expectation would force this probe to run git mid-session -- which
+            # is how the Windows leg deadlocked.
+            st_base = json.loads(await call("index_status", {}))
+            dirty_base = st_base.get("dirty_worktree", 0)
             scratch = os.path.join(os.getcwd(), "order-service", "src", "main", "java", "com", "acme", "ProbeScratch.java")
             with open(scratch, "w") as fh:
                 fh.write("package com.acme;\\npublic class ProbeScratch {}\\n")
@@ -1650,9 +1650,9 @@ async def main():
             os.remove(scratch)
             await s.call_tool("reindex", {"mode": "incremental"})
             st_clean = json.loads(await call("index_status", {}))
-            fresh_ok = (st_dirty.get("fresh") is False and st_dirty.get("dirty_worktree", 0) >= 1
-                        and st_abs.get("fresh") is True and st_abs.get("dirty_worktree", 0) >= 1
-                        and st_clean.get("fresh") is True and st_clean.get("dirty_worktree") == 0)
+            fresh_ok = (st_dirty.get("fresh") is False and st_dirty.get("dirty_worktree", 0) > dirty_base
+                        and st_abs.get("fresh") is True and st_abs.get("dirty_worktree", 0) > dirty_base
+                        and st_clean.get("fresh") is True and st_clean.get("dirty_worktree") == dirty_base)
 
             # ---- batch 18: a replaced DB inode is picked up by the long-lived server ----
             # (POSIX-only: Windows cannot unlink a file another process holds open.)
@@ -1781,7 +1781,7 @@ asyncio.run(main())
           sf.get("urOk") is True, str(sf.get("urOk")))
     check("dirty-state provenance: untracked file tagged in change_check with an uncommitted warning",
           sf.get("wtOk") is True, str(sf.get("wtOk")))
-    check("fresh tells the truth about the worktree (dirty->false, absorbed->true, clean->0)",
+    check("fresh tells the truth about the worktree (dirty, absorbed, back to baseline)",
           sf.get("freshOk") is True, str(sf.get("freshOk")))
     check("a mv-replaced index.db is picked up by the long-lived server (inode revalidation)",
           sf.get("inodeOk") is True, str(sf.get("inodeOk")))
