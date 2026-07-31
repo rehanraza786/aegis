@@ -18,7 +18,7 @@ readme = { text = "Ariadne (Python edition) — see https://github.com/rehanraza
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.2.0,<2",  # mcp 2.0 removed mcp.server.fastmcp; see requirements.txt
+    "mcp[cli]>=1.2.0,<3",  # mcp 2.0 removed mcp.server.fastmcp; see requirements.txt
     "protobuf>=7.35",
     "tree-sitter>=0.23",
     # <1 is load-bearing: the 1.x line downloads grammars from GitHub at
