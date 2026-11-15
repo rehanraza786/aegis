@@ -148,17 +148,17 @@ Twelve of them, in `.github/skills/`. They follow the open Agent Skills format, 
 
 ## Tools
 
-Twenty-four, served over MCP by `ariadne`. You won't type these yourself; they're what the skills call.
+Twenty-eight, served over MCP by `ariadne`. You won't type these yourself; they're what the skills call.
 
-**Orient and search**: `context_pack` · `index_status` · `module_map` · `search_code` · `find_symbol` · `file_outline` · `hotspots`
+**Orient and search**: `context_pack` · `plan_context` · `index_status` · `module_map` · `search_code` · `find_symbol` · `file_outline` · `hotspots`
 
-**Structure and impact**: `dependencies` · `blast_radius` · `find_callers` · `find_callees` · `find_references` (SCIP, compiler-grade) · `goto_definition`
+**Structure and impact**: `dependencies` · `blast_radius` · `find_callers` · `find_callees` · `find_references` (SCIP, compiler-grade) · `goto_definition` · `explain_path` · `change_check`
 
-**System seams**: `message_flow` (Kafka) · `db_map` (Liquibase ↔ code, with drift) · `http_map` (endpoints ↔ callers)
+**System seams**: `message_flow` (Kafka) · `db_map` (migrations, views and stored procedures ↔ code, with drift) · `http_map` (endpoints ↔ callers)
 
 **Knowledge and memory**: `explain` · `save_insight` · `decisions` · `decision_trace` · `save_decision`
 
-**Improve the graph**: `graph_gaps` · `assert_edge` · `reindex`
+**Improve the graph**: `graph_gaps` · `assert_edge` · `reindex` · `usage_report`
 
 Two are worth knowing by name:
 
@@ -177,6 +177,8 @@ Two are worth knowing by name:
 **Messaging**: `@KafkaListener`, `consumer.subscribe`, `*Template.send`, `ProducerRecord` — plus RabbitMQ/JMS via `@RabbitListener`/`@JmsListener` and receiver-classified templates (`rabbitTemplate.send` is a *rabbit* edge, not a fake Kafka one), amqplib and pika, boto3 SQS queues, and NATS, each labeled with its `system` everywhere it appears. Topic names resolve three ways: string literals, `static final String` / `const val` constants collected repo-wide, and `${config.key}` placeholders looked up in a flattened parse of every `application*.yaml|properties` in the workspace. That third one is what correlates a producer and consumer when neither mentions the topic literally. And the config itself is treated as the seam's source of truth: topic-ish keys are recorded as *declarations*, so a topic declared in config that no code touches is flagged (the messaging twin of table drift), and a site that hardcodes a name its config already declares gets a hoist-to-config note. What it *can't* evaluate (a topic assembled at runtime) it reports as a gap rather than guessing (see below).
 
 **Database and migrations**: Liquibase changelogs in XML, YAML, and formatted SQL, each op tagged with its `author:changeset-id` — plus Flyway versioned SQL (tagged with the migration filename), Prisma schemas (`@@map` honored), Rails `schema.rb`/migrations, and Alembic revisions. On the code side: JPA `@Entity`/`@Table` (including the camelCase→snake_case default), Spring Data repositories via their entity generic, `@Query` in both flavors, `JdbcTemplate` with literal *or constant* SQL, Querydsl — and beyond the JVM, SQLAlchemy models/tables and any driver call with a literal SQL string. Every access tagged read or write. Two drift warnings, and they're why this layer earns its keep: **code touches a table no changelog defines**, and **table defined but never accessed**.
+
+**SQL Server**: `[bracketed]` and `schema.`-qualified names everywhere, and T-SQL object scripts read as schema even outside a changelog folder (SSDT projects, `db/procs/*.sql`). Stored procedures are their own objects (`proc:<name>` in `db_map`); views and functions share the table namespace because code reads them like tables. A routine's body is parsed for what it reads, writes and `EXEC`s, with aliases (`UPDATE o … FROM dbo.orders o`), CTEs, `#temp` tables, `inserted`/`deleted` and system procs resolved away, so "who writes `payments`?" includes the proc that does. Triggers mark their table and own their body's writes. Call sites: `SimpleJdbcCall`, `{call …}` / `EXEC …` strings, `@Procedure`, `@NamedStoredProcedureQuery`, `createStoredProcedureQuery`, Spring `StoredProcedure` subclasses, `cursor.callproc`, and node-mssql `request.execute`. The drift warnings apply: a proc code calls that no script defines is DRIFT, and a proc nobody calls is flagged. Dynamic SQL (`sp_executesql`, `EXEC(@sql)`) is not evaluated.
 
 **The HTTP seam**: endpoints from Spring `@RestController` (class-level prefixes correctly combined), Express/Fastify/Router registrations, Nest controllers (`@Controller` prefix + method decorators), Flask routes, and FastAPI decorators — matched against TypeScript `fetch`/`axios`, Python `requests`/`httpx` (f-strings normalize like template literals), and Java `RestTemplate`/`WebClient`/`@FeignClient`. Paths normalize, so `/api/orders/{id}`, `:id`, and `` `${orderId}` `` all correlate — a Python `requests.post` to an Express route is one graph edge like any other.
 
@@ -421,6 +423,7 @@ Stated plainly, because you'll find them anyway. This is a 0.1: the mechanisms a
 - **The call graph is a heuristic.** `find_callers` matches by name. Use `find_references` when you need certainty.
 - **AST covers six languages.** Everything else is regex-tier: searchable and outline-able, no call graph.
 - **Spring profiles are flattened.** All `application-*.yaml` merge into one map, so profile-specific names can mis-correlate.
+- **Dynamic T-SQL isn't evaluated.** `sp_executesql` and `EXEC(@sql)` bodies are skipped, and MyBatis mapper XML isn't read yet.
 - **Gateway rewrites, GraphQL, and gRPC aren't modeled.** All three are good `.extract` extension candidates.
 - **Test detection is path- and name-based.** Convention-defying test code needs a `testPathPatterns` entry. The SCIP `SymbolRole.Test` bit isn't ingested yet (the compiler-grade upgrade path), and there is deliberately no `tests_for` tool, `context_pack`, `message_flow`, `db_map`, and `http_map` already answer it.
 - **Measured to 2,000 files, not 200,000.** Cold index 3.7 s, incremental 360 ms at that size. The correlation pass holds in-scope file text in memory; that's the first place to look if a much larger codebase drags.

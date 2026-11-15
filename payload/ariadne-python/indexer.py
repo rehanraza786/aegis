@@ -866,7 +866,8 @@ def kafka_pass(con, scope_prefixes=None):
     def in_ext_files(p):
         return any(r.search(p) for r in ext_file_res)
     from kafka_extract import load_config_map, load_constants, extract_kafka_edges, extract_broker_edges
-    from db_extract import (is_changelog, extract_changelog, is_schema_file, extract_schema_defs,
+    from db_extract import (is_changelog, extract_changelog, extract_routine_access, PROC_HINT_RE,
+                            is_schema_file, extract_schema_defs,
                             extract_entities, extract_db_access, extract_generic_db_access,
                             extract_lombok_symbols)
     from http_extract import extract_java_http, extract_ts_http, extract_ts_endpoints, extract_py_http
@@ -1155,6 +1156,12 @@ def kafka_pass(con, scope_prefixes=None):
             con.execute("INSERT INTO db_defs(file_id, tbl, op, line, changeset) VALUES(?,?,?,?,?)",
                         (fid, d["table"], d["op"], d["line"], d["changeset"]))
             defs += 1
+        # what stored procedures / views / triggers defined here read, write and EXEC
+        if fid:
+            for a in extract_routine_access(rel, text):
+                con.execute("INSERT INTO db_access(file_id, tbl, kind, mode, line, detail) VALUES(?,?,?,?,?,?)",
+                            (fid, a["table"], a["kind"], a["mode"], a["line"], a["detail"]))
+                accs += 1
     # schema definitions beyond Liquibase/Flyway: Prisma, Rails, Alembic
     for rel in tracked:
         if not rel.endswith((".prisma", ".rb", ".py")) or not in_scope(rel):
@@ -1173,8 +1180,9 @@ def kafka_pass(con, scope_prefixes=None):
             continue
         text = read_text(rel)
         fid = id_by_path.get(rel)
-        if not fid or text is None or not re.search(
-                r"__tablename__|\bTable\s*\(|execute|exec_driver_sql|\.query\s*\(|\.raw\s*\(", text):
+        if not fid or text is None or not (re.search(
+                r"__tablename__|\bTable\s*\(|execute|exec_driver_sql|\.query\s*\(|\.raw\s*\(", text)
+                or PROC_HINT_RE.search(text)):
             continue
         for a in extract_generic_db_access(text):
             con.execute("INSERT INTO db_access(file_id, tbl, kind, mode, line, detail) VALUES(?,?,?,?,?,?)",
@@ -1187,7 +1195,8 @@ def kafka_pass(con, scope_prefixes=None):
         fid = id_by_path.get(rel)
         if not fid or text is None:
             continue
-        if re.search(r"@Entity|Repository|@Query|[Jj]dbc|Template|com\.querydsl|JPAQueryFactory", text):
+        if re.search(r"@Entity|Repository|@Query|[Jj]dbc|Template|com\.querydsl|JPAQueryFactory", text) \
+                or PROC_HINT_RE.search(text):
             for a in extract_db_access(text, overlay(entity_tables, rel, "entities"), overlay(constants, rel, "constants")):
                 con.execute("INSERT INTO db_access(file_id, tbl, kind, mode, line, detail) VALUES(?,?,?,?,?,?)",
                             (fid, a["table"], a["kind"], a["mode"], a["line"], a["detail"]))

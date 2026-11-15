@@ -12,7 +12,7 @@ import { initAst, extractAst } from "./ast.mjs";
 const AST_LANGS = new Set(["java", "kotlin", "typescript", "javascript", "python"]);
 let astReady = false;
 import { loadConfigMap, loadConstants, extractKafkaEdges, extractBrokerEdges } from "./kafka.mjs";
-import { isChangelog, extractChangelog, isSchemaFile, extractSchemaDefs, extractEntities, extractDbAccess, extractGenericDbAccess, extractLombokSymbols } from "./db.mjs";
+import { isChangelog, extractChangelog, extractRoutineAccess, PROC_HINT_RE, isSchemaFile, extractSchemaDefs, extractEntities, extractDbAccess, extractGenericDbAccess, extractLombokSymbols } from "./db.mjs";
 import { extractJavaHttp, extractTsHttp, extractTsEndpoints, extractPyHttp, normalizePath as normalizeAssertedPath } from "./http.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -1092,6 +1092,8 @@ async function kafkaPass(db, scopePrefixes = null) {
     if (text == null || !isChangelog(rel, text)) continue;
     const fid = idByPath.get(rel)?.id;
     for (const d of extractChangelog(rel, text)) { insDef.run(fid ?? null, d.table, d.op, d.line, d.changeset); defs++; }
+    // what stored procedures / views / triggers defined here read, write and EXEC
+    if (fid) for (const a of extractRoutineAccess(rel, text)) { insAcc.run(fid, a.table, a.kind, a.mode, a.line, a.detail); accs++; }
   }
   // schema definitions beyond Liquibase/Flyway: Prisma, Rails, Alembic
   for (const rel of tracked) {
@@ -1106,7 +1108,7 @@ async function kafkaPass(db, scopePrefixes = null) {
     if (!/\.(py|ts|tsx|js|jsx|mjs|rb)$/.test(rel) || !inScope(rel)) continue;
     const text = readText(rel);
     const fid = idByPath.get(rel)?.id;
-    if (!fid || text == null || !/__tablename__|\bTable\s*\(|execute|exec_driver_sql|\.query\s*\(|\.raw\s*\(/.test(text)) continue;
+    if (!fid || text == null || !(/__tablename__|\bTable\s*\(|execute|exec_driver_sql|\.query\s*\(|\.raw\s*\(/.test(text) || PROC_HINT_RE.test(text))) continue;
     for (const a of extractGenericDbAccess(text)) { insAcc.run(fid, a.table, a.kind, a.mode, a.line, a.detail); accs++; }
   }
   const delSynth = db.prepare("DELETE FROM symbols WHERE file_id=? AND signature LIKE '%Lombok-generated%'");
@@ -1117,7 +1119,7 @@ async function kafkaPass(db, scopePrefixes = null) {
     const text = readText(rel);
     const fid = idByPath.get(rel)?.id;
     if (!fid || text == null) continue;
-    if (/@Entity|Repository|@Query|[Jj]dbc|Template|com\.querydsl|JPAQueryFactory/.test(text)) {
+    if (/@Entity|Repository|@Query|[Jj]dbc|Template|com\.querydsl|JPAQueryFactory/.test(text) || PROC_HINT_RE.test(text)) {
       for (const a of extractDbAccess(text, overlay(entityTables, rel, "entities"), overlay(constants, rel, "constants"))) { insAcc.run(fid, a.table, a.kind, a.mode, a.line, a.detail); accs++; }
     }
     if (/@(?:Data|Value|Getter|Setter|(?:Super)?Builder)\b/.test(text)) {
@@ -1129,7 +1131,7 @@ async function kafkaPass(db, scopePrefixes = null) {
   }
   runXFiltered("dbAccess", (rel) => ({ entityTables, constants, relpath: rel }),
     (r, fid) => { insAcc.run(fid, r.table, r.kind ?? "sql", r.mode ?? "rw", r.line, r.detail ?? "extension"); accs++; });
-  if (defs || accs) log("INFO", `DB: ${defs} schema ops (Liquibase), ${accs} access sites, ${entityTables.size} entities`);
+  if (defs || accs) log("INFO", `DB: ${defs} schema ops, ${accs} access sites, ${entityTables.size} entities`);
   if (lombok) log("INFO", `Lombok: ${lombok} generated members synthesized`);
 
   // ---- HTTP seam ----

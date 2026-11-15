@@ -4,6 +4,27 @@ Versions below are the **payload/engine** version (npm `aegis-ariadne`, PyPI
 `aegis-ariadne`, and the `payload_version` that `index_status` reports). The
 VS Code extension versions independently via release tags.
 
+## Unreleased
+
+- **SQL Server:** `[bracketed]` and schema-qualified names in DDL and DML (a
+  `CREATE TABLE [dbo].[x]` used to define nothing, so every table it created
+  showed as DRIFT; `"schema"."table"` used to record the schema as the table).
+  T-SQL object scripts count as schema outside changelog folders (SSDT,
+  `db/procs/*.sql`). Stored procedures (`proc:<name>`), views and functions are
+  defined objects; routine bodies yield read/write/EXEC access with aliases,
+  CTEs, `#temp`, `inserted`/`deleted` and system procs resolved away; triggers
+  mark their table. Procedure call sites from `SimpleJdbcCall`, `{call}`/`EXEC`
+  strings, `@Procedure`, `@NamedStoredProcedureQuery`,
+  `createStoredProcedureQuery`, `StoredProcedure` subclasses, `cursor.callproc`
+  and node-mssql. Comments in `.sql` files no longer define objects. Both
+  editions, 12 new suite checks.
+- **Leaner always-on instructions:** the routing snippet appended to
+  `copilot-instructions.md` drops from 73 to 27 lines; detail it duplicated
+  already lives in the skills, which load only when needed.
+- **Docs:** README tool list now matches the 28 registered tools.
+- Removed 12 stray `.patch` files committed at the repo root in #32 (their
+  changes were already applied in the same commit).
+
 ## 0.2.0
 
 The post-review release. Highlights, roughly in the order they landed:
