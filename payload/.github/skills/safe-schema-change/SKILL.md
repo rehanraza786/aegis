@@ -87,6 +87,15 @@ Reindex, then:
 **Migration safety.** Additive / breaking — <and if breaking, the staged plan>
 ```
 
+## Stored procedures, views and triggers (SQL Server)
+
+Treat them as schema: change them in the repo's object scripts or migrations,
+never ad hoc. `db_map table:proc:<name>` shows a procedure's definition, what its
+body reads/writes/EXECs, and every caller; `db_map table:<table>` lists the procs,
+views and triggers that touch a table. Before changing a proc's parameters, check
+every caller it lists. Dynamic SQL (sp_executesql) is invisible to the graph:
+read those bodies yourself.
+
 ## Rules
 
 - A schema change with no changeset is not a schema change, it's a bug.

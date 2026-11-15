@@ -190,6 +190,43 @@ public class PaymentDao {
 --changeset carol:010
 CREATE TABLE payments (id BIGINT PRIMARY KEY, order_id BIGINT);
 """)
+    # SQL Server: an SSDT-style object script OUTSIDE any changelog folder, with
+    # bracketed names, a proc, a view, a trigger, temp objects, a CTE, aliases,
+    # comments and system procs that must all be read (or ignored) correctly
+    w(b / "src/main/resources/db/procs/billing.sql", """CREATE TABLE [dbo].[ledger_entries] (id BIGINT, payment_id BIGINT);
+GO
+/* CREATE PROCEDURE dbo.usp_commented_out AS SELECT 1 */
+CREATE OR ALTER PROCEDURE [dbo].[usp_charge_payment] @order_id BIGINT AS
+BEGIN
+  SET NOCOUNT ON;
+  CREATE TABLE #work (id BIGINT);
+  WITH pending AS (SELECT id FROM dbo.payments WHERE order_id = @order_id)
+  INSERT INTO [dbo].[ledger_entries] (payment_id) SELECT id FROM pending;
+  UPDATE p SET p.order_id = @order_id FROM dbo.payments p JOIN #work w ON w.id = p.id;
+  -- EXEC dbo.usp_also_commented
+  EXEC dbo.usp_write_audit @order_id;
+  EXEC sp_executesql N'SELECT 1';
+END
+GO
+CREATE PROCEDURE dbo.usp_write_audit @order_id BIGINT AS
+  INSERT INTO audit_log (order_id) VALUES (@order_id);
+GO
+CREATE VIEW dbo.vw_open_payments AS SELECT p.id FROM dbo.payments p LEFT JOIN ledger_entries l ON l.payment_id = p.id;
+GO
+CREATE TRIGGER trg_payments_audit ON dbo.payments AFTER INSERT, UPDATE AS
+BEGIN
+  INSERT INTO audit_log (order_id) SELECT order_id FROM inserted i;
+END
+GO
+""")
+    w(b / "src/main/java/com/acme/PaymentProcs.java", """package com.acme;
+public class PaymentProcs {
+  private final JdbcTemplate jdbcTemplate;
+  public void charge(long id) { new SimpleJdbcCall(jdbcTemplate).withProcedureName("usp_charge_payment").execute(id); }
+  public List<Long> open() { return jdbcTemplate.queryForList("SELECT id FROM [dbo].[vw_open_payments]", Long.class); }
+  public void legacy(long id) { jdbcTemplate.update("EXEC dbo.usp_not_deployed ?", id); log.warn("Exec failed for order"); }
+}
+""")
     w(b / "src/main/resources/application.yaml",
       "app:\n  kafka:\n    payments-topic: payments.completed\n    refunds-topic: refunds.requested\n")
     w(b / "src/main/java/com/acme/AuditForwarder.java", """package com.acme;
@@ -541,6 +578,35 @@ def main():
     check("db drift (legacy_invoices)",
           q("SELECT 1 FROM db_access WHERE tbl='legacy_invoices'") != [] and
           q("SELECT 1 FROM db_defs WHERE tbl='legacy_invoices'") == [])
+    # SQL Server routine layer
+    acc = lambda tbl, extra="", *a: q(f"SELECT 1 FROM db_access WHERE tbl=? {extra}", tbl, *a) != []
+    check("t-sql: object script outside a changelog folder defines a proc",
+          q("SELECT 1 FROM db_defs WHERE tbl='proc:usp_charge_payment' AND op='create proc'") != [])
+    check("t-sql: bracketed [dbo].[table] defines the table",
+          q("SELECT 1 FROM db_defs WHERE tbl='ledger_entries' AND op='create'") != [])
+    check("t-sql: commented-out proc is not a definition",
+          q("SELECT 1 FROM db_defs WHERE tbl='proc:usp_commented_out'") == [])
+    check("t-sql: view defined in the table namespace",
+          q("SELECT 1 FROM db_defs WHERE tbl='vw_open_payments' AND op='create view'") != [])
+    check("t-sql: proc body write attributed to the proc",
+          acc("ledger_entries", "AND mode='write' AND detail='proc:usp_charge_payment'"))
+    check("t-sql: UPDATE alias resolves to its table",
+          acc("payments", "AND mode='write' AND detail='proc:usp_charge_payment'"))
+    check("t-sql: temp tables, CTEs, pseudo-tables and system procs ignored",
+          q("SELECT tbl FROM db_access WHERE tbl IN ('#work','work','pending','inserted','i','proc:sp_executesql',"
+            "'proc:usp_also_commented')") == [])
+    check("t-sql: proc-to-proc EXEC recorded",
+          acc("proc:usp_write_audit", "AND mode='exec' AND detail='proc:usp_charge_payment'"))
+    check("t-sql: SimpleJdbcCall call site",
+          acc("proc:usp_charge_payment", "AND mode='exec' AND detail='SimpleJdbcCall'"))
+    check("t-sql: bracketed read of a view from Java",
+          acc("vw_open_payments", "AND detail LIKE 'JdbcTemplate.%'"))
+    check("t-sql: trigger marks its table and owns its body's writes",
+          acc("payments", "AND kind='trigger'") and acc("audit_log", "AND detail LIKE 'trigger:trg_payments_audit%'"))
+    check("t-sql: undeployed proc is DRIFT; prose 'Exec failed' is not a call",
+          acc("proc:usp_not_deployed", "AND detail='EXEC'")
+          and q("SELECT 1 FROM db_defs WHERE tbl='proc:usp_not_deployed'") == []
+          and q("SELECT 1 FROM db_access WHERE tbl='proc:failed'") == [])
     check("http endpoint extracted",
           q("SELECT 1 FROM http_endpoints WHERE method='GET' AND norm='/api/orders/{}'") != [])
     check("http caller matched (web-app axios)",

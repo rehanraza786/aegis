@@ -1326,7 +1326,7 @@ def message_flow(topic: str = "") -> str:
 
 @mcp.tool(annotations=RO)
 def db_map(table: str = "") -> str:
-    """Database topology: each table's Liquibase changesets and every code site touching it, read or write. No args = full map plus DRIFT (tables code touches that no changelog defines, and tables defined but never touched). Pass table for one."""
+    """Database topology: changesets and every code site (read/write/exec) per table, view, or proc:<name>. No args = full map plus DRIFT (tables code touches that no changelog defines, and tables defined but never touched). Pass table for one."""
     con = db()
     if not con.execute("SELECT name FROM sqlite_master WHERE name='db_defs'").fetchone():
         return "No DB-layer data; reindex with the current Ariadne"
